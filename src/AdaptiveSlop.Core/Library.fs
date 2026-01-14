@@ -97,13 +97,43 @@ module Transaction =
                 setCurrent None
 
 module internal AdaptiveRuntime =
+    /// Thread-static evaluation context for caching dirty checks within a single evaluation.
+    /// This prevents O(depth^2) work in deep chains by ensuring each node is checked once per eval.
+    type private EvaluationContext =
+        [<ThreadStatic; DefaultValue>]
+        static val mutable private currentId: int64
+        [<ThreadStatic; DefaultValue>]
+        static val mutable private depth: int
+
+        static member GetCurrentId() = EvaluationContext.currentId
+        
+        /// Called at top-level read to start a new evaluation scope
+        static member Enter() =
+            if EvaluationContext.depth = 0 then
+                EvaluationContext.currentId <- EvaluationContext.currentId + 1L
+            EvaluationContext.depth <- EvaluationContext.depth + 1
+        
+        /// Called when top-level read completes
+        static member Exit() =
+            EvaluationContext.depth <- EvaluationContext.depth - 1
+
+    let internal getEvaluationId() = EvaluationContext.GetCurrentId()
+    let internal enterEvaluation() = EvaluationContext.Enter()
+    let internal exitEvaluation() = EvaluationContext.Exit()
+
+    /// Re-entrant dependency collector with stack frames.
+    /// Uses two parallel arrays (original format) with frame support.
     type DependencyCollector() =
-        let mutable depBuffer: IAdaptiveObject[] = Array.zeroCreate 8
-        let mutable versionBuffer: int64[] = Array.zeroCreate 8
+        let mutable depBuffer: IAdaptiveObject[] = Array.zeroCreate 16
+        let mutable versionBuffer: int64[] = Array.zeroCreate 16
         let mutable count = 0
+        // Frame stack: stores the starting index of each nested evaluation
+        let mutable frameStarts: int[] = Array.zeroCreate 8
+        let mutable frameDepth = 0
 
         member _.Reset() =
             count <- 0
+            frameDepth <- 0
 
         member _.Add(dep: IAdaptiveObject, version: int64) =
             if count = depBuffer.Length then
@@ -118,7 +148,23 @@ module internal AdaptiveRuntime =
             versionBuffer[count] <- version
             count <- count + 1
 
-        member _.Snapshot() = depBuffer, versionBuffer, count
+        member _.PushFrame() =
+            if frameDepth = frameStarts.Length then
+                let next = Array.zeroCreate (frameStarts.Length * 2)
+                Array.Copy(frameStarts, next, frameStarts.Length)
+                frameStarts <- next
+            frameStarts[frameDepth] <- count
+            frameDepth <- frameDepth + 1
+
+        member _.PopFrame() =
+            frameDepth <- frameDepth - 1
+            count <- frameStarts[frameDepth]
+
+        /// Get the current frame's deps (depBuffer, versionBuffer, start, length)
+        /// Returns struct tuple to avoid heap allocation
+        member _.CurrentFrame() =
+            let start = if frameDepth > 0 then frameStarts[frameDepth - 1] else 0
+            struct (depBuffer, versionBuffer, start, count - start)
 
     type private DependencyContext =
         [<ThreadStatic; DefaultValue>]
@@ -152,24 +198,24 @@ module internal AdaptiveRuntime =
         | Some collector -> collector.Add(dep, version)
         | None -> ()
 
+    /// Collect dependencies during evaluation. Returns struct tuple to avoid heap allocation.
     let collect (f: unit -> 'T) =
-        let previous = getCurrent()
         let collector =
-            match previous with
-            | Some _ -> DependencyCollector()
+            match getCurrent() with
+            | Some c -> c  // Reuse existing collector (nested evaluation)
             | None ->
                 let reusable = DependencyContext.GetReusable()
                 reusable.Reset()
+                setCurrent (Some reusable)
                 reusable
 
-        setCurrent (Some collector)
+        collector.PushFrame()
         try
             let value = f()
-            let deps, versions, depCount = collector.Snapshot()
-            value, deps, versions, depCount
+            let struct (deps, versions, start, len) = collector.CurrentFrame()
+            struct (value, deps, versions, start, len)
         finally
-            collector.Reset()
-            setCurrent previous
+            collector.PopFrame()
 
 type ConstantValue<'T>(value: 'T) =
     interface IAdaptiveValue<'T> with
@@ -188,23 +234,37 @@ and AdaptiveNode<'T>(compute: unit -> 'T) =
     let mutable depVersions: int64[] = [||]
     let mutable versionsFromPool = false
     let mutable depCount = 0
+    // Per-evaluation dirty cache to avoid O(depth^2) in deep chains
+    let mutable lastCheckedEvalId = 0L
+    let mutable dirtyCache = true
 
+    /// Check if dirty, using per-evaluation cache to avoid redundant deep traversals
     member private this.IsDirty() =
-        if not hasValue then
-            true
+        let evalId = AdaptiveRuntime.getEvaluationId()
+        if lastCheckedEvalId = evalId then
+            // Already checked in this evaluation, return cached result
+            dirtyCache
         else
-            let mutable dirty = false
-            let mutable i = 0
-            while not dirty && i < depCount do
-                if deps[i].Version <> depVersions[i] then
-                    dirty <- true
-                i <- i + 1
+            // Compute dirty status and cache it
+            let dirty =
+                if not hasValue then
+                    true
+                else
+                    let mutable d = false
+                    let mutable i = 0
+                    while not d && i < depCount do
+                        if deps[i].Version <> depVersions[i] then
+                            d <- true
+                        i <- i + 1
+                    d
+            lastCheckedEvalId <- evalId
+            dirtyCache <- dirty
             dirty
 
     member private this.Recompute() =
-        let newValue, newDeps, newVersions, newCount = AdaptiveRuntime.collect compute
+        let struct (newValue, newDeps, newVersions, newStart, newLen) = AdaptiveRuntime.collect compute
         value <- newValue
-        if newCount = 0 then
+        if newLen = 0 then
             if depsFromPool && deps.Length > 0 then
                 ArrayPool<IAdaptiveObject>.Shared.Return(deps, true)
             if versionsFromPool && depVersions.Length > 0 then
@@ -215,45 +275,55 @@ and AdaptiveNode<'T>(compute: unit -> 'T) =
             versionsFromPool <- false
             depCount <- 0
         else
-            if deps.Length < newCount then
+            if deps.Length < newLen then
                 if depsFromPool && deps.Length > 0 then
                     ArrayPool<IAdaptiveObject>.Shared.Return(deps, true)
-                deps <- ArrayPool<IAdaptiveObject>.Shared.Rent(newCount)
+                deps <- ArrayPool<IAdaptiveObject>.Shared.Rent(newLen)
                 depsFromPool <- true
-            if depVersions.Length < newCount then
+            if depVersions.Length < newLen then
                 if versionsFromPool && depVersions.Length > 0 then
                     ArrayPool<int64>.Shared.Return(depVersions, true)
-                depVersions <- ArrayPool<int64>.Shared.Rent(newCount)
+                depVersions <- ArrayPool<int64>.Shared.Rent(newLen)
                 versionsFromPool <- true
-            Array.Copy(newDeps, deps, newCount)
-            // Copy collected versions - these were captured at read time, not after
-            Array.Copy(newVersions, depVersions, newCount)
-            if depCount > newCount then
-                Array.Clear(deps, newCount, depCount - newCount)
-            depCount <- newCount
+            // Copy from collector's frame using Array.Copy (faster than loop)
+            Array.Copy(newDeps, newStart, deps, 0, newLen)
+            Array.Copy(newVersions, newStart, depVersions, 0, newLen)
+            if depCount > newLen then
+                Array.Clear(deps, newLen, depCount - newLen)
+            depCount <- newLen
         hasValue <- true
         version <- version + 1L
+        // Update cache: we just recomputed, so we're not dirty anymore for this evaluation
+        dirtyCache <- false
 
     interface IAdaptiveValue<'T> with
         member this.GetValue() =
-            Monitor.Enter(syncRoot)
+            AdaptiveRuntime.enterEvaluation()
             try
-                if this.IsDirty() then
-                    this.Recompute()
-                // Add dependency with committed version AFTER any recompute, inside lock
-                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
-                value
+                Monitor.Enter(syncRoot)
+                try
+                    if this.IsDirty() then
+                        this.Recompute()
+                    // Add dependency with committed version AFTER any recompute, inside lock
+                    AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                    value
+                finally
+                    Monitor.Exit(syncRoot)
             finally
-                Monitor.Exit(syncRoot)
+                AdaptiveRuntime.exitEvaluation()
         member this.Version =
-            Monitor.Enter(syncRoot)
+            AdaptiveRuntime.enterEvaluation()
             try
-                if this.IsDirty() then
-                    version + 1L
-                else
-                    version
+                Monitor.Enter(syncRoot)
+                try
+                    if this.IsDirty() then
+                        version + 1L
+                    else
+                        version
+                finally
+                    Monitor.Exit(syncRoot)
             finally
-                Monitor.Exit(syncRoot)
+                AdaptiveRuntime.exitEvaluation()
 
 and ChangeableValue<'T>(initial: 'T) =
     let syncRoot = obj()
