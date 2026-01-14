@@ -616,6 +616,68 @@ type WideTreeBenchmarks() =
             ()
 
 // =============================================================================
+// Optimized Wide Tree Benchmark using reduce (single node instead of map2 chain)
+// =============================================================================
+
+[<MemoryDiagnoser>]
+type OptimizedWideTreeBenchmarks() =
+    // Compares: map2 chain vs reduce (single node) vs FDA
+    let mutable slopInputsMap2: AdaptiveSlop.Core.ChangeableValue<int>[] = [||]
+    let mutable slopSumMap2: AdaptiveSlop.Core.IAdaptiveValue<int> = Unchecked.defaultof<_>
+    let mutable slopInputsReduce: AdaptiveSlop.Core.ChangeableValue<int>[] = [||]
+    let mutable slopSumReduce: AdaptiveSlop.Core.IAdaptiveValue<int> = Unchecked.defaultof<_>
+    let mutable fdaInputs: cval<int>[] = [||]
+    let mutable fdaSum: aval<int> = Unchecked.defaultof<_>
+
+    [<Params(10, 50, 100, 500)>]
+    member val Width = 0 with get, set
+
+    [<Params(100)>]
+    member val Iterations = 0 with get, set
+
+    [<GlobalSetup>]
+    member this.Setup() =
+        // AdaptiveSlop with map2 chain (baseline)
+        slopInputsMap2 <- Array.init this.Width (fun i -> AdaptiveSlop.Core.CVal.create i)
+        let mutable sum: AdaptiveSlop.Core.IAdaptiveValue<int> = AdaptiveSlop.Core.CVal.value slopInputsMap2.[0]
+        for i in 1..this.Width - 1 do
+            sum <- AdaptiveSlop.Core.AVal.map2 (+) sum (AdaptiveSlop.Core.CVal.value slopInputsMap2.[i])
+        slopSumMap2 <- sum
+
+        // AdaptiveSlop with reduce (optimized - single node)
+        slopInputsReduce <- Array.init this.Width (fun i -> AdaptiveSlop.Core.CVal.create i)
+        let deps = slopInputsReduce |> Array.map AdaptiveSlop.Core.CVal.value
+        slopSumReduce <- AdaptiveSlop.Core.AVal.reduce 0 (+) deps
+
+        // FDA with map2 chain
+        fdaInputs <- Array.init this.Width (fun i -> cval i)
+        let mutable fdaSumVal: aval<int> = fdaInputs.[0]
+        for i in 1..this.Width - 1 do
+            fdaSumVal <- AVal.map2 (+) fdaSumVal fdaInputs.[i]
+        fdaSum <- fdaSumVal
+
+    [<Benchmark(Baseline=true)>]
+    member this.AdaptiveSlop_Map2Chain() =
+        for i in 1..this.Iterations do
+            slopInputsMap2.[this.Width / 2].Set(i)
+            let _ = AdaptiveSlop.Core.AVal.getValue slopSumMap2
+            ()
+
+    [<Benchmark>]
+    member this.AdaptiveSlop_Reduce() =
+        for i in 1..this.Iterations do
+            slopInputsReduce.[this.Width / 2].Set(i)
+            let _ = AdaptiveSlop.Core.AVal.getValue slopSumReduce
+            ()
+
+    [<Benchmark>]
+    member this.FSharpDataAdaptive() =
+        for i in 1..this.Iterations do
+            transact (fun () -> fdaInputs.[this.Width / 2].Value <- i)
+            let _ = AVal.force fdaSum
+            ()
+
+// =============================================================================
 // Deep+Wide Tree Benchmark (depth with branching factor)
 // =============================================================================
 

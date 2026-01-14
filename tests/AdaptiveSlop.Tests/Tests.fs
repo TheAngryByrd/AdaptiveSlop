@@ -984,6 +984,297 @@ let ``Deep graph maintains version consistency under concurrent updates`` () =
     let actualFinal = AVal.getValue root
     Assert.Equal(expectedFinal, actualFinal)
 
+// =============================================================================
+// N-ary Node Tests (map3, map4, mapN, reduce, sum)
+// =============================================================================
+
+[<Fact>]
+let ``AVal map3 combines three values correctly`` () =
+    let a = CVal.create 1
+    let b = CVal.create 2
+    let c = CVal.create 3
+    let combined = AVal.map3 (fun x y z -> x + y + z) (CVal.value a) (CVal.value b) (CVal.value c)
+    
+    Assert.Equal(6, AVal.getValue combined)
+    
+    a.Set(10)
+    Assert.Equal(15, AVal.getValue combined)
+    
+    b.Set(20)
+    Assert.Equal(33, AVal.getValue combined)
+    
+    c.Set(30)
+    Assert.Equal(60, AVal.getValue combined)
+
+[<Fact>]
+let ``AVal map3 avoids recompute when unchanged`` () =
+    let a = CVal.create 1
+    let b = CVal.create 2
+    let c = CVal.create 3
+    let mutable computeCount = 0
+    let combined = 
+        AVal.map3 
+            (fun x y z -> 
+                computeCount <- computeCount + 1
+                x * y * z) 
+            (CVal.value a) (CVal.value b) (CVal.value c)
+    
+    Assert.Equal(6, AVal.getValue combined)
+    Assert.Equal(1, computeCount)
+    
+    // Reading again should not recompute
+    Assert.Equal(6, AVal.getValue combined)
+    Assert.Equal(1, computeCount)
+    
+    // Changing a value should recompute
+    a.Set(2)
+    Assert.Equal(12, AVal.getValue combined)
+    Assert.Equal(2, computeCount)
+
+[<Fact>]
+let ``AVal map4 combines four values correctly`` () =
+    let a = CVal.create 1
+    let b = CVal.create 2
+    let c = CVal.create 3
+    let d = CVal.create 4
+    let combined = AVal.map4 (fun w x y z -> w + x + y + z) (CVal.value a) (CVal.value b) (CVal.value c) (CVal.value d)
+    
+    Assert.Equal(10, AVal.getValue combined)
+    
+    a.Set(10)
+    Assert.Equal(19, AVal.getValue combined)
+    
+    d.Set(40)
+    Assert.Equal(55, AVal.getValue combined)
+
+[<Fact>]
+let ``AVal map4 avoids recompute when unchanged`` () =
+    let a = CVal.create 1
+    let b = CVal.create 2
+    let c = CVal.create 3
+    let d = CVal.create 4
+    let mutable computeCount = 0
+    let combined = 
+        AVal.map4 
+            (fun w x y z -> 
+                computeCount <- computeCount + 1
+                w * x * y * z) 
+            (CVal.value a) (CVal.value b) (CVal.value c) (CVal.value d)
+    
+    Assert.Equal(24, AVal.getValue combined)
+    Assert.Equal(1, computeCount)
+    
+    // Reading again should not recompute
+    Assert.Equal(24, AVal.getValue combined)
+    Assert.Equal(1, computeCount)
+    
+    // Changing a value should recompute
+    b.Set(3)
+    Assert.Equal(36, AVal.getValue combined)
+    Assert.Equal(2, computeCount)
+
+[<Fact>]
+let ``AVal mapN combines array of values correctly`` () =
+    let sources = [| CVal.create 1; CVal.create 2; CVal.create 3; CVal.create 4; CVal.create 5 |]
+    let deps = sources |> Array.map (fun s -> CVal.value s :> IAdaptiveValue<int>)
+    let combined = AVal.mapN (fun arr -> arr |> Array.sum) deps
+    
+    Assert.Equal(15, AVal.getValue combined)
+    
+    sources.[0].Set(10)
+    Assert.Equal(24, AVal.getValue combined)
+    
+    sources.[4].Set(50)
+    Assert.Equal(69, AVal.getValue combined)
+
+[<Fact>]
+let ``AVal mapN avoids recompute when unchanged`` () =
+    let sources = [| CVal.create 1; CVal.create 2; CVal.create 3 |]
+    let deps = sources |> Array.map (fun s -> CVal.value s :> IAdaptiveValue<int>)
+    let mutable computeCount = 0
+    let combined = 
+        AVal.mapN 
+            (fun arr -> 
+                computeCount <- computeCount + 1
+                arr |> Array.fold (*) 1) 
+            deps
+    
+    Assert.Equal(6, AVal.getValue combined)
+    Assert.Equal(1, computeCount)
+    
+    // Reading again should not recompute
+    Assert.Equal(6, AVal.getValue combined)
+    Assert.Equal(1, computeCount)
+    
+    // Changing a value should recompute
+    sources.[1].Set(5)
+    Assert.Equal(15, AVal.getValue combined)
+    Assert.Equal(2, computeCount)
+
+[<Fact>]
+let ``AVal mapN handles empty array`` () =
+    let deps: IAdaptiveValue<int>[] = [||]
+    let combined = AVal.mapN (fun arr -> arr.Length) deps
+    
+    Assert.Equal(0, AVal.getValue combined)
+
+[<Fact>]
+let ``AVal mapN handles single element`` () =
+    let source = CVal.create 42
+    let deps = [| CVal.value source :> IAdaptiveValue<int> |]
+    let combined = AVal.mapN (fun arr -> arr.[0] * 2) deps
+    
+    Assert.Equal(84, AVal.getValue combined)
+    
+    source.Set(10)
+    Assert.Equal(20, AVal.getValue combined)
+
+[<Fact>]
+let ``AVal reduce combines values with binary operation`` () =
+    let sources = [| CVal.create 1; CVal.create 2; CVal.create 3; CVal.create 4 |]
+    let deps = sources |> Array.map (fun s -> CVal.value s :> IAdaptiveValue<int>)
+    let reduced = AVal.reduce 0 (+) deps
+    
+    Assert.Equal(10, AVal.getValue reduced)
+    
+    sources.[0].Set(10)
+    Assert.Equal(19, AVal.getValue reduced)
+    
+    sources.[3].Set(40)
+    Assert.Equal(55, AVal.getValue reduced)
+
+[<Fact>]
+let ``AVal reduce handles empty array with init value`` () =
+    let deps: IAdaptiveValue<int>[] = [||]
+    let reduced = AVal.reduce 42 (+) deps
+    
+    Assert.Equal(42, AVal.getValue reduced)
+
+[<Fact>]
+let ``AVal reduce handles single element`` () =
+    let source = CVal.create 10
+    let deps = [| CVal.value source :> IAdaptiveValue<int> |]
+    let reduced = AVal.reduce 5 (+) deps
+    
+    Assert.Equal(15, AVal.getValue reduced)
+    
+    source.Set(20)
+    Assert.Equal(25, AVal.getValue reduced)
+
+[<Fact>]
+let ``AVal reduce works with multiplication`` () =
+    let sources = [| CVal.create 2; CVal.create 3; CVal.create 4 |]
+    let deps = sources |> Array.map (fun s -> CVal.value s :> IAdaptiveValue<int>)
+    let reduced = AVal.reduce 1 (*) deps
+    
+    Assert.Equal(24, AVal.getValue reduced)
+    
+    sources.[1].Set(5)
+    Assert.Equal(40, AVal.getValue reduced)
+
+[<Fact>]
+let ``AVal sum sums integer values`` () =
+    let sources = [| CVal.create 10; CVal.create 20; CVal.create 30 |]
+    let deps = sources |> Array.map (fun s -> CVal.value s :> IAdaptiveValue<int>)
+    let summed = AVal.sum deps
+    
+    Assert.Equal(60, AVal.getValue summed)
+    
+    sources.[0].Set(100)
+    Assert.Equal(150, AVal.getValue summed)
+    
+    sources.[2].Set(300)
+    Assert.Equal(420, AVal.getValue summed)
+
+[<Fact>]
+let ``AVal sum handles empty array`` () =
+    let deps: IAdaptiveValue<int>[] = [||]
+    let summed = AVal.sum deps
+    
+    Assert.Equal(0, AVal.getValue summed)
+
+[<Fact>]
+let ``AVal sum handles single element`` () =
+    let source = CVal.create 42
+    let deps = [| CVal.value source :> IAdaptiveValue<int> |]
+    let summed = AVal.sum deps
+    
+    Assert.Equal(42, AVal.getValue summed)
+    
+    source.Set(100)
+    Assert.Equal(100, AVal.getValue summed)
+
+[<Fact>]
+let ``AVal sum avoids recompute when unchanged`` () =
+    let sources = [| CVal.create 1; CVal.create 2; CVal.create 3 |]
+    let deps = sources |> Array.map (fun s -> CVal.value s :> IAdaptiveValue<int>)
+    
+    // Note: We can't easily count recomputes here without exposing internals,
+    // but we can verify version doesn't change on repeated reads
+    let summed = AVal.sum deps
+    let v1 = (summed :> IAdaptiveObject).Version
+    let _ = AVal.getValue summed
+    let v2 = (summed :> IAdaptiveObject).Version
+    
+    Assert.Equal(v1, v2)
+    
+    // After change, version should increase
+    sources.[0].Set(10)
+    let _ = AVal.getValue summed
+    let v3 = (summed :> IAdaptiveObject).Version
+    Assert.True(v3 > v2)
+
+[<Fact>]
+let ``N-ary nodes work in chains with other adaptive operations`` () =
+    let a = CVal.create 1
+    let b = CVal.create 2
+    let c = CVal.create 3
+    
+    // map3 -> map -> map2
+    let sum3 = AVal.map3 (fun x y z -> x + y + z) (CVal.value a) (CVal.value b) (CVal.value c)
+    let doubled = AVal.map (fun x -> x * 2) sum3
+    let final = AVal.map2 (fun x y -> x + y) doubled (CVal.value a)
+    
+    // (1+2+3)*2 + 1 = 13
+    Assert.Equal(13, AVal.getValue final)
+    
+    a.Set(10)
+    // (10+2+3)*2 + 10 = 40
+    Assert.Equal(40, AVal.getValue final)
+
+[<Fact>]
+let ``N-ary nodes handle concurrent reads and writes`` () =
+    let sources = Array.init 10 (fun i -> CVal.create i)
+    let deps = sources |> Array.map (fun s -> CVal.value s :> IAdaptiveValue<int>)
+    let summed = AVal.sum deps
+    
+    let errors = ConcurrentQueue<exn>()
+    let iterations = 2000
+    
+    let writerTask = Task.Run(fun () ->
+        try
+            for i in 1..iterations do
+                let idx = i % sources.Length
+                sources.[idx].Set(i)
+        with ex ->
+            errors.Enqueue(ex))
+    
+    let readerTask = Task.Run(fun () ->
+        try
+            for _ in 1..iterations do
+                let _ = AVal.getValue summed
+                ()
+        with ex ->
+            errors.Enqueue(ex))
+    
+    Task.WaitAll([| writerTask; readerTask |])
+    
+    Assert.True(errors.IsEmpty, $"Errors during concurrent N-ary access: {errors.Count}")
+
+// =============================================================================
+// Concurrency Hazard Tests
+// =============================================================================
+
 /// Test 5: Snapshot thrash test - rapidly invalidate while building snapshot
 [<Fact>]
 let ``ChangeableSet snapshot building handles rapid invalidation`` () =
