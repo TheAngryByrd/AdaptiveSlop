@@ -101,7 +101,7 @@ let ``ChangeableMap supports concurrent updates`` () =
 
     let errors =
         runParallel 8 2000 (fun value ->
-            changeable.AddOrUpdate(value, value * 2))
+            changeable.AddOrUpdate value (value * 2))
 
     Assert.True(errors.IsEmpty, $"Errors found: {errors.Count}")
     let result = AMap.getValue (CMap.value changeable)
@@ -252,7 +252,7 @@ let ``AMap map and filter`` () =
     let expectedInitial: Map<int, int> = Map.ofList [2, 21; 3, 31]
     Assert.Equal<Map<int, int>>(expectedInitial, AMap.getValue filtered)
 
-    source.AddOrUpdate(4, 40)
+    source.AddOrUpdate 4 40
     let expectedAfterAdd: Map<int, int> = Map.ofList [2, 21; 3, 31; 4, 41]
     Assert.Equal<Map<int, int>>(expectedAfterAdd, AMap.getValue filtered)
 
@@ -317,7 +317,7 @@ let ``Transaction batches map updates`` () =
     let mapValue = CMap.ofSeq [1, 10; 2, 20]
 
     Transaction.run (fun () ->
-        mapValue.AddOrUpdate(3, 30)
+        mapValue.AddOrUpdate 3 30
         mapValue.Remove(1)
         let expectedDuring: Map<int, int> = Map.ofList [1, 10; 2, 20]
         Assert.Equal<Map<int, int>>(expectedDuring, AMap.getValue (CMap.value mapValue))
@@ -380,11 +380,11 @@ let ``AMap map and filter respond to updates`` () =
     let expectedInitial: Map<int, int> = Map.ofList [2, 25]
     Assert.Equal<Map<int, int>>(expectedInitial, AMap.getValue filtered)
 
-    source.AddOrUpdate(2, 12)
+    source.AddOrUpdate 2 12
     let expectedAfterUpdate: Map<int, int> = Map.empty
     Assert.Equal<Map<int, int>>(expectedAfterUpdate, AMap.getValue filtered)
 
-    source.AddOrUpdate(1, 30)
+    source.AddOrUpdate 1 30
     let expectedAfterSecond: Map<int, int> = Map.ofList [1, 35]
     Assert.Equal<Map<int, int>>(expectedAfterSecond, AMap.getValue filtered)
 
@@ -487,8 +487,8 @@ let ``AMap filter ignores non-matching updates`` () =
     let expectedInitial: Map<int, int> = Map.ofList [2, 20]
     Assert.Equal<Map<int, int>>(expectedInitial, AMap.getValue filtered)
 
-    source.AddOrUpdate(1, 8)
-    source.AddOrUpdate(3, 9)
+    source.AddOrUpdate 1 8
+    source.AddOrUpdate 3 9
     let expectedAfter: Map<int, int> = Map.ofList [2, 20]
     Assert.Equal<Map<int, int>>(expectedAfter, AMap.getValue filtered)
 
@@ -558,7 +558,7 @@ let ``AMap filter updates on removals`` () =
     let expectedAfterRemove: Map<int, int> = Map.ofList [2, 20]
     Assert.Equal<Map<int, int>>(expectedAfterRemove, AMap.getValue filtered)
 
-    source.AddOrUpdate(1, 25)
+    source.AddOrUpdate 1 25
     let expectedAfterUpdate: Map<int, int> = Map.ofList [1, 25; 2, 20]
     Assert.Equal<Map<int, int>>(expectedAfterUpdate, AMap.getValue filtered)
 
@@ -569,7 +569,7 @@ let ``Transaction defers set and map together`` () =
 
     Transaction.run (fun () ->
         setValue.Add(2)
-        mapValue.AddOrUpdate(2, 2)
+        mapValue.AddOrUpdate 2 2
 
         let expectedSet: Set<int> = Set.ofList [1]
         let expectedMap: Map<int, int> = Map.ofList [1, 1]
@@ -621,7 +621,7 @@ let ``AMap filter removes when threshold increases`` () =
     let expectedInitial: Map<int, int> = Map.ofList [2, 15; 3, 25]
     Assert.Equal<Map<int, int>>(expectedInitial, AMap.getValue filtered)
 
-    source.AddOrUpdate(2, 8)
+    source.AddOrUpdate 2 8
     let expectedAfter: Map<int, int> = Map.ofList [3, 25]
     Assert.Equal<Map<int, int>>(expectedAfter, AMap.getValue filtered)
 
@@ -833,7 +833,7 @@ let ``ChangeableMap concurrent rapid read/write stress test`` () =
     let writerTask = Task.Run(fun () ->
         try
             for i in 1..writerIterations do
-                changeable.AddOrUpdate(i, i * 2)
+                changeable.AddOrUpdate i (i * 2)
                 if i > 10 then
                     changeable.Remove(i - 10)
         with ex ->
@@ -1076,7 +1076,7 @@ let ``AVal map4 avoids recompute when unchanged`` () =
 [<Fact>]
 let ``AVal mapN combines array of values correctly`` () =
     let sources = [| CVal.create 1; CVal.create 2; CVal.create 3; CVal.create 4; CVal.create 5 |]
-    let deps = sources |> Array.map (fun s -> CVal.value s :> IAdaptiveValue<int>)
+    let deps = sources |> Array.map CVal.value
     let combined = AVal.mapN (fun arr -> arr |> Array.sum) deps
     
     Assert.Equal(15, AVal.getValue combined)
@@ -1090,7 +1090,7 @@ let ``AVal mapN combines array of values correctly`` () =
 [<Fact>]
 let ``AVal mapN avoids recompute when unchanged`` () =
     let sources = [| CVal.create 1; CVal.create 2; CVal.create 3 |]
-    let deps = sources |> Array.map (fun s -> CVal.value s :> IAdaptiveValue<int>)
+    let deps = sources |> Array.map CVal.value
     let mutable computeCount = 0
     let combined = 
         AVal.mapN 
@@ -1121,7 +1121,7 @@ let ``AVal mapN handles empty array`` () =
 [<Fact>]
 let ``AVal mapN handles single element`` () =
     let source = CVal.create 42
-    let deps = [| CVal.value source :> IAdaptiveValue<int> |]
+    let deps = [| CVal.value source |]
     let combined = AVal.mapN (fun arr -> arr.[0] * 2) deps
     
     Assert.Equal(84, AVal.getValue combined)
@@ -1132,7 +1132,7 @@ let ``AVal mapN handles single element`` () =
 [<Fact>]
 let ``AVal reduce combines values with binary operation`` () =
     let sources = [| CVal.create 1; CVal.create 2; CVal.create 3; CVal.create 4 |]
-    let deps = sources |> Array.map (fun s -> CVal.value s :> IAdaptiveValue<int>)
+    let deps = sources |> Array.map CVal.value
     let reduced = AVal.reduce 0 (+) deps
     
     Assert.Equal(10, AVal.getValue reduced)
@@ -1153,7 +1153,7 @@ let ``AVal reduce handles empty array with init value`` () =
 [<Fact>]
 let ``AVal reduce handles single element`` () =
     let source = CVal.create 10
-    let deps = [| CVal.value source :> IAdaptiveValue<int> |]
+    let deps = [| CVal.value source |]
     let reduced = AVal.reduce 5 (+) deps
     
     Assert.Equal(15, AVal.getValue reduced)
@@ -1164,7 +1164,7 @@ let ``AVal reduce handles single element`` () =
 [<Fact>]
 let ``AVal reduce works with multiplication`` () =
     let sources = [| CVal.create 2; CVal.create 3; CVal.create 4 |]
-    let deps = sources |> Array.map (fun s -> CVal.value s :> IAdaptiveValue<int>)
+    let deps = sources |> Array.map CVal.value
     let reduced = AVal.reduce 1 (*) deps
     
     Assert.Equal(24, AVal.getValue reduced)
@@ -1175,7 +1175,7 @@ let ``AVal reduce works with multiplication`` () =
 [<Fact>]
 let ``AVal sum sums integer values`` () =
     let sources = [| CVal.create 10; CVal.create 20; CVal.create 30 |]
-    let deps = sources |> Array.map (fun s -> CVal.value s :> IAdaptiveValue<int>)
+    let deps = sources |> Array.map CVal.value
     let summed = AVal.sum deps
     
     Assert.Equal(60, AVal.getValue summed)
@@ -1196,7 +1196,7 @@ let ``AVal sum handles empty array`` () =
 [<Fact>]
 let ``AVal sum handles single element`` () =
     let source = CVal.create 42
-    let deps = [| CVal.value source :> IAdaptiveValue<int> |]
+    let deps = [| CVal.value source |]
     let summed = AVal.sum deps
     
     Assert.Equal(42, AVal.getValue summed)
@@ -1207,7 +1207,7 @@ let ``AVal sum handles single element`` () =
 [<Fact>]
 let ``AVal sum avoids recompute when unchanged`` () =
     let sources = [| CVal.create 1; CVal.create 2; CVal.create 3 |]
-    let deps = sources |> Array.map (fun s -> CVal.value s :> IAdaptiveValue<int>)
+    let deps = sources |> Array.map CVal.value
     
     // Note: We can't easily count recomputes here without exposing internals,
     // but we can verify version doesn't change on repeated reads
@@ -1245,7 +1245,7 @@ let ``N-ary nodes work in chains with other adaptive operations`` () =
 [<Fact>]
 let ``N-ary nodes handle concurrent reads and writes`` () =
     let sources = Array.init 10 (fun i -> CVal.create i)
-    let deps = sources |> Array.map (fun s -> CVal.value s :> IAdaptiveValue<int>)
+    let deps = sources |> Array.map CVal.value
     let summed = AVal.sum deps
     
     let errors = ConcurrentQueue<exn>()
