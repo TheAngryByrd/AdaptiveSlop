@@ -1407,17 +1407,21 @@ let ``mapN recompute allocates zero bytes`` () =
 // =============================================================================
 
 [<Fact>]
-let ``Post defers application until pump`` () =
+let ``Posted values apply at the next graph operation without pump`` () =
     let a = CVal.create 1
     let m = AVal.map (fun v -> v * 10) (CVal.value a)
 
     a.Post(5)
-    Assert.Equal(10, AVal.getValue m) // not applied yet
-    Posting.pump ()
+    // No pump needed: the next owner read drains and applies the post.
     Assert.Equal(50, AVal.getValue m)
 
+    // Posting.pump remains an explicit batch point.
+    a.Post(7)
+    Posting.pump ()
+    Assert.Equal(70, AVal.getValue m)
+
 [<Fact>]
-let ``Posts from a foreign thread apply at pump on the owner thread`` () =
+let ``Posts from a foreign thread apply at the next graph operation`` () =
     let a = CVal.create 0
     let mutable seen: int list = []
     use _obs = AVal.observe (fun v -> seen <- v :: seen) (CVal.value a)
@@ -1428,15 +1432,15 @@ let ``Posts from a foreign thread apply at pump on the owner thread`` () =
                 a.Post(i))
 
     producer.Wait()
-    // Nothing applied yet: the graph was not touched from the foreign thread.
-    Assert.Equal(0, AVal.getValue (CVal.value a))
-    Posting.pump ()
+    // No owner operation happened yet: posts are still pending, version untouched.
+    Assert.Equal(0L, (CVal.value a :> IAdaptiveObject).Version)
+
+    // The first owner read drains: one application of the last posted value.
     Assert.Equal(100, AVal.getValue (CVal.value a))
-    // One window, one application: one notification with the last value.
     Assert.Equal<int list>([ 100 ], seen)
 
 [<Fact>]
-let ``Posts from several threads collapse to one application per window`` () =
+let ``Posts from several threads collapse to one application per batch`` () =
     let a = CVal.create 0
     let mutable recomputeCount = 0
 
@@ -1457,12 +1461,11 @@ let ``Posts from several threads collapse to one application per window`` () =
                       a.Post(i)) ]
 
     Task.WaitAll(Array.ofList producers)
-    Posting.pump ()
-    // All 1000 posts collapsed into one application of the last posted value.
+    // The first read drains: all 1000 posts collapsed into one application.
     Assert.Equal(250, AVal.getValue (CVal.value a))
     Assert.Equal(250, AVal.getValue m) // lazy: this read triggers the recompute
     Assert.Equal(2, recomputeCount)
-    // An empty pump must not recompute anything.
+    // An explicit pump with nothing pending must not recompute anything.
     Posting.pump ()
     Assert.Equal(2, recomputeCount)
 

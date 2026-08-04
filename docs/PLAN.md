@@ -229,6 +229,13 @@ Each slot carries a sequence number for synchronization.
 Duplicate posts to one source in one window collapse to one application. This is safe
 because no read occurs during the drain.
 
+Pumping is automatic: the outermost entry of any owner-thread graph operation drains the
+ring first, so pending posts apply at the next read or write, as one batch with one
+notification delivery. `Pump()` remains available as an explicit batch point for callers
+that want to choose the application boundary (for example, once per frame). The auto-drain
+never fires inside a nested operation or a transaction, so an evaluation never observes a
+mid-recompute application.
+
 ### 7.4 Multiple graphs
 
 An application may run one graph per thread. To synchronize two graphs, post collection

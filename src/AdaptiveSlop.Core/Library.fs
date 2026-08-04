@@ -400,6 +400,8 @@ type internal GraphContext() =
     // depth for nested operations. 0 = idle.
     let mutable debugActiveThread = 0
     let mutable debugClaimDepth = 0
+    // Operation nesting depth. The automatic drain fires on the outermost claim only.
+    let mutable operationDepth = 0
     // Pooled marking stack for iterative dirty propagation.
     let mutable markStack: IAdaptiveNode[] = Array.zeroCreate 64
     let mutable markCount = 0
@@ -415,12 +417,14 @@ type internal GraphContext() =
     member internal _.EvaluationId = evaluationId
     member internal _.WriteGeneration = writeGeneration
 
-    /// Debug builds only: claim the graph for the current thread at the start of
-    /// an operation. Throws when another thread is inside a graph operation.
-    /// Sequential use from different threads is allowed: the claim is released
-    /// when the outermost operation ends. Pair every call with ReleaseOwner.
-    [<Conditional("DEBUG")>]
-    member internal _.ClaimOwner() =
+    /// Claim the graph for the current operation. Throws in debug builds when
+    /// another thread is inside a graph operation. Sequential use from different
+    /// threads is allowed: the claim is released when the outermost operation ends.
+    /// Pair every call with ReleaseOwner. On the outermost claim, pending posts are
+    /// drained automatically (auto-pump): they apply as one batch with one
+    /// notification delivery, before the operation runs.
+    member internal this.ClaimOwner() =
+#if DEBUG
         let tid = Environment.CurrentManagedThreadId
 
         if debugActiveThread = 0 then
@@ -430,14 +434,21 @@ type internal GraphContext() =
                 "Adaptive graph accessed concurrently from two threads. A graph is confined to one thread at a time; cross-thread changes must be posted to the owner thread."
 
         debugClaimDepth <- debugClaimDepth + 1
+#endif
+        operationDepth <- operationDepth + 1
 
-    /// Debug builds only: release one claim of ClaimOwner at the end of an operation.
-    [<Conditional("DEBUG")>]
-    member internal _.ReleaseOwner() =
+        if operationDepth = 1 && not this.TxActive then
+            this.DrainIfPending()
+
+    /// Release one claim of ClaimOwner at the end of an operation.
+    member internal this.ReleaseOwner() =
+#if DEBUG
         debugClaimDepth <- debugClaimDepth - 1
 
         if debugClaimDepth = 0 then
             debugActiveThread <- 0
+#endif
+        operationDepth <- operationDepth - 1
 
     member internal this.EnterEvaluation() =
         this.ClaimOwner()
@@ -506,29 +517,21 @@ type internal GraphContext() =
 
     member internal _.PostRing = postRing
 
-    /// Apply all posted changes on the owner thread. One application per source per
-    /// window: duplicate posts collapse to the last value. Notifications are
-    /// delivered after the drain, like after a transaction. When a transaction is
-    /// already active, posts apply immediately and notifications defer to its commit.
-    member internal this.Pump() =
-        this.ClaimOwner()
+    /// Apply all pending posts as one batch with one notification delivery.
+    /// Called automatically on the outermost claim of any graph operation, and
+    /// from Pump. No-op when the ring is empty.
+    member private this.DrainIfPending() =
+        if not postRing.IsEmpty then
+            let wasActive = this.TxActive
+            this.TxActive <- true
 
-        try
-            if not postRing.IsEmpty then
-                if this.TxActive then
-                    this.DrainPosts()
-                else
-                    // Apply the drain in one batch, then deliver notifications once.
-                    this.TxActive <- true
+            try
+                this.DrainPosts()
+            finally
+                this.TxActive <- wasActive
 
-                    try
-                        this.DrainPosts()
-                    finally
-                        this.TxActive <- false
-
-                    this.DeliverNotifications()
-        finally
-            this.ReleaseOwner()
+            if not wasActive then
+                this.DeliverNotifications()
 
     /// Drain the ring, applying each pending posted value. Owner thread only.
     member private this.DrainPosts() =
@@ -537,6 +540,17 @@ type internal GraphContext() =
         while item.IsSome do
             (unbox<IPostSource> item.Value).ApplyPosted()
             item <- postRing.TryDequeue()
+
+    /// Apply all pending posts now. Draining is automatic at the start of every
+    /// graph operation, so this is optional: use it to choose an explicit batch
+    /// boundary (for example, once per frame). No-op when nothing is pending.
+    member internal this.Pump() =
+        this.ClaimOwner()
+
+        try
+            this.DrainIfPending()
+        finally
+            this.ReleaseOwner()
 
     /// Deliver every queued notification. Notifications queued during delivery
     /// are delivered in the same drain.
@@ -586,29 +600,33 @@ module internal AdaptiveRuntime =
 /// <remarks>
 /// <para>
 /// A graph is confined to one owner thread: all reads and writes happen there.
-/// Foreign threads may only call <c>Post</c> on changeable values. The owner thread
-/// calls <c>Posting.pump()</c> once per frame or batch to apply the pending posts.
+/// Foreign threads may only call <c>Post</c> on changeable values. Pending posts are
+/// applied automatically at the start of the next graph operation on the owner
+/// thread, as one batch with one notification delivery. No pump call is required.
 /// </para>
 /// <para>
-/// Pending posts are applied in one batch: every posted source is applied at most
-/// once per pump, with the last posted value winning. The source equality check
-/// still applies, so posting an equal value does not mark. <c>pump</c> is cheap when
-/// the queue is empty and allocates nothing.
+/// Every posted source is applied at most once per batch, with the last posted value
+/// winning. The source equality check still applies, so posting an equal value does
+/// not mark. <c>Posting.pump()</c> forces application at a chosen boundary and is
+/// cheap when the queue is empty; it allocates nothing.
 /// </para>
 /// </remarks>
 /// <example>
 /// <code>
 /// // worker thread
 /// cval.Post(health - 1)
-/// // owner thread, once per frame
-/// Posting.pump()
+/// // owner thread: the next read applies the post automatically
+/// let h = AVal.getValue health
 /// </code>
 /// </example>
 module Posting =
-    /// <summary>Applies all pending posted changes on the owner thread.</summary>
+    /// <summary>
+    /// Applies all pending posted changes now. Optional: pending posts are applied
+    /// automatically at the next graph operation. Use this to choose an explicit
+    /// batch boundary (for example, once per frame).
+    /// </summary>
     /// <remarks>
-    /// Must be called on the owner thread. Posts from foreign threads that are not
-    /// yet in the queue stay pending until a later pump.
+    /// Must be called on the owner thread.
     /// </remarks>
     let pump () = GraphContext.Default.Pump()
 
@@ -886,10 +904,11 @@ and ChangeableValue<'T>(initial: 'T) =
         pendingValue <- Unchecked.defaultof<'T>
 
     /// <summary>
-    /// Posts a new value from any thread. The value is applied by <c>Posting.pump()</c>
-    /// on the owner thread. Several posts to this source between two pumps collapse
-    /// to the last value. The source equality check applies at application, so
-    /// posting an equal value does not mark. Allocates nothing.
+    /// Posts a new value from any thread. The value is applied automatically at the
+    /// next graph operation on the owner thread — no pump call is needed. Several
+    /// posts to this source before the application collapse to the last value. The
+    /// source equality check applies at application, so posting an equal value does
+    /// not mark. Allocates nothing.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -903,8 +922,8 @@ and ChangeableValue<'T>(initial: 'T) =
     /// <code>
     /// // worker thread
     /// health.Post(healthValue - 1)
-    /// // owner thread, once per frame
-    /// Posting.pump()
+    /// // owner thread: the next read applies the post automatically
+    /// let h = AVal.getValue health
     /// </code>
     /// </example>
     member this.Post(newValue: 'T) =
@@ -2202,15 +2221,16 @@ module CVal =
     let inline set (value: 'T) (cval: ChangeableValue<'T>) = cval.Set value
 
     /// <summary>
-    /// Posts a new value from any thread. The value is applied by <c>Posting.pump()</c>
-    /// on the owner thread. See <see cref="ChangeableValue&lt;'T&gt;.Post"/>.
+    /// Posts a new value from any thread. The value is applied automatically at the
+    /// next graph operation on the owner thread. See
+    /// <see cref="ChangeableValue&lt;'T&gt;.Post"/>.
     /// </summary>
     /// <example>
     /// <code>
     /// // worker thread
     /// CVal.post (health - 1) health
-    /// // owner thread, once per frame
-    /// Posting.pump()
+    /// // owner thread: the next read applies the post automatically
+    /// let h = AVal.getValue health
     /// </code>
     /// </example>
     let inline post (value: 'T) (cval: ChangeableValue<'T>) = cval.Post value

@@ -12,7 +12,7 @@ focus on memory efficiency and tight-loop (game/simulation) workloads.
 - **Lazy pull evaluation** — values recompute only when read and dirty
 - **Incremental collections** — adaptive sets/maps propagate element-level deltas
 - **Low allocation** — zero allocation on steady-state reads and writes
-- **Owner-thread confinement** — one thread per graph; foreign threads send changes with lock-free `Post`, the owner applies them with `Posting.pump()`
+- **Owner-thread confinement** — one thread per graph; foreign threads send changes with lock-free `Post`, applied automatically at the owner's next graph operation (optional explicit `Posting.pump()`)
 - **Transactions** — batch updates applied atomically at commit
 
 ## Installation
@@ -83,26 +83,29 @@ still see the pre-transaction values.
 ### Cross-thread posting
 
 A graph belongs to one **owner thread**. Only the owner reads and writes the graph.
-Foreign threads send changes with `Post`; the owner applies them with `Posting.pump()`:
+Foreign threads send changes with `Post`; the owner's next graph operation applies them
+automatically:
 
 ```fsharp
 // worker thread
 CVal.post (health - 1) health
 
-// owner thread, once per frame
-Posting.pump()
+// owner thread: no pump call needed
+let h = AVal.getValue health
 ```
 
 Posting rules:
 
 - `Post` is lock-free and allocates nothing. It writes a typed pending field and, if the
   source is not queued yet, pushes the source onto a bounded preallocated ring.
-- All posts pending at a pump are applied in one batch. Several posts to one source in a
-  window collapse to one application of the last value.
+- Pending posts are applied automatically at the start of the next graph operation on
+  the owner thread, as one batch with one notification delivery. Several posts to one
+  source before the application collapse to one application of the last value.
 - The source equality check still applies at application: posting an equal value marks
   nothing.
-- `Posting.pump()` runs on the owner thread only; it is cheap and allocation-free when
-  the queue is empty. Posts that arrive between pumps stay pending until the next pump.
+- `Posting.pump()` is optional: it forces application at a chosen boundary (for
+  example, once per frame). It runs on the owner thread only and is cheap and
+  allocation-free when the queue is empty.
 
 ### Adaptive collections
 
