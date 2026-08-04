@@ -3,19 +3,19 @@ namespace AdaptiveSlop.Core
 open System
 open System.Buffers
 open System.Collections.Generic
-open System.Threading
+open System.Diagnostics
 open System.Threading.Tasks
 
 /// <summary>
-/// Represents the dirty state of an adaptive node for lazy push invalidation.
+/// Represents the dirty state of an adaptive node. Writes mark; reads recompute.
 /// </summary>
 /// <remarks>
 /// <para>
-/// AdaptiveSlop uses a hybrid pull/push model:
+/// AdaptiveSlop uses a push-mark, pull-evaluate model:
 /// <list type="bullet">
-/// <item><description><c>Clean</c>: Node is up-to-date, no recomputation needed</description></item>
-/// <item><description><c>Dirty</c>: Node was invalidated by a dependency change, needs recomputation</description></item>
-/// <item><description><c>MaybeDirty</c>: Parent links are incomplete, fall back to version checking</description></item>
+/// <item><description><c>Clean</c>: Observed node is up-to-date; the next read is one flag check</description></item>
+/// <item><description><c>Dirty</c>: Node was marked by a dependency change; the next read recomputes</description></item>
+/// <item><description><c>MaybeDirty</c>: Node is unobserved or its links can be stale; the next read version-checks</description></item>
 /// </list>
 /// </para>
 /// </remarks>
@@ -39,17 +39,6 @@ type IAdaptiveObject =
     abstract member Version: int64
 
 /// <summary>
-/// Internal interface for nodes that support dirty propagation (push invalidation).
-/// </summary>
-/// <remarks>
-/// When a source value changes, it calls <c>MarkDirty()</c> on all registered parent nodes,
-/// which propagate the dirty state up the dependency graph.
-/// </remarks>
-type internal IMarkable =
-    /// <summary>Marks this node as dirty, triggering recomputation on next read.</summary>
-    abstract member MarkDirty: unit -> unit
-
-/// <summary>
 /// An adaptive value that automatically tracks dependencies and recomputes when inputs change.
 /// </summary>
 /// <typeparam name="T">The type of the value.</typeparam>
@@ -59,8 +48,9 @@ type internal IMarkable =
 /// the system checks if any dependencies have changed and recomputes if necessary.
 /// </para>
 /// <para>
-/// <strong>Thread safety:</strong> All operations are thread-safe. Multiple threads can
-/// read and modify the dependency graph concurrently.
+/// <strong>Threading:</strong> A graph is confined to one owner thread. All reads and
+/// writes must run on that thread. Cross-thread changes must be posted to the owner
+/// thread, never applied directly.
 /// </para>
 /// </remarks>
 type IAdaptiveValue<'T> =
@@ -114,282 +104,348 @@ type internal IMapSinkRegistry =
     abstract member AddMapSink: sink: obj -> unit
     abstract member RemoveMapSink: sink: obj -> unit
 
-module Transaction =
-    type ICommit =
-        abstract member Commit: unit -> unit
+/// <summary>
+/// A unit of deferred work applied at transaction commit.
+/// </summary>
+type ICommit =
+    /// <summary>Applies the deferred work.</summary>
+    abstract member Commit: unit -> unit
+    /// <summary>Discards the deferred work after a transaction rollback.</summary>
+    abstract member Abort: unit -> unit
 
-    type private TransactionState() =
-        let mutable buffer: ICommit[] = Array.zeroCreate 8
-        let mutable count = 0
+/// <summary>
+/// Internal. An observation sink that receives its callback after a batch or a write.
+/// </summary>
+type internal INotifiable =
+    /// <summary>Delivers the pending notification.</summary>
+    abstract member Deliver: unit -> unit
 
-        member _.Reset() =
-            if count > 0 then
-                Array.Clear(buffer, 0, count)
-                count <- 0
+/// <summary>
+/// Internal. Reusable buffer of commit actions for one graph context.
+/// </summary>
+type internal TransactionBuffer() =
+    let mutable buffer: ICommit[] = Array.zeroCreate 8
+    let mutable count = 0
 
-        member _.Enqueue(action: ICommit) =
-            if count = buffer.Length then
-                let next = Array.zeroCreate (buffer.Length * 2)
-                Array.Copy(buffer, next, buffer.Length)
-                buffer <- next
-
-            buffer[count] <- action
-            count <- count + 1
-
-        member _.Commit() =
-            let mutable i = 0
-
-            while i < count do
-                buffer[i].Commit()
-                i <- i + 1
-
+    member _.Reset() =
+        if count > 0 then
             Array.Clear(buffer, 0, count)
             count <- 0
 
-    type private TransactionContext =
-        [<ThreadStatic; DefaultValue>]
-        static val mutable private current: TransactionState voption
+    member _.Enqueue(action: ICommit) =
+        if count = buffer.Length then
+            let next = Array.zeroCreate (buffer.Length * 2)
+            Array.Copy(buffer, next, buffer.Length)
+            buffer <- next
 
-        [<ThreadStatic; DefaultValue>]
-        static val mutable private reusable: TransactionState
+        buffer[count] <- action
+        count <- count + 1
 
-        static member Get() = TransactionContext.current
-        static member Set(value: TransactionState voption) = TransactionContext.current <- value
+    member _.Commit() =
+        let mutable i = 0
 
-        static member GetReusable() =
-            let value = TransactionContext.reusable
+        while i < count do
+            buffer[i].Commit()
+            i <- i + 1
 
-            if obj.ReferenceEquals(value, null) then
-                let created = TransactionState()
-                TransactionContext.reusable <- created
-                created
-            else
-                value
+        Array.Clear(buffer, 0, count)
+        count <- 0
 
-    let inline private getCurrent () =
-        let value = TransactionContext.Get()
+    member _.Abort() =
+        let mutable i = 0
 
-        if obj.ReferenceEquals(value, null) then
-            ValueNone
+        while i < count do
+            buffer[i].Abort()
+            i <- i + 1
+
+        Array.Clear(buffer, 0, count)
+        count <- 0
+
+/// <summary>
+/// Internal. Re-entrant dependency collector with stack frames.
+/// One instance lives on each graph context.
+/// </summary>
+type internal DependencyCollector() =
+    let mutable depBuffer: IAdaptiveObject[] = Array.zeroCreate 16
+    let mutable versionBuffer: int64[] = Array.zeroCreate 16
+    let mutable count = 0
+    // Frame stack: stores the starting index of each nested evaluation
+    let mutable frameStarts: int[] = Array.zeroCreate 8
+    let mutable frameDepth = 0
+
+    member _.Reset() =
+        count <- 0
+        frameDepth <- 0
+
+    member _.FrameDepth = frameDepth
+
+    member _.Add(dep: IAdaptiveObject, version: int64) =
+        if count = depBuffer.Length then
+            let newSize = depBuffer.Length * 2
+            let nextDeps = Array.zeroCreate newSize
+            let nextVersions = Array.zeroCreate newSize
+            Array.Copy(depBuffer, nextDeps, depBuffer.Length)
+            Array.Copy(versionBuffer, nextVersions, versionBuffer.Length)
+            depBuffer <- nextDeps
+            versionBuffer <- nextVersions
+
+        depBuffer[count] <- dep
+        versionBuffer[count] <- version
+        count <- count + 1
+
+    member _.PushFrame() =
+        if frameDepth = frameStarts.Length then
+            let next = Array.zeroCreate (frameStarts.Length * 2)
+            Array.Copy(frameStarts, next, frameStarts.Length)
+            frameStarts <- next
+
+        frameStarts[frameDepth] <- count
+        frameDepth <- frameDepth + 1
+
+    member _.PopFrame() =
+        frameDepth <- frameDepth - 1
+        count <- frameStarts[frameDepth]
+        frameDepth
+
+    /// Get the current frame's deps (depBuffer, versionBuffer, start, length)
+    /// Returns struct tuple to avoid heap allocation
+    member _.CurrentFrame() =
+        let start = if frameDepth > 0 then frameStarts[frameDepth - 1] else 0
+        struct (depBuffer, versionBuffer, start, count - start)
+
+/// <summary>
+/// Internal. A node that depends on other adaptive objects. It can be stored
+/// as a parent in the edge list of its dependencies.
+/// </summary>
+type internal IAdaptiveNode =
+    /// Marks this node dirty. Called by a dependency when the dependency changes.
+    abstract member MarkDirty: unit -> unit
+    /// Writes the position of this node in the parents array of the dependency
+    /// at <paramref name="depIndex"/>. Called when edges are added and when a
+    /// swap-pop removal moves this node. A <paramref name="depIndex"/> of -1
+    /// means the parent has no dependency list (an observation sink).
+    abstract member SetDepSlot: depIndex: int * parentIndex: int -> unit
+    /// Called when this node gains its first parent.
+    abstract member OnFirstParent: unit -> unit
+    /// Called when this node loses its last parent.
+    abstract member OnLastParent: unit -> unit
+
+/// <summary>
+/// Internal. An object that can hold parents: the target of an edge.
+/// </summary>
+type internal IEdgeTarget =
+    /// The number of parents currently stored.
+    abstract member EdgeCount: int
+    /// Appends <paramref name="parent"/> and returns its index in the parents
+    /// array. <paramref name="depIndex"/> is the position of this object in the
+    /// dependency list of the parent (-1 for observation sinks).
+    abstract member AddEdge: parent: IAdaptiveNode * depIndex: int -> int
+    /// Removes the edge at <paramref name="index"/> with swap-pop. O(1).
+    abstract member RemoveEdgeAt: index: int -> unit
+
+/// <summary>
+/// Internal. Edge storage of one object: the parents that depend on it, and for
+/// each parent the position of this object in the dependency list of that parent.
+/// Removal is swap-pop with slot fixup on the moved parent. O(1), no allocation
+/// except array growth.
+/// </summary>
+type internal ParentEdges() =
+    let mutable parents: IAdaptiveNode[] = Array.empty
+    let mutable slots: int[] = Array.empty
+    let mutable count = 0
+
+    member _.Count = count
+
+    member _.Item
+        with get (index: int) = parents[index]
+
+    member _.Add(parent: IAdaptiveNode, depIndex: int) : int =
+        if count = parents.Length then
+            let newLength = if parents.Length = 0 then 4 else parents.Length * 2
+            let nextParents = Array.zeroCreate newLength
+            let nextSlots = Array.zeroCreate newLength
+            Array.Copy(parents, nextParents, parents.Length)
+            Array.Copy(slots, nextSlots, slots.Length)
+            parents <- nextParents
+            slots <- nextSlots
+
+        parents[count] <- parent
+        slots[count] <- depIndex
+        count <- count + 1
+        count - 1
+
+    member _.RemoveAt(index: int) =
+        count <- count - 1
+
+        if index < count then
+            // Move the last entry into the removed position and fix its slot.
+            let moved = parents[count]
+            let movedSlot = slots[count]
+            parents[index] <- moved
+            slots[index] <- movedSlot
+            parents[count] <- Unchecked.defaultof<IAdaptiveNode>
+            slots[count] <- 0
+            moved.SetDepSlot(movedSlot, index)
         else
-            value
+            parents[count] <- Unchecked.defaultof<IAdaptiveNode>
+            slots[count] <- 0
 
-    let inline private setCurrent value = TransactionContext.Set(value)
+    member _.Clear() =
+        if count > 0 then
+            Array.Clear(parents, 0, count)
+            Array.Clear(slots, 0, count)
+            count <- 0
 
-    let internal tryEnqueue (action: ICommit) =
-        match getCurrent () with
-        | ValueSome tx ->
-            tx.Enqueue(action)
-            true
-        | ValueNone -> false
+/// <summary>
+/// Internal. Holds all mutable runtime state of one adaptive graph.
+/// </summary>
+/// <remarks>
+/// The graph is confined to its owner thread: every operation must run on the
+/// thread that created the context. The core contains no locks. In debug builds
+/// an access from a foreign thread throws.
+/// </remarks>
+type internal GraphContext() =
+    let mutable evaluationId = 0L
+    let mutable evaluationDepth = 0
+    let collector = DependencyCollector()
+    let mutable collectorActive = false
+    let txBuffer = TransactionBuffer()
+    let mutable txActive = false
+    // DEBUG only: thread id of the thread inside graph operations, plus a claim
+    // depth for nested operations. 0 = idle.
+    let mutable debugActiveThread = 0
+    let mutable debugClaimDepth = 0
+    // Pooled marking stack for iterative dirty propagation.
+    let mutable markStack: IAdaptiveNode[] = Array.zeroCreate 64
+    let mutable markCount = 0
+    // Pooled notification queue. Delivered after a batch or a non-batched write.
+    let mutable notifications: INotifiable[] = Array.zeroCreate 16
+    let mutable notifyCount = 0
 
-    let internal tryEnqueueFactory (factory: unit -> ICommit) =
-        match getCurrent () with
-        | ValueSome tx ->
-            tx.Enqueue(factory ())
-            true
-        | ValueNone -> false
+    static let defaultContext = GraphContext()
 
-    let run (f: unit -> 'T) =
-        match getCurrent () with
-        | ValueSome _ -> f ()
-        | ValueNone ->
-            let tx = TransactionContext.GetReusable()
-            tx.Reset()
-            setCurrent (ValueSome tx)
+    /// The context of the ambient (default) graph.
+    static member internal Default = defaultContext
 
-            try
-                let result = f ()
-                tx.Commit()
-                result
-            finally
-                tx.Reset()
-                setCurrent ValueNone
+    member internal _.EvaluationId = evaluationId
 
-/// Internal module for managing parent (dependent) links for dirty propagation
-module internal ParentTracking =
-    /// Compact parent storage: inline single parent, array for multiple
-    [<Struct>]
-    type Parents =
-        | NoParents
-        | SingleParent of single: IMarkable
-        | MultipleParents of parents: IMarkable[]
+    /// Debug builds only: claim the graph for the current thread at the start of
+    /// an operation. Throws when another thread is inside a graph operation.
+    /// Sequential use from different threads is allowed: the claim is released
+    /// when the outermost operation ends. Pair every call with ReleaseOwner.
+    [<Conditional("DEBUG")>]
+    member internal _.ClaimOwner() =
+        let tid = Environment.CurrentManagedThreadId
 
-    /// Add a parent to the parent list
-    let addParent (current: Parents) (parent: IMarkable) : Parents =
-        match current with
-        | NoParents -> SingleParent parent
-        | SingleParent existing ->
-            if obj.ReferenceEquals(existing, parent) then
-                current
-            else
-                MultipleParents [| existing; parent |]
-        | MultipleParents arr ->
-            // Check if already present
-            let mutable found = false
+        if debugActiveThread = 0 then
+            debugActiveThread <- tid
+        elif debugActiveThread <> tid then
+            invalidOp
+                "Adaptive graph accessed concurrently from two threads. A graph is confined to one thread at a time; cross-thread changes must be posted to the owner thread."
 
-            for p in arr do
-                if obj.ReferenceEquals(p, parent) then
-                    found <- true
+        debugClaimDepth <- debugClaimDepth + 1
 
-            if found then
-                current
-            else
-                let newArr = Array.zeroCreate (arr.Length + 1)
-                Array.Copy(arr, newArr, arr.Length)
-                newArr.[arr.Length] <- parent
-                MultipleParents newArr
+    /// Debug builds only: release one claim of ClaimOwner at the end of an operation.
+    [<Conditional("DEBUG")>]
+    member internal _.ReleaseOwner() =
+        debugClaimDepth <- debugClaimDepth - 1
 
-    /// Remove a parent from the parent list
-    let removeParent (current: Parents) (parent: IMarkable) : Parents =
-        match current with
-        | NoParents -> NoParents
-        | SingleParent existing ->
-            if obj.ReferenceEquals(existing, parent) then
-                NoParents
-            else
-                current
-        | MultipleParents arr ->
-            let newArr =
-                [| for p in arr do
-                       if obj.ReferenceEquals(p, parent) then
-                           p |]
+        if debugClaimDepth = 0 then
+            debugActiveThread <- 0
 
-            match newArr.Length with
-            | 0 -> NoParents
-            | 1 -> SingleParent newArr.[0]
-            | _ -> MultipleParents newArr
+    member internal this.EnterEvaluation() =
+        this.ClaimOwner()
 
-    /// Mark all parents as dirty (propagate invalidation)
-    let markParentsDirty (parents: Parents) =
-        match parents with
-        | NoParents -> ()
-        | SingleParent p -> p.MarkDirty()
-        | MultipleParents arr ->
-            for p in arr do
-                p.MarkDirty()
+        if evaluationDepth = 0 then
+            evaluationId <- evaluationId + 1L
+
+        evaluationDepth <- evaluationDepth + 1
+
+    member internal this.ExitEvaluation() =
+        evaluationDepth <- evaluationDepth - 1
+        this.ReleaseOwner()
+
+    member internal _.Collector = collector
+
+    member internal _.CollectorActive
+        with get () = collectorActive
+        and set value = collectorActive <- value
+
+    member internal _.TxBuffer = txBuffer
+
+    member internal _.TxActive
+        with get () = txActive
+        and set value = txActive <- value
+
+    /// Push one node onto the marking stack. Amortized O(1), array growth only.
+    member internal _.PushDirty(node: IAdaptiveNode) =
+        if markCount = markStack.Length then
+            let next = Array.zeroCreate (markStack.Length * 2)
+            Array.Copy(markStack, next, markStack.Length)
+            markStack <- next
+
+        markStack[markCount] <- node
+        markCount <- markCount + 1
+
+    /// Drain the marking stack. Iterative: no recursion.
+    member internal this.PropagateDirty() =
+        while markCount > 0 do
+            markCount <- markCount - 1
+            let node = markStack[markCount]
+            markStack[markCount] <- Unchecked.defaultof<IAdaptiveNode>
+            node.MarkDirty()
+
+    /// Mark every parent in the edge list and propagate. Delivers queued
+    /// notifications when no transaction is running.
+    member internal this.MarkFrom(edges: ParentEdges) =
+        for i in 0 .. edges.Count - 1 do
+            this.PushDirty(edges[i])
+
+        this.PropagateDirty()
+
+        if not txActive then
+            this.DeliverNotifications()
+
+    /// Queue one notification sink for delivery.
+    member internal _.EnqueueNotification(sink: INotifiable) =
+        if notifyCount = notifications.Length then
+            let next = Array.zeroCreate (notifications.Length * 2)
+            Array.Copy(notifications, next, notifications.Length)
+            notifications <- next
+
+        notifications[notifyCount] <- sink
+        notifyCount <- notifyCount + 1
+
+    /// Deliver every queued notification. Notifications queued during delivery
+    /// are delivered in the same drain.
+    member internal _.DeliverNotifications() =
+        while notifyCount > 0 do
+            notifyCount <- notifyCount - 1
+            let sink = notifications[notifyCount]
+            notifications[notifyCount] <- Unchecked.defaultof<INotifiable>
+            sink.Deliver()
 
 module internal AdaptiveRuntime =
-    /// Thread-static evaluation context for caching dirty checks within a single evaluation.
-    /// This prevents O(depth^2) work in deep chains by ensuring each node is checked once per eval.
-    type private EvaluationContext =
-        [<ThreadStatic; DefaultValue>]
-        static val mutable private currentId: int64
+    let internal getEvaluationId () = GraphContext.Default.EvaluationId
 
-        [<ThreadStatic; DefaultValue>]
-        static val mutable private depth: int
-
-        static member GetCurrentId() = EvaluationContext.currentId
-
-        /// Called at top-level read to start a new evaluation scope
-        static member Enter() =
-            if EvaluationContext.depth = 0 then
-                EvaluationContext.currentId <- EvaluationContext.currentId + 1L
-
-            EvaluationContext.depth <- EvaluationContext.depth + 1
-
-        /// Called when top-level read completes
-        static member Exit() =
-            EvaluationContext.depth <- EvaluationContext.depth - 1
-
-    let internal getEvaluationId () = EvaluationContext.GetCurrentId()
-    let internal enterEvaluation () = EvaluationContext.Enter()
-    let internal exitEvaluation () = EvaluationContext.Exit()
-
-    /// Re-entrant dependency collector with stack frames.
-    /// Uses two parallel arrays (original format) with frame support.
-    type DependencyCollector() =
-        let mutable depBuffer: IAdaptiveObject[] = Array.zeroCreate 16
-        let mutable versionBuffer: int64[] = Array.zeroCreate 16
-        let mutable count = 0
-        // Frame stack: stores the starting index of each nested evaluation
-        let mutable frameStarts: int[] = Array.zeroCreate 8
-        let mutable frameDepth = 0
-
-        member _.Reset() =
-            count <- 0
-            frameDepth <- 0
-
-        member _.Add(dep: IAdaptiveObject, version: int64) =
-            if count = depBuffer.Length then
-                let newSize = depBuffer.Length * 2
-                let nextDeps = Array.zeroCreate newSize
-                let nextVersions = Array.zeroCreate newSize
-                Array.Copy(depBuffer, nextDeps, depBuffer.Length)
-                Array.Copy(versionBuffer, nextVersions, versionBuffer.Length)
-                depBuffer <- nextDeps
-                versionBuffer <- nextVersions
-
-            depBuffer[count] <- dep
-            versionBuffer[count] <- version
-            count <- count + 1
-
-        member _.PushFrame() =
-            if frameDepth = frameStarts.Length then
-                let next = Array.zeroCreate (frameStarts.Length * 2)
-                Array.Copy(frameStarts, next, frameStarts.Length)
-                frameStarts <- next
-
-            frameStarts[frameDepth] <- count
-            frameDepth <- frameDepth + 1
-
-        member _.PopFrame() =
-            frameDepth <- frameDepth - 1
-            count <- frameStarts[frameDepth]
-
-        /// Get the current frame's deps (depBuffer, versionBuffer, start, length)
-        /// Returns struct tuple to avoid heap allocation
-        member _.CurrentFrame() =
-            let start = if frameDepth > 0 then frameStarts[frameDepth - 1] else 0
-            struct (depBuffer, versionBuffer, start, count - start)
-
-    type private DependencyContext =
-        [<ThreadStatic; DefaultValue>]
-        static val mutable private current: DependencyCollector voption
-
-        [<ThreadStatic; DefaultValue>]
-        static val mutable private reusable: DependencyCollector
-
-        static member GetCurrent() = DependencyContext.current
-        static member SetCurrent(value: DependencyCollector voption) = DependencyContext.current <- value
-
-        static member GetReusable() =
-            let value = DependencyContext.reusable
-
-            if obj.ReferenceEquals(value, null) then
-                let created = DependencyCollector()
-                DependencyContext.reusable <- created
-                created
-            else
-                value
-
-    let private getCurrent () =
-        let value = DependencyContext.GetCurrent()
-
-        if obj.ReferenceEquals(value, null) then
-            ValueNone
-        else
-            value
-
-    let private setCurrent value = DependencyContext.SetCurrent(value)
+    let internal enterEvaluation () = GraphContext.Default.EnterEvaluation()
+    let internal exitEvaluation () = GraphContext.Default.ExitEvaluation()
 
     /// Add a dependency with its current committed version.
-    /// Must be called INSIDE the lock after any recomputation, so version is stable.
-    let addDependency (dep: IAdaptiveObject) (version: int64) =
-        match getCurrent () with
-        | ValueSome collector -> collector.Add(dep, version)
-        | ValueNone -> ()
+    let internal addDependency (dep: IAdaptiveObject) (version: int64) =
+        let ctx = GraphContext.Default
+
+        if ctx.CollectorActive then
+            ctx.Collector.Add(dep, version)
 
     /// Collect dependencies during evaluation. Returns struct tuple to avoid heap allocation.
-    let collect (f: unit -> 'T) =
-        let collector =
-            match getCurrent () with
-            | ValueSome c -> c // Reuse existing collector (nested evaluation)
-            | ValueNone ->
-                let reusable = DependencyContext.GetReusable()
-                reusable.Reset()
-                setCurrent (ValueSome reusable)
-                reusable
+    let internal collect (f: unit -> 'T) =
+        let ctx = GraphContext.Default
+        let collector = ctx.Collector
+
+        if not ctx.CollectorActive then
+            collector.Reset()
+            ctx.CollectorActive <- true
 
         collector.PushFrame()
 
@@ -398,7 +454,53 @@ module internal AdaptiveRuntime =
             let struct (deps, versions, start, len) = collector.CurrentFrame()
             struct (value, deps, versions, start, len)
         finally
-            collector.PopFrame()
+            if collector.PopFrame() = 0 then
+                ctx.CollectorActive <- false
+
+module Transaction =
+    /// <summary>
+    /// Runs a function as a transaction. Writes inside the transaction are deferred
+    /// and applied at commit. Nested calls join the running transaction.
+    /// Reads inside a transaction see the pre-transaction values.
+    /// Notifications are delivered after the outermost transaction commits.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// Transaction.run (fun () ->
+    ///     a.Set(1)
+    ///     b.Set(2)) |> ignore
+    /// </code>
+    /// </example>
+    let run (f: unit -> 'T) =
+        let ctx = GraphContext.Default
+        ctx.ClaimOwner()
+
+        try
+            if ctx.TxActive then
+                f ()
+            else
+                ctx.TxActive <- true
+                ctx.TxBuffer.Reset()
+                let mutable committed = false
+
+                let result =
+                    try
+                        let value = f ()
+                        ctx.TxBuffer.Commit()
+                        committed <- true
+                        value
+                    finally
+                        if not committed then
+                            ctx.TxBuffer.Abort()
+
+                        ctx.TxActive <- false
+                // The transaction is closed: notifications see a consistent graph,
+                // and callbacks that write apply directly.
+                ctx.DeliverNotifications()
+                result
+        finally
+            ctx.ReleaseOwner()
+
 
 type ConstantValue<'T>(value: 'T) =
     interface IAdaptiveValue<'T> with
@@ -409,15 +511,17 @@ type ConstantValue<'T>(value: 'T) =
         member _.Version = 0L
 
 and AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
-    let syncRoot = obj ()
     let mutable version = 0L
     let mutable hasValue = false
     let mutable value = Unchecked.defaultof<'T>
     let mutable deps: IAdaptiveObject[] = Array.empty
-    let mutable depsFromPool = false
     let mutable depVersions: int64[] = Array.empty
-    let mutable versionsFromPool = false
+    // Position of this node in the parents array of each dependency. -1 = no edge.
+    let mutable depSlots: int[] = Array.empty
+    let mutable arraysFromPool = false
     let mutable depCount = 0
+    let edges = ParentEdges()
+    let mutable dirtyState = DirtyState.MaybeDirty
     // Per-evaluation dirty cache to avoid O(depth^2) in deep chains
     let mutable lastCheckedEvalId = 0L
     let mutable dirtyCache = true
@@ -434,7 +538,14 @@ and AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
             let dirty =
                 if not hasValue then
                     true
+                elif dirtyState = DirtyState.Dirty then
+                    // Marked by a dependency change.
+                    true
+                elif dirtyState = DirtyState.Clean && edges.Count > 0 then
+                    // Observed and not marked: one flag check, no version reads.
+                    false
                 else
+                    // Unobserved, or links can be stale: version check.
                     let mutable d = false
                     let mutable i = 0
 
@@ -450,49 +561,79 @@ and AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
             dirtyCache <- dirty
             dirty
 
+    /// Remove every edge from the stored dependencies to this node. O(depCount).
+    member private this.TearDownEdges() =
+        for j in 0 .. depCount - 1 do
+            if depSlots[j] >= 0 then
+                (deps[j] :?> IEdgeTarget).RemoveEdgeAt(depSlots[j])
+                depSlots[j] <- -1
+
+    /// Add an edge from every stored dependency to this node. O(depCount).
+    member private this.BuildEdges() =
+        for j in 0 .. depCount - 1 do
+            depSlots[j] <-
+                match deps[j] with
+                | :? IEdgeTarget as target -> target.AddEdge(this, j)
+                | _ -> -1
+
+    /// Registration cascade: this node gained its first parent.
+    member private this.RegisterWithDeps() =
+        this.BuildEdges()
+        // Links can be stale; the next read must version-check.
+        dirtyState <- DirtyState.MaybeDirty
+
+    /// Unregistration cascade: this node lost its last parent.
+    member private this.UnregisterFromDeps() =
+        this.TearDownEdges()
+        dirtyState <- DirtyState.MaybeDirty
+
     member private this.Recompute() =
+        let observed = edges.Count > 0
+
         let struct (newValue, newDeps, newVersions, newStart, newLen) =
             AdaptiveRuntime.collect compute
 
         value <- newValue
 
-        if newLen = 0 then
-            if depsFromPool && deps.Length > 0 then
+        // Compare the new dependency set with the stored set (same order, by reference).
+        let mutable sameSet = newLen = depCount
+        let mutable i = 0
+
+        while sameSet && i < newLen do
+            if not (obj.ReferenceEquals(newDeps[newStart + i], deps[i])) then
+                sameSet <- false
+
+            i <- i + 1
+
+        if observed && not sameSet then
+            this.TearDownEdges()
+
+        // Store the new dependency set and the version snapshots.
+        if deps.Length < newLen then
+            if arraysFromPool && deps.Length > 0 then
                 ArrayPool<IAdaptiveObject>.Shared.Return(deps, true)
-
-            if versionsFromPool && depVersions.Length > 0 then
                 ArrayPool<int64>.Shared.Return(depVersions, true)
+                ArrayPool<int>.Shared.Return(depSlots, true)
 
-            deps <- Array.empty
-            depVersions <- Array.empty
-            depsFromPool <- false
-            versionsFromPool <- false
-            depCount <- 0
-        else
-            if deps.Length < newLen then
-                if depsFromPool && deps.Length > 0 then
-                    ArrayPool<IAdaptiveObject>.Shared.Return(deps, true)
+            deps <- ArrayPool<IAdaptiveObject>.Shared.Rent(newLen)
+            depVersions <- ArrayPool<int64>.Shared.Rent(newLen)
+            depSlots <- ArrayPool<int>.Shared.Rent(newLen)
+            arraysFromPool <- true
 
-                deps <- ArrayPool<IAdaptiveObject>.Shared.Rent(newLen)
-                depsFromPool <- true
+        Array.Copy(newDeps, newStart, deps, 0, newLen)
+        Array.Copy(newVersions, newStart, depVersions, 0, newLen)
 
-            if depVersions.Length < newLen then
-                if versionsFromPool && depVersions.Length > 0 then
-                    ArrayPool<int64>.Shared.Return(depVersions, true)
+        if depCount > newLen then
+            Array.Clear(deps, newLen, depCount - newLen)
 
-                depVersions <- ArrayPool<int64>.Shared.Rent(newLen)
-                versionsFromPool <- true
-            // Copy from collector's frame using Array.Copy (faster than loop)
-            Array.Copy(newDeps, newStart, deps, 0, newLen)
-            Array.Copy(newVersions, newStart, depVersions, 0, newLen)
+        depCount <- newLen
 
-            if depCount > newLen then
-                Array.Clear(deps, newLen, depCount - newLen)
-
-            depCount <- newLen
+        if observed && not sameSet then
+            this.BuildEdges()
 
         hasValue <- true
         version <- version + 1L
+        dirtyState <- if observed then DirtyState.Clean else DirtyState.MaybeDirty
         // Update cache: we just recomputed, so we're not dirty anymore for this evaluation
         dirtyCache <- false
 
@@ -501,16 +642,11 @@ and AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
             AdaptiveRuntime.enterEvaluation ()
 
             try
-                Monitor.Enter(syncRoot)
-
-                try
-                    if this.IsDirty() then
-                        this.Recompute()
-                    // Add dependency with committed version AFTER any recompute, inside lock
-                    AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
-                    value
-                finally
-                    Monitor.Exit(syncRoot)
+                if this.IsDirty() then
+                    this.Recompute()
+                // Add dependency with committed version AFTER any recompute
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                value
             finally
                 AdaptiveRuntime.exitEvaluation ()
 
@@ -518,576 +654,128 @@ and AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
             AdaptiveRuntime.enterEvaluation ()
 
             try
-                Monitor.Enter(syncRoot)
-
-                try
-                    if this.IsDirty() then version + 1L else version
-                finally
-                    Monitor.Exit(syncRoot)
+                if this.IsDirty() then version + 1L else version
             finally
                 AdaptiveRuntime.exitEvaluation ()
 
+    interface IAdaptiveNode with
+        member this.MarkDirty() =
+            if dirtyState <> DirtyState.Dirty then
+                dirtyState <- DirtyState.Dirty
+                let ctx = GraphContext.Default
+
+                for i in 0 .. edges.Count - 1 do
+                    ctx.PushDirty(edges[i])
+
+        member _.SetDepSlot(depIndex: int, parentIndex: int) = depSlots[depIndex] <- parentIndex
+
+        member this.OnFirstParent() = this.RegisterWithDeps()
+        member this.OnLastParent() = this.UnregisterFromDeps()
+
+    interface IEdgeTarget with
+        member _.EdgeCount = edges.Count
+
+        member this.AddEdge(parent: IAdaptiveNode, depIndex: int) =
+            let index = edges.Add(parent, depIndex)
+
+            if edges.Count = 1 then
+                this.RegisterWithDeps()
+
+            index
+
+        member this.RemoveEdgeAt(index: int) =
+            edges.RemoveAt(index)
+
+            if edges.Count = 0 then
+                this.UnregisterFromDeps()
+
 and ChangeableValue<'T>(initial: 'T) =
-    let syncRoot = obj ()
     let mutable value = initial
     let mutable version = 0L
-    let mutable parents = ParentTracking.NoParents
+    let edges = ParentEdges()
+    // Pending slot for writes inside a transaction. Last write wins.
+    let mutable hasPending = false
+    let mutable pendingValue = Unchecked.defaultof<'T>
 
-    member internal _.AddParent(parent: IMarkable) =
-        Monitor.Enter(syncRoot)
-
-        try
-            parents <- ParentTracking.addParent parents parent
-        finally
-            Monitor.Exit(syncRoot)
-
-    member internal _.RemoveParent(parent: IMarkable) =
-        Monitor.Enter(syncRoot)
+    member internal this.Apply(newValue: 'T) =
+        let ctx = GraphContext.Default
+        ctx.ClaimOwner()
 
         try
-            parents <- ParentTracking.removeParent parents parent
-        finally
-            Monitor.Exit(syncRoot)
-
-    member internal _.Apply(newValue: 'T) =
-        let parentsToNotify =
-            Monitor.Enter(syncRoot)
-
-            try
+            // Equality at the source: a write that changes nothing does nothing.
+            if not (EqualityComparer<'T>.Default.Equals(value, newValue)) then
                 value <- newValue
                 version <- version + 1L
-                parents // Capture parents before releasing lock
-            finally
-                Monitor.Exit(syncRoot)
-        // Mark parents dirty outside the lock to avoid deadlocks
-        ParentTracking.markParentsDirty parentsToNotify
+                ctx.MarkFrom(edges)
+        finally
+            ctx.ReleaseOwner()
+
+    member internal this.ApplyPending() =
+        let newValue = pendingValue
+        hasPending <- false
+        pendingValue <- Unchecked.defaultof<'T>
+        this.Apply(newValue)
+
+    member internal _.AbortPending() =
+        hasPending <- false
+        pendingValue <- Unchecked.defaultof<'T>
 
     member this.Set(newValue: 'T) =
-        if not (Transaction.tryEnqueueFactory (fun () -> ValueChange(this, newValue) :> Transaction.ICommit)) then
+        let ctx = GraphContext.Default
+
+        if ctx.TxActive then
+            pendingValue <- newValue
+
+            if not hasPending then
+                hasPending <- true
+                ctx.TxBuffer.Enqueue(this :> ICommit)
+        else
             this.Apply(newValue)
 
     interface IAdaptiveValue<'T> with
         member this.GetValue() =
-            Monitor.Enter(syncRoot)
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
 
             try
-                // Add dependency with committed version inside lock
                 AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
                 value
             finally
-                Monitor.Exit(syncRoot)
+                ctx.ReleaseOwner()
 
-        member _.Version = Interlocked.Read(&version)
+        member _.Version = version
 
-and ValueChange<'T>(target: ChangeableValue<'T>, value: 'T) =
-    interface Transaction.ICommit with
-        member _.Commit() = target.Apply(value)
+    interface IEdgeTarget with
+        member _.EdgeCount = edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
 
-/// <summary>
-/// Specialized adaptive node that combines exactly three dependencies with inline field storage.
-/// </summary>
-/// <typeparam name="A">Type of the first dependency.</typeparam>
-/// <typeparam name="B">Type of the second dependency.</typeparam>
-/// <typeparam name="C">Type of the third dependency.</typeparam>
-/// <typeparam name="T">Type of the computed result.</typeparam>
-/// <remarks>
-/// <para>
-/// This node type is more efficient than chaining <c>map2</c> calls because:
-/// <list type="bullet">
-/// <item><description>Uses inline fields instead of arrays for dependency tracking</description></item>
-/// <item><description>Single node instead of two intermediate nodes</description></item>
-/// <item><description>Supports lazy push invalidation when observed by parent nodes</description></item>
-/// </list>
-/// </para>
-/// <para>
-/// <strong>Internal implementation detail:</strong> Created via <see cref="AVal.map3"/>.
-/// </para>
-/// </remarks>
-and Map3Node<'A, 'B, 'C, 'T>
-    (
-        dep0: IAdaptiveValue<'A>,
-        dep1: IAdaptiveValue<'B>,
-        dep2: IAdaptiveValue<'C>,
-        [<InlineIfLambda>] compute: 'A -> 'B -> 'C -> 'T
-    ) as this =
-    let syncRoot = obj ()
-    let mutable version = 0L
-    let mutable hasValue = false
-    let mutable value = Unchecked.defaultof<'T>
-    let mutable ver0 = 0L
-    let mutable ver1 = 0L
-    let mutable ver2 = 0L
-    let mutable dirtyState = DirtyState.Dirty
-    let mutable parents = ParentTracking.NoParents
-    let mutable isObserved = false
-    let markable = this :> IMarkable
+    interface ICommit with
+        member this.Commit() = this.ApplyPending()
+        member this.Abort() = this.AbortPending()
 
-    member private _.RegisterWithDeps() =
-        match dep0 with
-        | :? ChangeableValue<'A> as cv -> cv.AddParent(markable)
-        | _ -> ()
-
-        match dep1 with
-        | :? ChangeableValue<'B> as cv -> cv.AddParent(markable)
-        | _ -> ()
-
-        match dep2 with
-        | :? ChangeableValue<'C> as cv -> cv.AddParent(markable)
-        | _ -> ()
-
-    member private _.UnregisterFromDeps() =
-        match dep0 with
-        | :? ChangeableValue<'A> as cv -> cv.RemoveParent(markable)
-        | _ -> ()
-
-        match dep1 with
-        | :? ChangeableValue<'B> as cv -> cv.RemoveParent(markable)
-        | _ -> ()
-
-        match dep2 with
-        | :? ChangeableValue<'C> as cv -> cv.RemoveParent(markable)
-        | _ -> ()
-
-    member internal _.AddParent(parent: IMarkable) =
-        let shouldRegister =
-            Monitor.Enter(syncRoot)
-
-            try
-                let wasUnobserved =
-                    match parents with
-                    | ParentTracking.NoParents -> true
-                    | _ -> false
-
-                parents <- ParentTracking.addParent parents parent
-
-                if wasUnobserved && not isObserved then
-                    isObserved <- true
-                    true
-                else
-                    false
-            finally
-                Monitor.Exit(syncRoot)
-        // Register after releasing lock
-        if shouldRegister then
-            this.RegisterWithDeps()
-
-    member internal _.RemoveParent(parent: IMarkable) =
-        let shouldUnregister =
-            Monitor.Enter(syncRoot)
-
-            try
-                parents <- ParentTracking.removeParent parents parent
-
-                let noParents =
-                    match parents with
-                    | ParentTracking.NoParents -> true
-                    | _ -> false
-
-                if noParents then
-                    isObserved <- false
-
-                noParents
-            finally
-                Monitor.Exit(syncRoot)
-
-        if shouldUnregister then
-            this.UnregisterFromDeps()
-
-    member private this.IsDirty() =
-        // If explicitly dirty (from push notification), definitely dirty
-        if dirtyState = DirtyState.Dirty then
-            true
-        // If not observed, always check versions (no push notification possible)
-        elif not isObserved then
-            not hasValue
-            || (dep0 :> IAdaptiveObject).Version <> ver0
-            || (dep1 :> IAdaptiveObject).Version <> ver1
-            || (dep2 :> IAdaptiveObject).Version <> ver2
-        // If observed and clean, trust the dirty state
-        elif dirtyState = DirtyState.Clean then
-            false
-        else // MaybeDirty - fall back to version check
-            not hasValue
-            || (dep0 :> IAdaptiveObject).Version <> ver0
-            || (dep1 :> IAdaptiveObject).Version <> ver1
-            || (dep2 :> IAdaptiveObject).Version <> ver2
-
-    member private this.Recompute() =
-        let v0 = dep0.GetValue()
-        let v1 = dep1.GetValue()
-        let v2 = dep2.GetValue()
-        value <- compute v0 v1 v2
-        ver0 <- (dep0 :> IAdaptiveObject).Version
-        ver1 <- (dep1 :> IAdaptiveObject).Version
-        ver2 <- (dep2 :> IAdaptiveObject).Version
-        hasValue <- true
-        version <- version + 1L
-        dirtyState <- DirtyState.Clean
-
-    interface IMarkable with
-        member _.MarkDirty() =
-            let parentsToNotify =
-                Monitor.Enter(syncRoot)
-
-                try
-                    if dirtyState <> DirtyState.Dirty then
-                        dirtyState <- DirtyState.Dirty
-                        parents
-                    else
-                        ParentTracking.NoParents
-                finally
-                    Monitor.Exit(syncRoot)
-
-            ParentTracking.markParentsDirty parentsToNotify
-
-    interface IAdaptiveValue<'T> with
-        member this.GetValue() =
-            AdaptiveRuntime.enterEvaluation ()
-
-            try
-                Monitor.Enter(syncRoot)
-
-                try
-                    if this.IsDirty() then
-                        this.Recompute()
-
-                    AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
-                    value
-                finally
-                    Monitor.Exit(syncRoot)
-            finally
-                AdaptiveRuntime.exitEvaluation ()
-
-        member this.Version =
-            AdaptiveRuntime.enterEvaluation ()
-
-            try
-                Monitor.Enter(syncRoot)
-
-                try
-                    if this.IsDirty() then version + 1L else version
-                finally
-                    Monitor.Exit(syncRoot)
-            finally
-                AdaptiveRuntime.exitEvaluation ()
-
-/// <summary>
-/// Specialized adaptive node that combines exactly four dependencies with inline field storage.
-/// </summary>
-/// <typeparam name="A">Type of the first dependency.</typeparam>
-/// <typeparam name="B">Type of the second dependency.</typeparam>
-/// <typeparam name="C">Type of the third dependency.</typeparam>
-/// <typeparam name="D">Type of the fourth dependency.</typeparam>
-/// <typeparam name="T">Type of the computed result.</typeparam>
-/// <remarks>
-/// <para>
-/// This node type is more efficient than chaining <c>map2</c> calls because:
-/// <list type="bullet">
-/// <item><description>Uses inline fields instead of arrays for dependency tracking</description></item>
-/// <item><description>Single node instead of three intermediate nodes</description></item>
-/// <item><description>Supports lazy push invalidation when observed by parent nodes</description></item>
-/// </list>
-/// </para>
-/// <para>
-/// <strong>Internal implementation detail:</strong> Created via <see cref="AVal.map4"/>.
-/// </para>
-/// </remarks>
-and Map4Node<'A, 'B, 'C, 'D, 'T>
-    (
-        dep0: IAdaptiveValue<'A>,
-        dep1: IAdaptiveValue<'B>,
-        dep2: IAdaptiveValue<'C>,
-        dep3: IAdaptiveValue<'D>,
-        [<InlineIfLambda>] compute: 'A -> 'B -> 'C -> 'D -> 'T
-    ) as this =
-    let syncRoot = obj ()
-    let mutable version = 0L
-    let mutable hasValue = false
-    let mutable value = Unchecked.defaultof<'T>
-    let mutable ver0 = 0L
-    let mutable ver1 = 0L
-    let mutable ver2 = 0L
-    let mutable ver3 = 0L
-    let mutable dirtyState = DirtyState.Dirty
-    let mutable parents = ParentTracking.NoParents
-    let mutable isObserved = false
-    let markable = this :> IMarkable
-
-    member private _.RegisterWithDeps() =
-        match dep0 with
-        | :? ChangeableValue<'A> as cv -> cv.AddParent(markable)
-        | _ -> ()
-
-        match dep1 with
-        | :? ChangeableValue<'B> as cv -> cv.AddParent(markable)
-        | _ -> ()
-
-        match dep2 with
-        | :? ChangeableValue<'C> as cv -> cv.AddParent(markable)
-        | _ -> ()
-
-        match dep3 with
-        | :? ChangeableValue<'D> as cv -> cv.AddParent(markable)
-        | _ -> ()
-
-    member private _.UnregisterFromDeps() =
-        match dep0 with
-        | :? ChangeableValue<'A> as cv -> cv.RemoveParent(markable)
-        | _ -> ()
-
-        match dep1 with
-        | :? ChangeableValue<'B> as cv -> cv.RemoveParent(markable)
-        | _ -> ()
-
-        match dep2 with
-        | :? ChangeableValue<'C> as cv -> cv.RemoveParent(markable)
-        | _ -> ()
-
-        match dep3 with
-        | :? ChangeableValue<'D> as cv -> cv.RemoveParent(markable)
-        | _ -> ()
-
-    member internal _.AddParent(parent: IMarkable) =
-        let shouldRegister =
-            Monitor.Enter(syncRoot)
-
-            try
-                let wasUnobserved =
-                    match parents with
-                    | ParentTracking.NoParents -> true
-                    | _ -> false
-
-                parents <- ParentTracking.addParent parents parent
-
-                if wasUnobserved && not isObserved then
-                    isObserved <- true
-                    true
-                else
-                    false
-            finally
-                Monitor.Exit(syncRoot)
-
-        if shouldRegister then
-            this.RegisterWithDeps()
-
-    member internal _.RemoveParent(parent: IMarkable) =
-        let shouldUnregister =
-            Monitor.Enter(syncRoot)
-
-            try
-                parents <- ParentTracking.removeParent parents parent
-
-                let noParents =
-                    match parents with
-                    | ParentTracking.NoParents -> true
-                    | _ -> false
-
-                if noParents then
-                    isObserved <- false
-
-                noParents
-            finally
-                Monitor.Exit(syncRoot)
-
-        if shouldUnregister then
-            this.UnregisterFromDeps()
-
-    member private this.IsDirty() =
-        // If explicitly dirty (from push notification), definitely dirty
-        if dirtyState = DirtyState.Dirty then
-            true
-        // If not observed, always check versions (no push notification possible)
-        elif not isObserved then
-            not hasValue
-            || (dep0 :> IAdaptiveObject).Version <> ver0
-            || (dep1 :> IAdaptiveObject).Version <> ver1
-            || (dep2 :> IAdaptiveObject).Version <> ver2
-            || (dep3 :> IAdaptiveObject).Version <> ver3
-        // If observed and clean, trust the dirty state
-        elif dirtyState = DirtyState.Clean then
-            false
-        else // MaybeDirty
-            not hasValue
-            || (dep0 :> IAdaptiveObject).Version <> ver0
-            || (dep1 :> IAdaptiveObject).Version <> ver1
-            || (dep2 :> IAdaptiveObject).Version <> ver2
-            || (dep3 :> IAdaptiveObject).Version <> ver3
-
-    member private this.Recompute() =
-        let v0 = dep0.GetValue()
-        let v1 = dep1.GetValue()
-        let v2 = dep2.GetValue()
-        let v3 = dep3.GetValue()
-        value <- compute v0 v1 v2 v3
-        ver0 <- (dep0 :> IAdaptiveObject).Version
-        ver1 <- (dep1 :> IAdaptiveObject).Version
-        ver2 <- (dep2 :> IAdaptiveObject).Version
-        ver3 <- (dep3 :> IAdaptiveObject).Version
-        hasValue <- true
-        version <- version + 1L
-        dirtyState <- DirtyState.Clean
-
-    interface IMarkable with
-        member _.MarkDirty() =
-            let parentsToNotify =
-                Monitor.Enter(syncRoot)
-
-                try
-                    if dirtyState <> DirtyState.Dirty then
-                        dirtyState <- DirtyState.Dirty
-                        parents
-                    else
-                        ParentTracking.NoParents
-                finally
-                    Monitor.Exit(syncRoot)
-
-            ParentTracking.markParentsDirty parentsToNotify
-
-    interface IAdaptiveValue<'T> with
-        member this.GetValue() =
-            AdaptiveRuntime.enterEvaluation ()
-
-            try
-                Monitor.Enter(syncRoot)
-
-                try
-                    if this.IsDirty() then
-                        this.Recompute()
-
-                    AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
-                    value
-                finally
-                    Monitor.Exit(syncRoot)
-            finally
-                AdaptiveRuntime.exitEvaluation ()
-
-        member this.Version =
-            AdaptiveRuntime.enterEvaluation ()
-
-            try
-                Monitor.Enter(syncRoot)
-
-                try
-                    if this.IsDirty() then version + 1L else version
-                finally
-                    Monitor.Exit(syncRoot)
-            finally
-                AdaptiveRuntime.exitEvaluation ()
-
-/// <summary>
-/// Specialized adaptive node that combines N dependencies of the same type.
-/// Dramatically more efficient than chaining <c>map2</c> for wide fan-in patterns.
-/// </summary>
-/// <typeparam name="T">Type of each dependency value.</typeparam>
-/// <typeparam name="U">Type of the computed result.</typeparam>
-/// <remarks>
-/// <para>
-/// <strong>Performance characteristics:</strong>
-/// <list type="bullet">
-/// <item><description>Single node instead of O(N) nodes from chained map2</description></item>
-/// <item><description>Tight loop for version checking (cache-friendly)</description></item>
-/// <item><description>3-100× faster than map2 chains for 10-500 inputs</description></item>
-/// <item><description>Constant memory overhead regardless of input count</description></item>
-/// </list>
-/// </para>
-/// <para>
-/// <strong>Dirty propagation:</strong> When observed by parent nodes, this node registers
-/// with ChangeableValue dependencies for push-based invalidation, avoiding unnecessary
-/// version checks on unchanged values.
-/// </para>
-/// <para>
-/// <strong>Internal implementation detail:</strong> Created via <see cref="AVal.mapN"/>.
-/// </para>
-/// </remarks>
-and MapNNode<'T, 'U>(deps: IAdaptiveValue<'T>[], [<InlineIfLambda>] compute: 'T[] -> 'U) as this =
-    let syncRoot = obj ()
+and MapNNode<'T, 'U>(deps: IAdaptiveValue<'T>[], [<InlineIfLambda>] compute: 'T[] -> 'U) =
     let mutable version = 0L
     let mutable hasValue = false
     let mutable value = Unchecked.defaultof<'U>
     let depVersions = Array.zeroCreate<int64> deps.Length
-    let mutable dirtyState = DirtyState.Dirty
-    let mutable parents = ParentTracking.NoParents
-    let mutable isObserved = false
-    let markable = this :> IMarkable
-
-    member private _.RegisterWithDeps() =
-        for dep in deps do
-            match dep with
-            | :? ChangeableValue<'T> as cv -> cv.AddParent(markable)
-            | _ -> ()
-
-    member private _.UnregisterFromDeps() =
-        for dep in deps do
-            match dep with
-            | :? ChangeableValue<'T> as cv -> cv.RemoveParent(markable)
-            | _ -> ()
-
-    member internal _.AddParent(parent: IMarkable) =
-        let shouldRegister =
-            Monitor.Enter(syncRoot)
-
-            try
-                let wasUnobserved =
-                    match parents with
-                    | ParentTracking.NoParents -> true
-                    | _ -> false
-
-                parents <- ParentTracking.addParent parents parent
-
-                if wasUnobserved && not isObserved then
-                    isObserved <- true
-                    true
-                else
-                    false
-            finally
-                Monitor.Exit(syncRoot)
-
-        if shouldRegister then
-            this.RegisterWithDeps()
-
-    member internal _.RemoveParent(parent: IMarkable) =
-        let shouldUnregister =
-            Monitor.Enter(syncRoot)
-
-            try
-                parents <- ParentTracking.removeParent parents parent
-
-                let noParents =
-                    match parents with
-                    | ParentTracking.NoParents -> true
-                    | _ -> false
-
-                if noParents then
-                    isObserved <- false
-
-                noParents
-            finally
-                Monitor.Exit(syncRoot)
-
-        if shouldUnregister then
-            this.UnregisterFromDeps()
+    // Position of this node in the parents array of each dependency. -1 = no edge.
+    let depSlots = Array.create deps.Length -1
+    let edges = ParentEdges()
+    let mutable dirtyState = DirtyState.MaybeDirty
 
     member private this.IsDirty() =
-        // If explicitly dirty (from push notification), definitely dirty
-        if dirtyState = DirtyState.Dirty then
+        if not hasValue then
             true
-        // If not observed, always check versions (no push notification possible)
-        elif not isObserved then
-            let mutable dirty = not hasValue
-            let mutable i = 0
-
-            while not dirty && i < deps.Length do
-                if (deps.[i] :> IAdaptiveObject).Version <> depVersions.[i] then
-                    dirty <- true
-
-                i <- i + 1
-
-            dirty
-        // If observed and clean, trust the dirty state
-        elif dirtyState = DirtyState.Clean then
+        elif dirtyState = DirtyState.Dirty then
+            // Marked by a dependency change.
+            true
+        elif dirtyState = DirtyState.Clean && edges.Count > 0 then
+            // Observed and not marked: one flag check, no version reads.
             false
-        else // MaybeDirty
-            let mutable dirty = not hasValue
+        else
+            // Unobserved, or links can be stale: version check.
+            let mutable dirty = false
             let mutable i = 0
 
             while not dirty && i < deps.Length do
@@ -1108,39 +796,42 @@ and MapNNode<'T, 'U>(deps: IAdaptiveValue<'T>[], [<InlineIfLambda>] compute: 'T[
         value <- compute values
         hasValue <- true
         version <- version + 1L
-        dirtyState <- DirtyState.Clean
 
-    interface IMarkable with
-        member _.MarkDirty() =
-            let parentsToNotify =
-                Monitor.Enter(syncRoot)
+        dirtyState <-
+            if edges.Count > 0 then
+                DirtyState.Clean
+            else
+                DirtyState.MaybeDirty
 
-                try
-                    if dirtyState <> DirtyState.Dirty then
-                        dirtyState <- DirtyState.Dirty
-                        parents
-                    else
-                        ParentTracking.NoParents
-                finally
-                    Monitor.Exit(syncRoot)
+    /// Registration cascade: this node gained its first parent.
+    member private this.RegisterWithDeps() =
+        for j in 0 .. deps.Length - 1 do
+            depSlots[j] <-
+                match deps[j] with
+                | :? IEdgeTarget as target -> target.AddEdge(this, j)
+                | _ -> -1
 
-            ParentTracking.markParentsDirty parentsToNotify
+        dirtyState <- DirtyState.MaybeDirty
+
+    /// Unregistration cascade: this node lost its last parent.
+    member private this.UnregisterFromDeps() =
+        for j in 0 .. deps.Length - 1 do
+            if depSlots[j] >= 0 then
+                (deps[j] :?> IEdgeTarget).RemoveEdgeAt(depSlots[j])
+                depSlots[j] <- -1
+
+        dirtyState <- DirtyState.MaybeDirty
 
     interface IAdaptiveValue<'U> with
         member this.GetValue() =
             AdaptiveRuntime.enterEvaluation ()
 
             try
-                Monitor.Enter(syncRoot)
+                if this.IsDirty() then
+                    this.Recompute()
 
-                try
-                    if this.IsDirty() then
-                        this.Recompute()
-
-                    AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
-                    value
-                finally
-                    Monitor.Exit(syncRoot)
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                value
             finally
                 AdaptiveRuntime.exitEvaluation ()
 
@@ -1148,14 +839,40 @@ and MapNNode<'T, 'U>(deps: IAdaptiveValue<'T>[], [<InlineIfLambda>] compute: 'T[
             AdaptiveRuntime.enterEvaluation ()
 
             try
-                Monitor.Enter(syncRoot)
-
-                try
-                    if this.IsDirty() then version + 1L else version
-                finally
-                    Monitor.Exit(syncRoot)
+                if this.IsDirty() then version + 1L else version
             finally
                 AdaptiveRuntime.exitEvaluation ()
+
+    interface IAdaptiveNode with
+        member this.MarkDirty() =
+            if dirtyState <> DirtyState.Dirty then
+                dirtyState <- DirtyState.Dirty
+                let ctx = GraphContext.Default
+
+                for i in 0 .. edges.Count - 1 do
+                    ctx.PushDirty(edges[i])
+
+        member _.SetDepSlot(depIndex: int, parentIndex: int) = depSlots[depIndex] <- parentIndex
+
+        member this.OnFirstParent() = this.RegisterWithDeps()
+        member this.OnLastParent() = this.UnregisterFromDeps()
+
+    interface IEdgeTarget with
+        member _.EdgeCount = edges.Count
+
+        member this.AddEdge(parent: IAdaptiveNode, depIndex: int) =
+            let index = edges.Add(parent, depIndex)
+
+            if edges.Count = 1 then
+                this.RegisterWithDeps()
+
+            index
+
+        member this.RemoveEdgeAt(index: int) =
+            edges.RemoveAt(index)
+
+            if edges.Count = 0 then
+                this.UnregisterFromDeps()
 
 /// <summary>
 /// Specialized adaptive node that reduces N dependencies using a binary operation.
@@ -1184,95 +901,28 @@ and MapNNode<'T, 'U>(deps: IAdaptiveValue<'T>[], [<InlineIfLambda>] compute: 'T[
 /// <strong>Internal implementation detail:</strong> Created via <see cref="AVal.reduce"/> or <see cref="AVal.sum"/>.
 /// </para>
 /// </remarks>
-and ReduceNode<'T>(deps: IAdaptiveValue<'T>[], init: 'T, [<InlineIfLambda>] reduce: 'T -> 'T -> 'T) as this =
-    let syncRoot = obj ()
+and ReduceNode<'T>(deps: IAdaptiveValue<'T>[], init: 'T, [<InlineIfLambda>] reduce: 'T -> 'T -> 'T) =
     let mutable version = 0L
     let mutable hasValue = false
     let mutable value = Unchecked.defaultof<'T>
     let depVersions = Array.zeroCreate<int64> deps.Length
-    let mutable dirtyState = DirtyState.Dirty
-    let mutable parents = ParentTracking.NoParents
-    let mutable isObserved = false
-    let markable = this :> IMarkable
-
-    member private _.RegisterWithDeps() =
-        for dep in deps do
-            match dep with
-            | :? ChangeableValue<'T> as cv -> cv.AddParent(markable)
-            | _ -> ()
-
-    member private _.UnregisterFromDeps() =
-        for dep in deps do
-            match dep with
-            | :? ChangeableValue<'T> as cv -> cv.RemoveParent(markable)
-            | _ -> ()
-
-    member internal _.AddParent(parent: IMarkable) =
-        let shouldRegister =
-            Monitor.Enter(syncRoot)
-
-            try
-                let wasUnobserved =
-                    match parents with
-                    | ParentTracking.NoParents -> true
-                    | _ -> false
-
-                parents <- ParentTracking.addParent parents parent
-
-                if wasUnobserved && not isObserved then
-                    isObserved <- true
-                    true
-                else
-                    false
-            finally
-                Monitor.Exit(syncRoot)
-
-        if shouldRegister then
-            this.RegisterWithDeps()
-
-    member internal _.RemoveParent(parent: IMarkable) =
-        let shouldUnregister =
-            Monitor.Enter(syncRoot)
-
-            try
-                parents <- ParentTracking.removeParent parents parent
-
-                let noParents =
-                    match parents with
-                    | ParentTracking.NoParents -> true
-                    | _ -> false
-
-                if noParents then
-                    isObserved <- false
-
-                noParents
-            finally
-                Monitor.Exit(syncRoot)
-
-        if shouldUnregister then
-            this.UnregisterFromDeps()
+    // Position of this node in the parents array of each dependency. -1 = no edge.
+    let depSlots = Array.create deps.Length -1
+    let edges = ParentEdges()
+    let mutable dirtyState = DirtyState.MaybeDirty
 
     member private this.IsDirty() =
-        // If explicitly dirty (from push notification), definitely dirty
-        if dirtyState = DirtyState.Dirty then
+        if not hasValue then
             true
-        // If not observed, always check versions (no push notification possible)
-        elif not isObserved then
-            let mutable dirty = not hasValue
-            let mutable i = 0
-
-            while not dirty && i < deps.Length do
-                if (deps.[i] :> IAdaptiveObject).Version <> depVersions.[i] then
-                    dirty <- true
-
-                i <- i + 1
-
-            dirty
-        // If observed and clean, trust the dirty state
-        elif dirtyState = DirtyState.Clean then
+        elif dirtyState = DirtyState.Dirty then
+            // Marked by a dependency change.
+            true
+        elif dirtyState = DirtyState.Clean && edges.Count > 0 then
+            // Observed and not marked: one flag check, no version reads.
             false
-        else // MaybeDirty
-            let mutable dirty = not hasValue
+        else
+            // Unobserved, or links can be stale: version check.
+            let mutable dirty = false
             let mutable i = 0
 
             while not dirty && i < deps.Length do
@@ -1294,39 +944,42 @@ and ReduceNode<'T>(deps: IAdaptiveValue<'T>[], init: 'T, [<InlineIfLambda>] redu
         value <- acc
         hasValue <- true
         version <- version + 1L
-        dirtyState <- DirtyState.Clean
 
-    interface IMarkable with
-        member _.MarkDirty() =
-            let parentsToNotify =
-                Monitor.Enter(syncRoot)
+        dirtyState <-
+            if edges.Count > 0 then
+                DirtyState.Clean
+            else
+                DirtyState.MaybeDirty
 
-                try
-                    if dirtyState <> DirtyState.Dirty then
-                        dirtyState <- DirtyState.Dirty
-                        parents
-                    else
-                        ParentTracking.NoParents
-                finally
-                    Monitor.Exit(syncRoot)
+    /// Registration cascade: this node gained its first parent.
+    member private this.RegisterWithDeps() =
+        for j in 0 .. deps.Length - 1 do
+            depSlots[j] <-
+                match deps[j] with
+                | :? IEdgeTarget as target -> target.AddEdge(this, j)
+                | _ -> -1
 
-            ParentTracking.markParentsDirty parentsToNotify
+        dirtyState <- DirtyState.MaybeDirty
+
+    /// Unregistration cascade: this node lost its last parent.
+    member private this.UnregisterFromDeps() =
+        for j in 0 .. deps.Length - 1 do
+            if depSlots[j] >= 0 then
+                (deps[j] :?> IEdgeTarget).RemoveEdgeAt(depSlots[j])
+                depSlots[j] <- -1
+
+        dirtyState <- DirtyState.MaybeDirty
 
     interface IAdaptiveValue<'T> with
         member this.GetValue() =
             AdaptiveRuntime.enterEvaluation ()
 
             try
-                Monitor.Enter(syncRoot)
+                if this.IsDirty() then
+                    this.Recompute()
 
-                try
-                    if this.IsDirty() then
-                        this.Recompute()
-
-                    AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
-                    value
-                finally
-                    Monitor.Exit(syncRoot)
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                value
             finally
                 AdaptiveRuntime.exitEvaluation ()
 
@@ -1334,21 +987,105 @@ and ReduceNode<'T>(deps: IAdaptiveValue<'T>[], init: 'T, [<InlineIfLambda>] redu
             AdaptiveRuntime.enterEvaluation ()
 
             try
-                Monitor.Enter(syncRoot)
-
-                try
-                    if this.IsDirty() then version + 1L else version
-                finally
-                    Monitor.Exit(syncRoot)
+                if this.IsDirty() then version + 1L else version
             finally
                 AdaptiveRuntime.exitEvaluation ()
 
+    interface IAdaptiveNode with
+        member this.MarkDirty() =
+            if dirtyState <> DirtyState.Dirty then
+                dirtyState <- DirtyState.Dirty
+                let ctx = GraphContext.Default
+
+                for i in 0 .. edges.Count - 1 do
+                    ctx.PushDirty(edges[i])
+
+        member _.SetDepSlot(depIndex: int, parentIndex: int) = depSlots[depIndex] <- parentIndex
+
+        member this.OnFirstParent() = this.RegisterWithDeps()
+        member this.OnLastParent() = this.UnregisterFromDeps()
+
+    interface IEdgeTarget with
+        member _.EdgeCount = edges.Count
+
+        member this.AddEdge(parent: IAdaptiveNode, depIndex: int) =
+            let index = edges.Add(parent, depIndex)
+
+            if edges.Count = 1 then
+                this.RegisterWithDeps()
+
+            index
+
+        member this.RemoveEdgeAt(index: int) =
+            edges.RemoveAt(index)
+
+            if edges.Count = 0 then
+                this.UnregisterFromDeps()
+
+/// <summary>
+/// Internal. An active observation of an adaptive value. Registered as a parent
+/// of the observed object. Marking enqueues it once per batch; delivery pulls the
+/// current value and invokes the callback when the version changed.
+/// </summary>
+type internal Observation<'T>(target: IAdaptiveValue<'T>, callback: 'T -> unit) as this =
+    let mutable active = true
+    let mutable enqueued = false
+    let mutable indexInTarget = -1
+    let mutable lastVersion = -1L
+
+    /// Force the initial read and register this observation as a parent.
+    member internal _.Attach() =
+        // Materialize the dependency subgraph before the cascade registers it.
+        let _ = target.GetValue()
+
+        match target with
+        | :? IEdgeTarget as edgeTarget ->
+            lastVersion <- (target :> IAdaptiveObject).Version
+            indexInTarget <- edgeTarget.AddEdge(this :> IAdaptiveNode, -1)
+        | _ -> ()
+
+    interface IAdaptiveNode with
+        member this.MarkDirty() =
+            if active && not enqueued then
+                enqueued <- true
+                GraphContext.Default.EnqueueNotification(this :> INotifiable)
+
+        member _.SetDepSlot(depIndex: int, parentIndex: int) =
+            if depIndex = -1 then
+                indexInTarget <- parentIndex
+
+        member _.OnFirstParent() = ()
+        member _.OnLastParent() = ()
+
+    interface INotifiable with
+        member this.Deliver() =
+            enqueued <- false
+
+            if active then
+                let newValue = target.GetValue()
+                let newVersion = (target :> IAdaptiveObject).Version
+
+                if newVersion <> lastVersion then
+                    lastVersion <- newVersion
+                    callback newValue
+
+    interface IObservation with
+        member _.IsActive = active
+
+        member this.Dispose() =
+            if active then
+                active <- false
+
+                match target with
+                | :? IEdgeTarget as edgeTarget -> edgeTarget.RemoveEdgeAt(indexInTarget)
+                | _ -> ()
+
 type ChangeableSet<'T when 'T: comparison>(initial: Set<'T>) =
-    let syncRoot = obj ()
     let mutable version = 0L
     let mutable data = HashSet<'T>(initial.Count)
     let mutable snapshot = initial
     let mutable snapshotVersion = -1L
+    let edges = ParentEdges()
     let mutable sinks: obj[] = Array.zeroCreate 4
     let mutable sinkCount = 0
     let mutable journalAdds: 'T[] = ArrayPool<'T>.Shared.Rent 16
@@ -1356,6 +1093,8 @@ type ChangeableSet<'T when 'T: comparison>(initial: Set<'T>) =
     let mutable journalRems: 'T[] = ArrayPool<'T>.Shared.Rent 16
     let mutable journalRemCount = 0
     let mutable flushEnqueued = false
+    // Pending full-replace for Set inside a transaction. Last write wins.
+    let mutable pendingValue: Set<'T> voption = ValueNone
 
     do
         for item in initial do
@@ -1364,61 +1103,48 @@ type ChangeableSet<'T when 'T: comparison>(initial: Set<'T>) =
     member private _.InvalidateSnapshot() = snapshotVersion <- -1L
 
     member internal this.AddSink(sink: ISetDeltaSink<'T>) =
-        Monitor.Enter syncRoot
+        if sinkCount = sinks.Length then
+            let next = Array.zeroCreate (sinks.Length * 2)
+            Array.Copy(sinks, next, sinks.Length)
+            sinks <- next
 
-        try
-            if sinkCount = sinks.Length then
-                let next = Array.zeroCreate (sinks.Length * 2)
-                Array.Copy(sinks, next, sinks.Length)
-                sinks <- next
-
-            sinks[sinkCount] <- box sink
-            sinkCount <- sinkCount + 1
-        finally
-            Monitor.Exit syncRoot
+        sinks[sinkCount] <- box sink
+        sinkCount <- sinkCount + 1
 
     member internal this.RemoveSink(sink: ISetDeltaSink<'T>) =
-        Monitor.Enter syncRoot
+        let mutable found = -1
+        let mutable i = 0
 
-        try
-            let mutable found = -1
-            let mutable i = 0
+        while found < 0 && i < sinkCount do
+            if obj.ReferenceEquals(sinks[i], box sink) then
+                found <- i
+            else
+                i <- i + 1
 
-            while found < 0 && i < sinkCount do
-                if obj.ReferenceEquals(sinks[i], box sink) then
-                    found <- i
-                else
-                    i <- i + 1
+        if found >= 0 then
+            sinkCount <- sinkCount - 1
 
-            if found >= 0 then
-                sinkCount <- sinkCount - 1
+            for j in found .. sinkCount - 1 do
+                sinks[j] <- sinks[j + 1]
 
-                for j in found .. sinkCount - 1 do
-                    sinks[j] <- sinks[j + 1]
-
-                sinks[sinkCount] <- null
-        finally
-            Monitor.Exit syncRoot
+            sinks[sinkCount] <- null
 
     member private this.FlushDeltas(newVersion: int64, adds: 'T[], addCount: int, rems: 'T[], remCount: int) =
         if addCount > 0 || remCount > 0 then
             let sinksSnapshot =
-                Monitor.Enter syncRoot
-
-                try
-                    if sinkCount = 0 then
-                        Array.empty
-                    else
-                        let arr = Array.zeroCreate sinkCount
-                        Array.Copy(sinks, arr, sinkCount)
-                        arr
-                finally
-                    Monitor.Exit syncRoot
+                if sinkCount = 0 then
+                    Array.empty
+                else
+                    let arr = Array.zeroCreate sinkCount
+                    Array.Copy(sinks, arr, sinkCount)
+                    arr
 
             for i in 0 .. sinksSnapshot.Length - 1 do
                 (unbox<ISetDeltaSink<'T>> sinksSnapshot[i]).OnDeltas(newVersion, adds, addCount, rems, remCount)
 
     member private this.JournalFlush() =
+        flushEnqueued <- false
+
         if journalAddCount > 0 || journalRemCount > 0 then
             let adds = journalAdds
             let addCnt = journalAddCount
@@ -1428,40 +1154,32 @@ type ChangeableSet<'T when 'T: comparison>(initial: Set<'T>) =
             journalAddCount <- 0
             journalRems <- ArrayPool<'T>.Shared.Rent 16
             journalRemCount <- 0
-            Monitor.Enter syncRoot
 
-            try
-                for i in 0 .. addCnt - 1 do
-                    data.Add adds[i] |> ignore
+            for i in 0 .. addCnt - 1 do
+                data.Add adds[i] |> ignore
 
-                for i in 0 .. remCnt - 1 do
-                    data.Remove rems[i] |> ignore
+            for i in 0 .. remCnt - 1 do
+                data.Remove rems[i] |> ignore
 
-                version <- version + 1L
-                this.InvalidateSnapshot()
-            finally
-                Monitor.Exit syncRoot
+            version <- version + 1L
+            this.InvalidateSnapshot()
 
             this.FlushDeltas(version, adds, addCnt, rems, remCnt)
             ArrayPool<'T>.Shared.Return(adds, true)
             ArrayPool<'T>.Shared.Return(rems, true)
-            flushEnqueued <- false
+            GraphContext.Default.MarkFrom(edges)
 
     member private this.ApplyAndFlush(item: 'T, isAdd: bool) =
         let mutable added = false
-        Monitor.Enter syncRoot
 
-        try
-            if isAdd then
-                added <- data.Add item
-            else
-                added <- data.Remove item
+        if isAdd then
+            added <- data.Add item
+        else
+            added <- data.Remove item
 
-            if added then
-                version <- version + 1L
-                this.InvalidateSnapshot()
-        finally
-            Monitor.Exit syncRoot
+        if added then
+            version <- version + 1L
+            this.InvalidateSnapshot()
 
         if added then
             let bufAdds = ArrayPool<'T>.Shared.Rent 1
@@ -1476,29 +1194,26 @@ type ChangeableSet<'T when 'T: comparison>(initial: Set<'T>) =
 
             ArrayPool<'T>.Shared.Return(bufAdds, true)
             ArrayPool<'T>.Shared.Return(bufRems, true)
+            GraphContext.Default.MarkFrom(edges)
 
     member internal this.Apply(newValue: Set<'T>) =
         let oldCount = data.Count
         let buffer = ArrayPool<'T>.Shared.Rent(max oldCount newValue.Count)
         let mutable oldIdx = 0
-        Monitor.Enter syncRoot
 
-        try
-            for item in data do
-                if not (newValue.Contains item) then
-                    buffer[oldIdx] <- item
-                    oldIdx <- oldIdx + 1
+        for item in data do
+            if not (newValue.Contains item) then
+                buffer[oldIdx] <- item
+                oldIdx <- oldIdx + 1
 
-            data.Clear()
+        data.Clear()
 
-            for item in newValue do
-                data.Add item |> ignore
+        for item in newValue do
+            data.Add item |> ignore
 
-            version <- version + 1L
-            snapshot <- newValue
-            snapshotVersion <- version
-        finally
-            Monitor.Exit syncRoot
+        version <- version + 1L
+        snapshot <- newValue
+        snapshotVersion <- version
 
         let adds = ArrayPool<'T>.Shared.Rent newValue.Count
         let mutable ai = 0
@@ -1513,72 +1228,93 @@ type ChangeableSet<'T when 'T: comparison>(initial: Set<'T>) =
         ArrayPool<'T>.Shared.Return(buffer, true)
         ArrayPool<'T>.Shared.Return(adds, true)
         ArrayPool<'T>.Shared.Return(rems, true)
+        GraphContext.Default.MarkFrom(edges)
 
     member this.Set(newValue: Set<'T>) =
-        if
-            not (
-                Transaction.tryEnqueueFactory (fun () ->
-                    { new Transaction.ICommit with
-                        member _.Commit() = this.Apply newValue })
-            )
-        then
-            this.Apply newValue
+        let ctx = GraphContext.Default
+        ctx.ClaimOwner()
+
+        try
+            if ctx.TxActive then
+                pendingValue <- ValueSome newValue
+                // A full replace discards the journaled deltas of this batch.
+                journalAddCount <- 0
+                journalRemCount <- 0
+
+                if not flushEnqueued then
+                    flushEnqueued <- true
+                    ctx.TxBuffer.Enqueue(this :> ICommit)
+            else
+                this.Apply newValue
+        finally
+            ctx.ReleaseOwner()
 
     member this.Add(item: 'T) =
-        if
-            not (
-                Transaction.tryEnqueueFactory (fun () ->
-                    { new Transaction.ICommit with
-                        member _.Commit() =
-                            if journalAddCount = journalAdds.Length then
-                                let next = ArrayPool<'T>.Shared.Rent(journalAdds.Length * 2)
-                                Array.Copy(journalAdds, next, journalAdds.Length)
-                                ArrayPool<'T>.Shared.Return(journalAdds, true)
-                                journalAdds <- next
+        let ctx = GraphContext.Default
+        ctx.ClaimOwner()
 
-                            journalAdds[journalAddCount] <- item
-                            journalAddCount <- journalAddCount + 1
+        try
+            if ctx.TxActive then
+                if journalAddCount = journalAdds.Length then
+                    let next = ArrayPool<'T>.Shared.Rent(journalAdds.Length * 2)
+                    Array.Copy(journalAdds, next, journalAdds.Length)
+                    ArrayPool<'T>.Shared.Return(journalAdds, true)
+                    journalAdds <- next
 
-                            if not flushEnqueued then
-                                flushEnqueued <- true
+                journalAdds[journalAddCount] <- item
+                journalAddCount <- journalAddCount + 1
 
-                                Transaction.tryEnqueue
-                                    { new Transaction.ICommit with
-                                        member _.Commit() = this.JournalFlush() }
-                                |> ignore })
-            )
-        then
-            this.ApplyAndFlush(item, true)
+                if not flushEnqueued then
+                    flushEnqueued <- true
+                    ctx.TxBuffer.Enqueue(this :> ICommit)
+            else
+                this.ApplyAndFlush(item, true)
+        finally
+            ctx.ReleaseOwner()
 
     member this.Remove(item: 'T) =
-        if
-            not (
-                Transaction.tryEnqueueFactory (fun () ->
-                    { new Transaction.ICommit with
-                        member _.Commit() =
-                            if journalRemCount = journalRems.Length then
-                                let next = ArrayPool<'T>.Shared.Rent(journalRems.Length * 2)
-                                Array.Copy(journalRems, next, journalRems.Length)
-                                ArrayPool<'T>.Shared.Return(journalRems, true)
-                                journalRems <- next
+        let ctx = GraphContext.Default
+        ctx.ClaimOwner()
 
-                            journalRems[journalRemCount] <- item
-                            journalRemCount <- journalRemCount + 1
+        try
+            if ctx.TxActive then
+                if journalRemCount = journalRems.Length then
+                    let next = ArrayPool<'T>.Shared.Rent(journalRems.Length * 2)
+                    Array.Copy(journalRems, next, journalRems.Length)
+                    ArrayPool<'T>.Shared.Return(journalRems, true)
+                    journalRems <- next
 
-                            if not flushEnqueued then
-                                flushEnqueued <- true
+                journalRems[journalRemCount] <- item
+                journalRemCount <- journalRemCount + 1
 
-                                Transaction.tryEnqueue
-                                    { new Transaction.ICommit with
-                                        member _.Commit() = this.JournalFlush() }
-                                |> ignore })
-            )
-        then
-            this.ApplyAndFlush(item, false)
+                if not flushEnqueued then
+                    flushEnqueued <- true
+                    ctx.TxBuffer.Enqueue(this :> ICommit)
+            else
+                this.ApplyAndFlush(item, false)
+        finally
+            ctx.ReleaseOwner()
+
+    interface ICommit with
+        member this.Commit() =
+            match pendingValue with
+            | ValueSome newValue ->
+                pendingValue <- ValueNone
+                this.Apply newValue
+            | ValueNone -> ()
+
+            this.JournalFlush()
+
+        member this.Abort() =
+            pendingValue <- ValueNone
+            journalAddCount <- 0
+            journalRemCount <- 0
+            flushEnqueued <- false
 
     interface IAdaptiveSet<'T> with
         member this.GetValue() =
-            Monitor.Enter syncRoot
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
 
             try
                 AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
@@ -1610,9 +1346,9 @@ type ChangeableSet<'T when 'T: comparison>(initial: Set<'T>) =
                         finally
                             ArrayPool<'T>.Shared.Return(buffer, true)
             finally
-                Monitor.Exit syncRoot
+                ctx.ReleaseOwner()
 
-        member _.Version = Interlocked.Read &version
+        member _.Version = version
 
     interface ISetSinkRegistry with
         member this.AddSetSink(sink) =
@@ -1621,12 +1357,17 @@ type ChangeableSet<'T when 'T: comparison>(initial: Set<'T>) =
         member this.RemoveSetSink(sink) =
             this.RemoveSink(unbox<ISetDeltaSink<'T>> sink)
 
+    interface IEdgeTarget with
+        member _.EdgeCount = edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
+
 type ChangeableMap<'K, 'V when 'K: comparison>(initial: Map<'K, 'V>) =
-    let syncRoot = obj ()
     let mutable version = 0L
     let mutable data = Dictionary<'K, 'V>(initial.Count)
     let mutable snapshot = initial
     let mutable snapshotVersion = -1L
+    let edges = ParentEdges()
     let mutable sinks: obj[] = Array.zeroCreate 4
     let mutable sinkCount = 0
 
@@ -1637,6 +1378,8 @@ type ChangeableMap<'K, 'V when 'K: comparison>(initial: Map<'K, 'V>) =
     let mutable journalRems: 'K[] = ArrayPool<'K>.Shared.Rent 16
     let mutable journalRemCount = 0
     let mutable flushEnqueued = false
+    // Pending full-replace for Set inside a transaction. Last write wins.
+    let mutable pendingValue: Map<'K, 'V> voption = ValueNone
 
     do
         for KeyValue(key, value) in initial do
@@ -1645,63 +1388,50 @@ type ChangeableMap<'K, 'V when 'K: comparison>(initial: Map<'K, 'V>) =
     member private _.InvalidateSnapshot() = snapshotVersion <- -1L
 
     member internal this.AddSink(sink: IMapDeltaSink<'K, 'V>) =
-        Monitor.Enter syncRoot
+        if sinkCount = sinks.Length then
+            let next = Array.zeroCreate (sinks.Length * 2)
+            Array.Copy(sinks, next, sinks.Length)
+            sinks <- next
 
-        try
-            if sinkCount = sinks.Length then
-                let next = Array.zeroCreate (sinks.Length * 2)
-                Array.Copy(sinks, next, sinks.Length)
-                sinks <- next
-
-            sinks[sinkCount] <- box sink
-            sinkCount <- sinkCount + 1
-        finally
-            Monitor.Exit syncRoot
+        sinks[sinkCount] <- box sink
+        sinkCount <- sinkCount + 1
 
     member internal this.RemoveSink(sink: IMapDeltaSink<'K, 'V>) =
-        Monitor.Enter syncRoot
+        let mutable found = -1
+        let mutable i = 0
 
-        try
-            let mutable found = -1
-            let mutable i = 0
+        while found < 0 && i < sinkCount do
+            if obj.ReferenceEquals(sinks[i], box sink) then
+                found <- i
+            else
+                i <- i + 1
 
-            while found < 0 && i < sinkCount do
-                if obj.ReferenceEquals(sinks[i], box sink) then
-                    found <- i
-                else
-                    i <- i + 1
+        if found >= 0 then
+            sinkCount <- sinkCount - 1
 
-            if found >= 0 then
-                sinkCount <- sinkCount - 1
+            for j in found .. sinkCount - 1 do
+                sinks[j] <- sinks[j + 1]
 
-                for j in found .. sinkCount - 1 do
-                    sinks[j] <- sinks[j + 1]
-
-                sinks[sinkCount] <- null
-        finally
-            Monitor.Exit syncRoot
+            sinks[sinkCount] <- null
 
     member private this.FlushDeltas
         (newVersion: int64, sets: struct ('K * 'V)[], setCount: int, rems: 'K[], remCount: int)
         =
         if setCount > 0 || remCount > 0 then
             let sinksSnapshot =
-                Monitor.Enter syncRoot
-
-                try
-                    if sinkCount = 0 then
-                        Array.empty
-                    else
-                        let arr = Array.zeroCreate sinkCount
-                        Array.Copy(sinks, arr, sinkCount)
-                        arr
-                finally
-                    Monitor.Exit syncRoot
+                if sinkCount = 0 then
+                    Array.empty
+                else
+                    let arr = Array.zeroCreate sinkCount
+                    Array.Copy(sinks, arr, sinkCount)
+                    arr
 
             for i in 0 .. sinksSnapshot.Length - 1 do
                 (unbox<IMapDeltaSink<'K, 'V>> sinksSnapshot[i]).OnDeltas(newVersion, sets, setCount, rems, remCount)
 
     member private this.JournalFlush() =
+        flushEnqueued <- false
+
         if journalSetCount > 0 || journalRemCount > 0 then
             let sets = journalSets
             let setCnt = journalSetCount
@@ -1711,45 +1441,37 @@ type ChangeableMap<'K, 'V when 'K: comparison>(initial: Map<'K, 'V>) =
             journalSetCount <- 0
             journalRems <- ArrayPool<'K>.Shared.Rent 16
             journalRemCount <- 0
-            Monitor.Enter syncRoot
 
-            try
-                for i in 0 .. setCnt - 1 do
-                    let struct (k, v) = sets[i]
-                    data[k] <- v
+            for i in 0 .. setCnt - 1 do
+                let struct (k, v) = sets[i]
+                data[k] <- v
 
-                for i in 0 .. remCnt - 1 do
-                    data.Remove rems[i] |> ignore
+            for i in 0 .. remCnt - 1 do
+                data.Remove rems[i] |> ignore
 
-                version <- version + 1L
-                this.InvalidateSnapshot()
-            finally
-                Monitor.Exit syncRoot
+            version <- version + 1L
+            this.InvalidateSnapshot()
 
             this.FlushDeltas(version, sets, setCnt, rems, remCnt)
             ArrayPool<struct ('K * 'V)>.Shared.Return(sets, true)
             ArrayPool<'K>.Shared.Return(rems, true)
-            flushEnqueued <- false
+            GraphContext.Default.MarkFrom(edges)
 
     member private this.ApplyAndFlush(key: 'K, valueToSet: 'V, isRemove: bool) =
         let mutable changed = false
-        Monitor.Enter syncRoot
 
-        try
-            if isRemove then
-                changed <- data.Remove key
-            else
-                match data.TryGetValue key with
-                | true, existing when EqualityComparer<'V>.Default.Equals(existing, valueToSet) -> ()
-                | _ ->
-                    data[key] <- valueToSet
-                    changed <- true
+        if isRemove then
+            changed <- data.Remove key
+        else
+            match data.TryGetValue key with
+            | true, existing when EqualityComparer<'V>.Default.Equals(existing, valueToSet) -> ()
+            | _ ->
+                data[key] <- valueToSet
+                changed <- true
 
-            if changed then
-                version <- version + 1L
-                this.InvalidateSnapshot()
-        finally
-            Monitor.Exit syncRoot
+        if changed then
+            version <- version + 1L
+            this.InvalidateSnapshot()
 
         if changed then
             let bufSets = ArrayPool<struct ('K * 'V)>.Shared.Rent 1
@@ -1764,6 +1486,7 @@ type ChangeableMap<'K, 'V when 'K: comparison>(initial: Map<'K, 'V>) =
 
             ArrayPool<struct ('K * 'V)>.Shared.Return(bufSets, true)
             ArrayPool<'K>.Shared.Return(bufRems, true)
+            GraphContext.Default.MarkFrom(edges)
 
     member internal this.Apply(newValue: Map<'K, 'V>) =
         let oldCount = data.Count
@@ -1771,26 +1494,22 @@ type ChangeableMap<'K, 'V when 'K: comparison>(initial: Map<'K, 'V>) =
         let mutable oldIdx = 0
         let newEntries = ArrayPool<struct ('K * 'V)>.Shared.Rent newValue.Count
         let mutable newIdx = 0
-        Monitor.Enter syncRoot
 
-        try
-            for key in data.Keys do
-                if not (newValue.ContainsKey key) then
-                    oldKeys[oldIdx] <- key
-                    oldIdx <- oldIdx + 1
+        for key in data.Keys do
+            if not (newValue.ContainsKey key) then
+                oldKeys[oldIdx] <- key
+                oldIdx <- oldIdx + 1
 
-            data.Clear()
+        data.Clear()
 
-            for KeyValue(k, v) in newValue do
-                data.Add(k, v)
-                newEntries[newIdx] <- struct (k, v)
-                newIdx <- newIdx + 1
+        for KeyValue(k, v) in newValue do
+            data.Add(k, v)
+            newEntries[newIdx] <- struct (k, v)
+            newIdx <- newIdx + 1
 
-            version <- version + 1L
-            snapshot <- newValue
-            snapshotVersion <- version
-        finally
-            Monitor.Exit syncRoot
+        version <- version + 1L
+        snapshot <- newValue
+        snapshotVersion <- version
 
         let rems = ArrayPool<'K>.Shared.Rent oldIdx
         Array.Copy(oldKeys, rems, oldIdx)
@@ -1798,72 +1517,93 @@ type ChangeableMap<'K, 'V when 'K: comparison>(initial: Map<'K, 'V>) =
         ArrayPool<'K>.Shared.Return(oldKeys, true)
         ArrayPool<struct ('K * 'V)>.Shared.Return(newEntries, true)
         ArrayPool<'K>.Shared.Return(rems, true)
+        GraphContext.Default.MarkFrom(edges)
 
     member this.Set(newValue: Map<'K, 'V>) =
-        if
-            not (
-                Transaction.tryEnqueueFactory (fun () ->
-                    { new Transaction.ICommit with
-                        member _.Commit() = this.Apply newValue })
-            )
-        then
-            this.Apply newValue
+        let ctx = GraphContext.Default
+        ctx.ClaimOwner()
+
+        try
+            if ctx.TxActive then
+                pendingValue <- ValueSome newValue
+                // A full replace discards the journaled deltas of this batch.
+                journalSetCount <- 0
+                journalRemCount <- 0
+
+                if not flushEnqueued then
+                    flushEnqueued <- true
+                    ctx.TxBuffer.Enqueue(this :> ICommit)
+            else
+                this.Apply newValue
+        finally
+            ctx.ReleaseOwner()
 
     member this.AddOrUpdate (key: 'K) (valueToSet: 'V) =
-        if
-            not (
-                Transaction.tryEnqueueFactory (fun () ->
-                    { new Transaction.ICommit with
-                        member _.Commit() =
-                            if journalSetCount = journalSets.Length then
-                                let next = ArrayPool<struct ('K * 'V)>.Shared.Rent(journalSets.Length * 2)
-                                Array.Copy(journalSets, next, journalSets.Length)
-                                ArrayPool<struct ('K * 'V)>.Shared.Return(journalSets, true)
-                                journalSets <- next
+        let ctx = GraphContext.Default
+        ctx.ClaimOwner()
 
-                            journalSets[journalSetCount] <- struct (key, valueToSet)
-                            journalSetCount <- journalSetCount + 1
+        try
+            if ctx.TxActive then
+                if journalSetCount = journalSets.Length then
+                    let next = ArrayPool<struct ('K * 'V)>.Shared.Rent(journalSets.Length * 2)
+                    Array.Copy(journalSets, next, journalSets.Length)
+                    ArrayPool<struct ('K * 'V)>.Shared.Return(journalSets, true)
+                    journalSets <- next
 
-                            if not flushEnqueued then
-                                flushEnqueued <- true
+                journalSets[journalSetCount] <- struct (key, valueToSet)
+                journalSetCount <- journalSetCount + 1
 
-                                Transaction.tryEnqueue
-                                    { new Transaction.ICommit with
-                                        member _.Commit() = this.JournalFlush() }
-                                |> ignore })
-            )
-        then
-            this.ApplyAndFlush(key, valueToSet, false)
+                if not flushEnqueued then
+                    flushEnqueued <- true
+                    ctx.TxBuffer.Enqueue(this :> ICommit)
+            else
+                this.ApplyAndFlush(key, valueToSet, false)
+        finally
+            ctx.ReleaseOwner()
 
     member this.Remove(key: 'K) =
-        if
-            not (
-                Transaction.tryEnqueueFactory (fun () ->
-                    { new Transaction.ICommit with
-                        member _.Commit() =
-                            if journalRemCount = journalRems.Length then
-                                let next = ArrayPool<'K>.Shared.Rent(journalRems.Length * 2)
-                                Array.Copy(journalRems, next, journalRems.Length)
-                                ArrayPool<'K>.Shared.Return(journalRems, true)
-                                journalRems <- next
+        let ctx = GraphContext.Default
+        ctx.ClaimOwner()
 
-                            journalRems[journalRemCount] <- key
-                            journalRemCount <- journalRemCount + 1
+        try
+            if ctx.TxActive then
+                if journalRemCount = journalRems.Length then
+                    let next = ArrayPool<'K>.Shared.Rent(journalRems.Length * 2)
+                    Array.Copy(journalRems, next, journalRems.Length)
+                    ArrayPool<'K>.Shared.Return(journalRems, true)
+                    journalRems <- next
 
-                            if not flushEnqueued then
-                                flushEnqueued <- true
+                journalRems[journalRemCount] <- key
+                journalRemCount <- journalRemCount + 1
 
-                                Transaction.tryEnqueue
-                                    { new Transaction.ICommit with
-                                        member _.Commit() = this.JournalFlush() }
-                                |> ignore })
-            )
-        then
-            this.ApplyAndFlush(key, Unchecked.defaultof<'V>, true)
+                if not flushEnqueued then
+                    flushEnqueued <- true
+                    ctx.TxBuffer.Enqueue(this :> ICommit)
+            else
+                this.ApplyAndFlush(key, Unchecked.defaultof<'V>, true)
+        finally
+            ctx.ReleaseOwner()
+
+    interface ICommit with
+        member this.Commit() =
+            match pendingValue with
+            | ValueSome newValue ->
+                pendingValue <- ValueNone
+                this.Apply newValue
+            | ValueNone -> ()
+
+            this.JournalFlush()
+
+        member this.Abort() =
+            pendingValue <- ValueNone
+            journalSetCount <- 0
+            journalRemCount <- 0
+            flushEnqueued <- false
 
     interface IAdaptiveMap<'K, 'V> with
         member this.GetValue() =
-            Monitor.Enter syncRoot
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
 
             try
                 AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
@@ -1883,9 +1623,9 @@ type ChangeableMap<'K, 'V when 'K: comparison>(initial: Map<'K, 'V>) =
                         snapshotVersion <- version
                         next
             finally
-                Monitor.Exit syncRoot
+                ctx.ReleaseOwner()
 
-        member _.Version = Interlocked.Read &version
+        member _.Version = version
 
     interface IMapSinkRegistry with
         member this.AddMapSink(sink) =
@@ -1894,20 +1634,26 @@ type ChangeableMap<'K, 'V when 'K: comparison>(initial: Map<'K, 'V>) =
         member this.RemoveMapSink(sink) =
             this.RemoveSink(unbox<IMapDeltaSink<'K, 'V>> sink)
 
+    interface IEdgeTarget with
+        member _.EdgeCount = edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
+
 /// <summary>
 /// Core operations for creating and transforming adaptive values.
 /// Adaptive values automatically track dependencies and recompute only when their inputs change.
 /// </summary>
 /// <remarks>
 /// <para>
-/// AdaptiveSlop provides incremental computation through a pull-based model with optional push invalidation.
-/// When you read an adaptive value, it checks if any dependencies have changed and recomputes if necessary.
+/// AdaptiveSlop provides incremental computation with a push-mark, pull-evaluate model.
+/// Writes mark the dependents of a source dirty. Reads recompute marked nodes and
+/// return cached values for the rest. Observed subgraphs (see <c>AVal.observe</c>)
+/// get O(1) dirty checks; unobserved subgraphs fall back to version checks.
 /// </para>
 /// <para>
 /// <strong>Performance Guidance:</strong>
 /// <list type="bullet">
 /// <item><description>Use <c>map</c>, <c>map2</c> for 1-2 dependencies (most common case)</description></item>
-/// <item><description>Use <c>map3</c>, <c>map4</c> for 3-4 dependencies (avoids intermediate nodes)</description></item>
 /// <item><description>Use <c>mapN</c>, <c>reduce</c>, <c>sum</c> for N dependencies (avoids O(N) node chains)</description></item>
 /// </list>
 /// </para>
@@ -1986,23 +1732,13 @@ module AVal =
 
     /// <summary>
     /// Combines three adaptive values using a mapping function.
-    /// Uses a specialized node with inline dependency tracking for better performance.
+    /// Recomputes only when one of the three inputs changes.
     /// </summary>
     /// <param name="f">The function to combine the three values.</param>
     /// <param name="a">The first adaptive value.</param>
     /// <param name="b">The second adaptive value.</param>
     /// <param name="c">The third adaptive value.</param>
     /// <returns>A new adaptive value that combines all three inputs.</returns>
-    /// <remarks>
-    /// <para>
-    /// More efficient than chaining <c>map2</c> calls because it uses a single node
-    /// with inline fields instead of creating intermediate nodes.
-    /// </para>
-    /// <para>
-    /// <strong>Performance:</strong> Uses inline dependency storage (no array allocation).
-    /// Supports lazy push invalidation when observed.
-    /// </para>
-    /// </remarks>
     /// <example>
     /// <code>
     /// let r = CVal.create 255
@@ -2018,11 +1754,11 @@ module AVal =
         (b: IAdaptiveValue<'B>)
         (c: IAdaptiveValue<'C>)
         : IAdaptiveValue<'T> =
-        Map3Node(a, b, c, f)
+        AdaptiveNode(fun () -> f (a.GetValue()) (b.GetValue()) (c.GetValue()))
 
     /// <summary>
     /// Combines four adaptive values using a mapping function.
-    /// Uses a specialized node with inline dependency tracking for better performance.
+    /// Recomputes only when one of the four inputs changes.
     /// </summary>
     /// <param name="f">The function to combine the four values.</param>
     /// <param name="a">The first adaptive value.</param>
@@ -2030,16 +1766,6 @@ module AVal =
     /// <param name="c">The third adaptive value.</param>
     /// <param name="d">The fourth adaptive value.</param>
     /// <returns>A new adaptive value that combines all four inputs.</returns>
-    /// <remarks>
-    /// <para>
-    /// More efficient than chaining <c>map2</c> calls because it uses a single node
-    /// with inline fields instead of creating intermediate nodes.
-    /// </para>
-    /// <para>
-    /// <strong>Performance:</strong> Uses inline dependency storage (no array allocation).
-    /// Supports lazy push invalidation when observed.
-    /// </para>
-    /// </remarks>
     /// <example>
     /// <code>
     /// let x = CVal.create 0.0
@@ -2057,7 +1783,7 @@ module AVal =
         (c: IAdaptiveValue<'C>)
         (d: IAdaptiveValue<'D>)
         : IAdaptiveValue<'T> =
-        Map4Node(a, b, c, d, f)
+        AdaptiveNode(fun () -> f (a.GetValue()) (b.GetValue()) (c.GetValue()) (d.GetValue()))
 
     /// <summary>
     /// Combines N adaptive values of the same type using a function that receives all values as an array.
@@ -2233,6 +1959,34 @@ module AVal =
             ))
 
     let inline getValue (value: IAdaptiveValue<'T>) = value.GetValue()
+
+    /// <summary>
+    /// Observes an adaptive value. Forces an initial read and registers the callback
+    /// as a parent of the value. The callback runs after a batch or a write that
+    /// changed the value, and it receives the new value.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The callback does not run for the initial read. It runs only for later changes.
+    /// Several writes inside one transaction produce one callback.
+    /// </para>
+    /// <para>
+    /// <strong>Memory management:</strong> Edges are strong references. Always dispose
+    /// the returned observation when it is no longer needed. Otherwise the observed
+    /// subgraph stays registered and keeps receiving marks.
+    /// </para>
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// let count = CVal.create 0
+    /// use observation = AVal.observe (fun v -> printfn "count: %d" v) (CVal.value count)
+    /// count.Set(1)  // prints "count: 1"
+    /// </code>
+    /// </example>
+    let observe (callback: 'T -> unit) (value: IAdaptiveValue<'T>) : IObservation =
+        let observation = new Observation<_>(value, callback)
+        observation.Attach()
+        observation :> IObservation
 
     let inline getValueTask (value: IAdaptiveValue<'T>) = Task.FromResult(value.GetValue())
 

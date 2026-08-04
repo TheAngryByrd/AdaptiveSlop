@@ -12,8 +12,12 @@ open FSharp.Data.Adaptive
 
 [<MemoryDiagnoser>]
 type ValueBenchmarks() =
-    let mutable slopInput: AdaptiveSlop.Core.ChangeableValue<int> = Unchecked.defaultof<_>
-    let mutable slopMapped: AdaptiveSlop.Core.IAdaptiveValue<int> = Unchecked.defaultof<_>
+    let mutable slopInput: AdaptiveSlop.Core.ChangeableValue<int> =
+        Unchecked.defaultof<_>
+
+    let mutable slopMapped: AdaptiveSlop.Core.IAdaptiveValue<int> =
+        Unchecked.defaultof<_>
+
     let mutable fdaInput: cval<int> = Unchecked.defaultof<_>
     let mutable fdaMapped: aval<int> = Unchecked.defaultof<_>
 
@@ -27,16 +31,16 @@ type ValueBenchmarks() =
         fdaInput <- cval 0
         fdaMapped <- AVal.map (fun value -> value + 1) fdaInput
 
-    [<Benchmark(Baseline=true)>]
+    [<Benchmark(Baseline = true)>]
     member this.AdaptiveSlop() =
-        for i in 1..this.Iterations do
+        for i in 1 .. this.Iterations do
             slopInput.Set(i)
             let _ = AdaptiveSlop.Core.AVal.getValue slopMapped
             ()
 
     [<Benchmark>]
     member this.FSharpDataAdaptive() =
-        for i in 1..this.Iterations do
+        for i in 1 .. this.Iterations do
             transact (fun () -> fdaInput.Value <- i)
             let _ = AVal.force fdaMapped
             ()
@@ -47,8 +51,12 @@ type ValueBenchmarks() =
 
 [<MemoryDiagnoser>]
 type DeepChainBenchmarks() =
-    let mutable slopInput: AdaptiveSlop.Core.ChangeableValue<int> = Unchecked.defaultof<_>
-    let mutable slopChain: AdaptiveSlop.Core.IAdaptiveValue<int> = Unchecked.defaultof<_>
+    let mutable slopInput: AdaptiveSlop.Core.ChangeableValue<int> =
+        Unchecked.defaultof<_>
+
+    let mutable slopChain: AdaptiveSlop.Core.IAdaptiveValue<int> =
+        Unchecked.defaultof<_>
+
     let mutable fdaInput: cval<int> = Unchecked.defaultof<_>
     let mutable fdaChain: aval<int> = Unchecked.defaultof<_>
 
@@ -62,28 +70,34 @@ type DeepChainBenchmarks() =
     member this.Setup() =
         // AdaptiveSlop chain
         slopInput <- AdaptiveSlop.Core.CVal.create 0
-        let mutable current: AdaptiveSlop.Core.IAdaptiveValue<int> = AdaptiveSlop.Core.CVal.value slopInput
-        for _ in 1..this.Depth do
+
+        let mutable current: AdaptiveSlop.Core.IAdaptiveValue<int> =
+            AdaptiveSlop.Core.CVal.value slopInput
+
+        for _ in 1 .. this.Depth do
             current <- AdaptiveSlop.Core.AVal.map (fun v -> v + 1) current
+
         slopChain <- current
 
         // FDA chain
         fdaInput <- cval 0
         let mutable fdaCurrent: aval<int> = fdaInput
-        for _ in 1..this.Depth do
+
+        for _ in 1 .. this.Depth do
             fdaCurrent <- AVal.map (fun v -> v + 1) fdaCurrent
+
         fdaChain <- fdaCurrent
 
-    [<Benchmark(Baseline=true)>]
+    [<Benchmark(Baseline = true)>]
     member this.AdaptiveSlop() =
-        for i in 1..this.Iterations do
+        for i in 1 .. this.Iterations do
             slopInput.Set(i)
             let _ = AdaptiveSlop.Core.AVal.getValue slopChain
             ()
 
     [<Benchmark>]
     member this.FSharpDataAdaptive() =
-        for i in 1..this.Iterations do
+        for i in 1 .. this.Iterations do
             transact (fun () -> fdaInput.Value <- i)
             let _ = AVal.force fdaChain
             ()
@@ -94,9 +108,15 @@ type DeepChainBenchmarks() =
 
 [<MemoryDiagnoser>]
 type Map2Benchmarks() =
-    let mutable slopLeft: AdaptiveSlop.Core.ChangeableValue<int> = Unchecked.defaultof<_>
-    let mutable slopRight: AdaptiveSlop.Core.ChangeableValue<int> = Unchecked.defaultof<_>
-    let mutable slopCombined: AdaptiveSlop.Core.IAdaptiveValue<int> = Unchecked.defaultof<_>
+    let mutable slopLeft: AdaptiveSlop.Core.ChangeableValue<int> =
+        Unchecked.defaultof<_>
+
+    let mutable slopRight: AdaptiveSlop.Core.ChangeableValue<int> =
+        Unchecked.defaultof<_>
+
+    let mutable slopCombined: AdaptiveSlop.Core.IAdaptiveValue<int> =
+        Unchecked.defaultof<_>
+
     let mutable fdaLeft: cval<int> = Unchecked.defaultof<_>
     let mutable fdaRight: cval<int> = Unchecked.defaultof<_>
     let mutable fdaCombined: aval<int> = Unchecked.defaultof<_>
@@ -108,15 +128,20 @@ type Map2Benchmarks() =
     member _.Setup() =
         slopLeft <- AdaptiveSlop.Core.CVal.create 0
         slopRight <- AdaptiveSlop.Core.CVal.create 0
-        slopCombined <- AdaptiveSlop.Core.AVal.map2 (+) (AdaptiveSlop.Core.CVal.value slopLeft) (AdaptiveSlop.Core.CVal.value slopRight)
-        
+
+        slopCombined <-
+            AdaptiveSlop.Core.AVal.map2
+                (+)
+                (AdaptiveSlop.Core.CVal.value slopLeft)
+                (AdaptiveSlop.Core.CVal.value slopRight)
+
         fdaLeft <- cval 0
         fdaRight <- cval 0
         fdaCombined <- AVal.map2 (+) fdaLeft fdaRight
 
-    [<Benchmark(Baseline=true)>]
+    [<Benchmark(Baseline = true)>]
     member this.AdaptiveSlop() =
-        for i in 1..this.Iterations do
+        for i in 1 .. this.Iterations do
             slopLeft.Set(i)
             slopRight.Set(i * 2)
             let _ = AdaptiveSlop.Core.AVal.getValue slopCombined
@@ -124,10 +149,11 @@ type Map2Benchmarks() =
 
     [<Benchmark>]
     member this.FSharpDataAdaptive() =
-        for i in 1..this.Iterations do
+        for i in 1 .. this.Iterations do
             transact (fun () ->
                 fdaLeft.Value <- i
                 fdaRight.Value <- i * 2)
+
             let _ = AVal.force fdaCombined
             ()
 
@@ -137,10 +163,18 @@ type Map2Benchmarks() =
 
 [<MemoryDiagnoser>]
 type BindBenchmarks() =
-    let mutable slopSelector: AdaptiveSlop.Core.ChangeableValue<bool> = Unchecked.defaultof<_>
-    let mutable slopLeft: AdaptiveSlop.Core.ChangeableValue<int> = Unchecked.defaultof<_>
-    let mutable slopRight: AdaptiveSlop.Core.ChangeableValue<int> = Unchecked.defaultof<_>
-    let mutable slopBound: AdaptiveSlop.Core.IAdaptiveValue<int> = Unchecked.defaultof<_>
+    let mutable slopSelector: AdaptiveSlop.Core.ChangeableValue<bool> =
+        Unchecked.defaultof<_>
+
+    let mutable slopLeft: AdaptiveSlop.Core.ChangeableValue<int> =
+        Unchecked.defaultof<_>
+
+    let mutable slopRight: AdaptiveSlop.Core.ChangeableValue<int> =
+        Unchecked.defaultof<_>
+
+    let mutable slopBound: AdaptiveSlop.Core.IAdaptiveValue<int> =
+        Unchecked.defaultof<_>
+
     let mutable fdaSelector: cval<bool> = Unchecked.defaultof<_>
     let mutable fdaLeft: cval<int> = Unchecked.defaultof<_>
     let mutable fdaRight: cval<int> = Unchecked.defaultof<_>
@@ -154,18 +188,24 @@ type BindBenchmarks() =
         slopSelector <- AdaptiveSlop.Core.CVal.create true
         slopLeft <- AdaptiveSlop.Core.CVal.create 1
         slopRight <- AdaptiveSlop.Core.CVal.create 2
-        slopBound <- AdaptiveSlop.Core.AVal.bind 
-            (fun sel -> if sel then AdaptiveSlop.Core.CVal.value slopLeft else AdaptiveSlop.Core.CVal.value slopRight) 
-            (AdaptiveSlop.Core.CVal.value slopSelector)
-        
+
+        slopBound <-
+            AdaptiveSlop.Core.AVal.bind
+                (fun sel ->
+                    if sel then
+                        AdaptiveSlop.Core.CVal.value slopLeft
+                    else
+                        AdaptiveSlop.Core.CVal.value slopRight)
+                (AdaptiveSlop.Core.CVal.value slopSelector)
+
         fdaSelector <- cval true
         fdaLeft <- cval 1
         fdaRight <- cval 2
         fdaBound <- AVal.bind (fun sel -> if sel then fdaLeft :> aval<_> else fdaRight :> aval<_>) fdaSelector
 
-    [<Benchmark(Baseline=true)>]
+    [<Benchmark(Baseline = true)>]
     member this.AdaptiveSlop() =
-        for i in 1..this.Iterations do
+        for i in 1 .. this.Iterations do
             slopSelector.Set(i % 2 = 0)
             slopLeft.Set(i)
             slopRight.Set(i * 2)
@@ -174,11 +214,12 @@ type BindBenchmarks() =
 
     [<Benchmark>]
     member this.FSharpDataAdaptive() =
-        for i in 1..this.Iterations do
+        for i in 1 .. this.Iterations do
             transact (fun () ->
                 fdaSelector.Value <- (i % 2 = 0)
                 fdaLeft.Value <- i
                 fdaRight.Value <- i * 2)
+
             let _ = AVal.force fdaBound
             ()
 
@@ -203,33 +244,42 @@ type TransactionBenchmarks() =
     member this.Setup() =
         // AdaptiveSlop
         slopValues <- Array.init this.ValueCount (fun _ -> AdaptiveSlop.Core.CVal.create 0)
-        let mutable sum: AdaptiveSlop.Core.IAdaptiveValue<int> = AdaptiveSlop.Core.AVal.constant 0
+
+        let mutable sum: AdaptiveSlop.Core.IAdaptiveValue<int> =
+            AdaptiveSlop.Core.AVal.constant 0
+
         for v in slopValues do
             sum <- AdaptiveSlop.Core.AVal.map2 (+) sum (AdaptiveSlop.Core.CVal.value v)
+
         slopSum <- sum
 
         // FDA
         fdaValues <- Array.init this.ValueCount (fun _ -> cval 0)
         let mutable fdaSumVal: aval<int> = AVal.constant 0
+
         for v in fdaValues do
             fdaSumVal <- AVal.map2 (+) fdaSumVal v
+
         fdaSum <- fdaSumVal
 
-    [<Benchmark(Baseline=true)>]
+    [<Benchmark(Baseline = true)>]
     member this.AdaptiveSlop_Batched() =
-        for i in 1..this.Iterations do
+        for i in 1 .. this.Iterations do
             AdaptiveSlop.Core.Transaction.run (fun () ->
-                for j in 0..slopValues.Length - 1 do
-                    slopValues[j].Set(i + j)) |> ignore
+                for j in 0 .. slopValues.Length - 1 do
+                    slopValues[j].Set(i + j))
+            |> ignore
+
             let _ = AdaptiveSlop.Core.AVal.getValue slopSum
             ()
 
     [<Benchmark>]
     member this.FSharpDataAdaptive_Batched() =
-        for i in 1..this.Iterations do
+        for i in 1 .. this.Iterations do
             transact (fun () ->
-                for j in 0..fdaValues.Length - 1 do
+                for j in 0 .. fdaValues.Length - 1 do
                     fdaValues[j].Value <- i + j)
+
             let _ = AVal.force fdaSum
             ()
 
@@ -254,9 +304,9 @@ type SetBenchmarks() =
         fdaSet <- cset<int> []
         fdaASet <- fdaSet :> aset<int>
 
-    [<Benchmark(Baseline=true)>]
+    [<Benchmark(Baseline = true)>]
     member this.AdaptiveSlop() =
-        for i in 1..this.Iterations do
+        for i in 1 .. this.Iterations do
             slopSet.Add(i)
             slopSet.Remove(i)
             let _ = AdaptiveSlop.Core.ASet.getValue slopASet
@@ -264,10 +314,11 @@ type SetBenchmarks() =
 
     [<Benchmark>]
     member this.FSharpDataAdaptive() =
-        for i in 1..this.Iterations do
+        for i in 1 .. this.Iterations do
             transact (fun () ->
                 fdaSet.Add(i) |> ignore
                 fdaSet.Remove(i) |> ignore)
+
             let _ = ASet.force fdaASet
             ()
 
@@ -278,7 +329,10 @@ type SetBenchmarks() =
 [<MemoryDiagnoser>]
 type SetTransformBenchmarks() =
     let mutable slopSet: AdaptiveSlop.Core.ChangeableSet<int> = Unchecked.defaultof<_>
-    let mutable slopFiltered: AdaptiveSlop.Core.IAdaptiveSet<int> = Unchecked.defaultof<_>
+
+    let mutable slopFiltered: AdaptiveSlop.Core.IAdaptiveSet<int> =
+        Unchecked.defaultof<_>
+
     let mutable fdaSet: cset<int> = Unchecked.defaultof<_>
     let mutable fdaFiltered: aset<int> = Unchecked.defaultof<_>
 
@@ -288,16 +342,19 @@ type SetTransformBenchmarks() =
     [<GlobalSetup>]
     member _.Setup() =
         slopSet <- AdaptiveSlop.Core.CSet.ofSeq (seq { 1..100 })
-        let mapped = AdaptiveSlop.Core.ASet.map (fun v -> v * 2) (AdaptiveSlop.Core.CSet.value slopSet)
+
+        let mapped =
+            AdaptiveSlop.Core.ASet.map (fun v -> v * 2) (AdaptiveSlop.Core.CSet.value slopSet)
+
         slopFiltered <- AdaptiveSlop.Core.ASet.filter (fun v -> v % 4 = 0) mapped
-        
+
         fdaSet <- cset (seq { 1..100 })
         let fdaMapped = ASet.map (fun v -> v * 2) fdaSet
         fdaFiltered <- ASet.filter (fun v -> v % 4 = 0) fdaMapped
 
-    [<Benchmark(Baseline=true)>]
+    [<Benchmark(Baseline = true)>]
     member this.AdaptiveSlop() =
-        for i in 1..this.Iterations do
+        for i in 1 .. this.Iterations do
             slopSet.Add(1000 + i)
             slopSet.Remove(1000 + i - 1)
             let _ = AdaptiveSlop.Core.ASet.getValue slopFiltered
@@ -305,10 +362,11 @@ type SetTransformBenchmarks() =
 
     [<Benchmark>]
     member this.FSharpDataAdaptive() =
-        for i in 1..this.Iterations do
+        for i in 1 .. this.Iterations do
             transact (fun () ->
                 fdaSet.Add(1000 + i) |> ignore
                 fdaSet.Remove(1000 + i - 1) |> ignore)
+
             let _ = ASet.force fdaFiltered
             ()
 
@@ -318,8 +376,12 @@ type SetTransformBenchmarks() =
 
 [<MemoryDiagnoser>]
 type MapBenchmarks() =
-    let mutable slopMap: AdaptiveSlop.Core.ChangeableMap<int, int> = Unchecked.defaultof<_>
-    let mutable slopAMap: AdaptiveSlop.Core.IAdaptiveMap<int, int> = Unchecked.defaultof<_>
+    let mutable slopMap: AdaptiveSlop.Core.ChangeableMap<int, int> =
+        Unchecked.defaultof<_>
+
+    let mutable slopAMap: AdaptiveSlop.Core.IAdaptiveMap<int, int> =
+        Unchecked.defaultof<_>
+
     let mutable fdaMap: cmap<int, int> = Unchecked.defaultof<_>
     let mutable fdaAMap: amap<int, int> = Unchecked.defaultof<_>
 
@@ -333,9 +395,9 @@ type MapBenchmarks() =
         fdaMap <- cmap (Seq.empty<int * int>)
         fdaAMap <- fdaMap :> amap<int, int>
 
-    [<Benchmark(Baseline=true)>]
+    [<Benchmark(Baseline = true)>]
     member this.AdaptiveSlop() =
-        for i in 1..this.Iterations do
+        for i in 1 .. this.Iterations do
             slopMap.AddOrUpdate i (i * 2)
             slopMap.Remove(i)
             let _ = AdaptiveSlop.Core.AMap.getValue slopAMap
@@ -343,10 +405,11 @@ type MapBenchmarks() =
 
     [<Benchmark>]
     member this.FSharpDataAdaptive() =
-        for i in 1..this.Iterations do
+        for i in 1 .. this.Iterations do
             transact (fun () ->
                 fdaMap.[i] <- i * 2
                 fdaMap.Remove(i) |> ignore)
+
             let _ = AMap.force fdaAMap
             ()
 
@@ -356,8 +419,12 @@ type MapBenchmarks() =
 
 [<MemoryDiagnoser>]
 type MapTransformBenchmarks() =
-    let mutable slopMap: AdaptiveSlop.Core.ChangeableMap<int, int> = Unchecked.defaultof<_>
-    let mutable slopFiltered: AdaptiveSlop.Core.IAdaptiveMap<int, int> = Unchecked.defaultof<_>
+    let mutable slopMap: AdaptiveSlop.Core.ChangeableMap<int, int> =
+        Unchecked.defaultof<_>
+
+    let mutable slopFiltered: AdaptiveSlop.Core.IAdaptiveMap<int, int> =
+        Unchecked.defaultof<_>
+
     let mutable fdaMap: cmap<int, int> = Unchecked.defaultof<_>
     let mutable fdaFiltered: amap<int, int> = Unchecked.defaultof<_>
 
@@ -367,16 +434,19 @@ type MapTransformBenchmarks() =
     [<GlobalSetup>]
     member _.Setup() =
         slopMap <- AdaptiveSlop.Core.CMap.ofSeq (seq { for i in 1..100 -> i, i * 10 })
-        let mapped = AdaptiveSlop.Core.AMap.map (fun _ v -> v + 1) (AdaptiveSlop.Core.CMap.value slopMap)
+
+        let mapped =
+            AdaptiveSlop.Core.AMap.map (fun _ v -> v + 1) (AdaptiveSlop.Core.CMap.value slopMap)
+
         slopFiltered <- AdaptiveSlop.Core.AMap.filter (fun _ v -> v > 50) mapped
-        
+
         fdaMap <- cmap (seq { for i in 1..100 -> i, i * 10 })
         let fdaMapped = AMap.map (fun _ v -> v + 1) fdaMap
         fdaFiltered <- AMap.filter (fun _ v -> v > 50) fdaMapped
 
-    [<Benchmark(Baseline=true)>]
+    [<Benchmark(Baseline = true)>]
     member this.AdaptiveSlop() =
-        for i in 1..this.Iterations do
+        for i in 1 .. this.Iterations do
             slopMap.AddOrUpdate (1000 + i) ((1000 + i) * 10)
             slopMap.Remove(1000 + i - 1)
             let _ = AdaptiveSlop.Core.AMap.getValue slopFiltered
@@ -384,10 +454,11 @@ type MapTransformBenchmarks() =
 
     [<Benchmark>]
     member this.FSharpDataAdaptive() =
-        for i in 1..this.Iterations do
+        for i in 1 .. this.Iterations do
             transact (fun () ->
                 fdaMap.[1000 + i] <- (1000 + i) * 10
                 fdaMap.Remove(1000 + i - 1) |> ignore)
+
             let _ = AMap.force fdaFiltered
             ()
 
@@ -410,16 +481,17 @@ type LargeCollectionBenchmarks() =
 
     [<GlobalSetup>]
     member this.Setup() =
-        slopSet <- AdaptiveSlop.Core.CSet.ofSeq (seq { 1..this.InitialSize })
+        slopSet <- AdaptiveSlop.Core.CSet.ofSeq (seq { 1 .. this.InitialSize })
         slopASet <- AdaptiveSlop.Core.CSet.value slopSet
-        
-        fdaSet <- cset (seq { 1..this.InitialSize })
+
+        fdaSet <- cset (seq { 1 .. this.InitialSize })
         fdaASet <- fdaSet :> aset<int>
 
-    [<Benchmark(Baseline=true)>]
+    [<Benchmark(Baseline = true)>]
     member this.AdaptiveSlop() =
         let baseIdx = this.InitialSize
-        for i in 1..this.Iterations do
+
+        for i in 1 .. this.Iterations do
             slopSet.Add(baseIdx + i)
             let _ = AdaptiveSlop.Core.ASet.getValue slopASet
             ()
@@ -427,7 +499,8 @@ type LargeCollectionBenchmarks() =
     [<Benchmark>]
     member this.FSharpDataAdaptive() =
         let baseIdx = this.InitialSize
-        for i in 1..this.Iterations do
+
+        for i in 1 .. this.Iterations do
             transact (fun () -> fdaSet.Add(baseIdx + i) |> ignore)
             let _ = ASet.force fdaASet
             ()
@@ -438,8 +511,12 @@ type LargeCollectionBenchmarks() =
 
 [<MemoryDiagnoser>]
 type ReadHeavyBenchmarks() =
-    let mutable slopInput: AdaptiveSlop.Core.ChangeableValue<int> = Unchecked.defaultof<_>
-    let mutable slopMapped: AdaptiveSlop.Core.IAdaptiveValue<int> = Unchecked.defaultof<_>
+    let mutable slopInput: AdaptiveSlop.Core.ChangeableValue<int> =
+        Unchecked.defaultof<_>
+
+    let mutable slopMapped: AdaptiveSlop.Core.IAdaptiveValue<int> =
+        Unchecked.defaultof<_>
+
     let mutable fdaInput: cval<int> = Unchecked.defaultof<_>
     let mutable fdaMapped: aval<int> = Unchecked.defaultof<_>
 
@@ -453,70 +530,27 @@ type ReadHeavyBenchmarks() =
     member _.Setup() =
         slopInput <- AdaptiveSlop.Core.CVal.create 0
         slopMapped <- AdaptiveSlop.Core.AVal.map (fun v -> v * 2) (AdaptiveSlop.Core.CVal.value slopInput)
-        
+
         fdaInput <- cval 0
         fdaMapped <- AVal.map (fun v -> v * 2) fdaInput
 
-    [<Benchmark(Baseline=true)>]
+    [<Benchmark(Baseline = true)>]
     member this.AdaptiveSlop() =
-        for i in 1..this.WriteCount do
+        for i in 1 .. this.WriteCount do
             slopInput.Set(i)
-            for _ in 1..this.ReadsPerWrite do
+
+            for _ in 1 .. this.ReadsPerWrite do
                 let _ = AdaptiveSlop.Core.AVal.getValue slopMapped
                 ()
 
     [<Benchmark>]
     member this.FSharpDataAdaptive() =
-        for i in 1..this.WriteCount do
+        for i in 1 .. this.WriteCount do
             transact (fun () -> fdaInput.Value <- i)
-            for _ in 1..this.ReadsPerWrite do
+
+            for _ in 1 .. this.ReadsPerWrite do
                 let _ = AVal.force fdaMapped
                 ()
-
-// =============================================================================
-// Concurrent Access Benchmark
-// =============================================================================
-
-[<MemoryDiagnoser>]
-type ConcurrentBenchmarks() =
-    let mutable slopInput: AdaptiveSlop.Core.ChangeableValue<int> = Unchecked.defaultof<_>
-    let mutable slopMapped: AdaptiveSlop.Core.IAdaptiveValue<int> = Unchecked.defaultof<_>
-    let mutable fdaInput: cval<int> = Unchecked.defaultof<_>
-    let mutable fdaMapped: aval<int> = Unchecked.defaultof<_>
-
-    [<Params(4)>]
-    member val ThreadCount = 0 with get, set
-
-    [<Params(500)>]
-    member val IterationsPerThread = 0 with get, set
-
-    [<GlobalSetup>]
-    member _.Setup() =
-        slopInput <- AdaptiveSlop.Core.CVal.create 0
-        slopMapped <- AdaptiveSlop.Core.AVal.map (fun v -> v + 1) (AdaptiveSlop.Core.CVal.value slopInput)
-        
-        fdaInput <- cval 0
-        fdaMapped <- AVal.map (fun v -> v + 1) fdaInput
-
-    [<Benchmark(Baseline=true)>]
-    member this.AdaptiveSlop() =
-        let tasks = Array.init this.ThreadCount (fun threadId ->
-            Task.Run(fun () ->
-                for i in 1..this.IterationsPerThread do
-                    slopInput.Set(threadId * 10000 + i)
-                    let _ = AdaptiveSlop.Core.AVal.getValue slopMapped
-                    ()))
-        Task.WaitAll(tasks)
-
-    [<Benchmark>]
-    member this.FSharpDataAdaptive() =
-        let tasks = Array.init this.ThreadCount (fun threadId ->
-            Task.Run(fun () ->
-                for i in 1..this.IterationsPerThread do
-                    transact (fun () -> fdaInput.Value <- threadId * 10000 + i)
-                    let _ = AVal.force fdaMapped
-                    ()))
-        Task.WaitAll(tasks)
 
 // =============================================================================
 // Diamond Dependency Graph Benchmark
@@ -548,16 +582,16 @@ type DiamondGraphBenchmarks() =
         let fdaC = AVal.map (fun v -> v * 2) fdaA
         fdaD <- AVal.map2 (+) fdaB fdaC
 
-    [<Benchmark(Baseline=true)>]
+    [<Benchmark(Baseline = true)>]
     member this.AdaptiveSlop() =
-        for i in 1..this.Iterations do
+        for i in 1 .. this.Iterations do
             slopA.Set(i)
             let _ = AdaptiveSlop.Core.AVal.getValue slopD
             ()
 
     [<Benchmark>]
     member this.FSharpDataAdaptive() =
-        for i in 1..this.Iterations do
+        for i in 1 .. this.Iterations do
             transact (fun () -> fdaA.Value <- i)
             let _ = AVal.force fdaD
             ()
@@ -588,21 +622,27 @@ type WideTreeBenchmarks() =
     member this.Setup() =
         // AdaptiveSlop wide tree
         slopInputs <- Array.init this.Width (fun i -> AdaptiveSlop.Core.CVal.create i)
-        let mutable sum: AdaptiveSlop.Core.IAdaptiveValue<int> = AdaptiveSlop.Core.CVal.value slopInputs.[0]
-        for i in 1..this.Width - 1 do
+
+        let mutable sum: AdaptiveSlop.Core.IAdaptiveValue<int> =
+            AdaptiveSlop.Core.CVal.value slopInputs.[0]
+
+        for i in 1 .. this.Width - 1 do
             sum <- AdaptiveSlop.Core.AVal.map2 (+) sum (AdaptiveSlop.Core.CVal.value slopInputs.[i])
+
         slopSum <- sum
 
         // FDA wide tree
         fdaInputs <- Array.init this.Width (fun i -> cval i)
         let mutable fdaSumVal: aval<int> = fdaInputs.[0]
-        for i in 1..this.Width - 1 do
+
+        for i in 1 .. this.Width - 1 do
             fdaSumVal <- AVal.map2 (+) fdaSumVal fdaInputs.[i]
+
         fdaSum <- fdaSumVal
 
-    [<Benchmark(Baseline=true)>]
+    [<Benchmark(Baseline = true)>]
     member this.AdaptiveSlop() =
-        for i in 1..this.Iterations do
+        for i in 1 .. this.Iterations do
             // Change one input in the middle
             slopInputs.[this.Width / 2].Set(i)
             let _ = AdaptiveSlop.Core.AVal.getValue slopSum
@@ -610,7 +650,7 @@ type WideTreeBenchmarks() =
 
     [<Benchmark>]
     member this.FSharpDataAdaptive() =
-        for i in 1..this.Iterations do
+        for i in 1 .. this.Iterations do
             transact (fun () -> fdaInputs.[this.Width / 2].Value <- i)
             let _ = AVal.force fdaSum
             ()
@@ -623,9 +663,15 @@ type WideTreeBenchmarks() =
 type OptimizedWideTreeBenchmarks() =
     // Compares: map2 chain vs reduce (single node) vs FDA
     let mutable slopInputsMap2: AdaptiveSlop.Core.ChangeableValue<int>[] = [||]
-    let mutable slopSumMap2: AdaptiveSlop.Core.IAdaptiveValue<int> = Unchecked.defaultof<_>
+
+    let mutable slopSumMap2: AdaptiveSlop.Core.IAdaptiveValue<int> =
+        Unchecked.defaultof<_>
+
     let mutable slopInputsReduce: AdaptiveSlop.Core.ChangeableValue<int>[] = [||]
-    let mutable slopSumReduce: AdaptiveSlop.Core.IAdaptiveValue<int> = Unchecked.defaultof<_>
+
+    let mutable slopSumReduce: AdaptiveSlop.Core.IAdaptiveValue<int> =
+        Unchecked.defaultof<_>
+
     let mutable fdaInputs: cval<int>[] = [||]
     let mutable fdaSum: aval<int> = Unchecked.defaultof<_>
 
@@ -639,9 +685,13 @@ type OptimizedWideTreeBenchmarks() =
     member this.Setup() =
         // AdaptiveSlop with map2 chain (baseline)
         slopInputsMap2 <- Array.init this.Width (fun i -> AdaptiveSlop.Core.CVal.create i)
-        let mutable sum: AdaptiveSlop.Core.IAdaptiveValue<int> = AdaptiveSlop.Core.CVal.value slopInputsMap2.[0]
-        for i in 1..this.Width - 1 do
+
+        let mutable sum: AdaptiveSlop.Core.IAdaptiveValue<int> =
+            AdaptiveSlop.Core.CVal.value slopInputsMap2.[0]
+
+        for i in 1 .. this.Width - 1 do
             sum <- AdaptiveSlop.Core.AVal.map2 (+) sum (AdaptiveSlop.Core.CVal.value slopInputsMap2.[i])
+
         slopSumMap2 <- sum
 
         // AdaptiveSlop with reduce (optimized - single node)
@@ -652,27 +702,29 @@ type OptimizedWideTreeBenchmarks() =
         // FDA with map2 chain
         fdaInputs <- Array.init this.Width (fun i -> cval i)
         let mutable fdaSumVal: aval<int> = fdaInputs.[0]
-        for i in 1..this.Width - 1 do
+
+        for i in 1 .. this.Width - 1 do
             fdaSumVal <- AVal.map2 (+) fdaSumVal fdaInputs.[i]
+
         fdaSum <- fdaSumVal
 
-    [<Benchmark(Baseline=true)>]
+    [<Benchmark(Baseline = true)>]
     member this.AdaptiveSlop_Map2Chain() =
-        for i in 1..this.Iterations do
+        for i in 1 .. this.Iterations do
             slopInputsMap2.[this.Width / 2].Set(i)
             let _ = AdaptiveSlop.Core.AVal.getValue slopSumMap2
             ()
 
     [<Benchmark>]
     member this.AdaptiveSlop_Reduce() =
-        for i in 1..this.Iterations do
+        for i in 1 .. this.Iterations do
             slopInputsReduce.[this.Width / 2].Set(i)
             let _ = AdaptiveSlop.Core.AVal.getValue slopSumReduce
             ()
 
     [<Benchmark>]
     member this.FSharpDataAdaptive() =
-        for i in 1..this.Iterations do
+        for i in 1 .. this.Iterations do
             transact (fun () -> fdaInputs.[this.Width / 2].Value <- i)
             let _ = AVal.force fdaSum
             ()
@@ -702,47 +754,59 @@ type DeepWideBenchmarks() =
     [<GlobalSetup>]
     member this.Setup() =
         let leafCount = pown this.BranchingFactor this.Depth
-        
+
         // AdaptiveSlop tree
         slopInputs <- Array.init leafCount (fun i -> AdaptiveSlop.Core.CVal.create i)
-        
+
         // Build tree bottom-up by combining nodes at each level
         let rec buildLevel (nodes: AdaptiveSlop.Core.IAdaptiveValue<int>[]) =
-            if nodes.Length = 1 then nodes.[0]
+            if nodes.Length = 1 then
+                nodes.[0]
             else
                 let parentCount = (nodes.Length + this.BranchingFactor - 1) / this.BranchingFactor
-                let parents = Array.init parentCount (fun i ->
-                    let start = i * this.BranchingFactor
-                    let endIdx = min (start + this.BranchingFactor) nodes.Length
-                    let mutable combined = nodes.[start]
-                    for j in (start + 1)..(endIdx - 1) do
-                        combined <- AdaptiveSlop.Core.AVal.map2 (+) combined nodes.[j]
-                    combined)
+
+                let parents =
+                    Array.init parentCount (fun i ->
+                        let start = i * this.BranchingFactor
+                        let endIdx = min (start + this.BranchingFactor) nodes.Length
+                        let mutable combined = nodes.[start]
+
+                        for j in (start + 1) .. (endIdx - 1) do
+                            combined <- AdaptiveSlop.Core.AVal.map2 (+) combined nodes.[j]
+
+                        combined)
+
                 buildLevel parents
-        
+
         slopRoot <- buildLevel (slopInputs |> Array.map AdaptiveSlop.Core.CVal.value)
 
         // FDA tree
         fdaInputs <- Array.init leafCount (fun i -> cval i)
-        
+
         let rec buildFdaLevel (nodes: aval<int>[]) =
-            if nodes.Length = 1 then nodes.[0]
+            if nodes.Length = 1 then
+                nodes.[0]
             else
                 let parentCount = (nodes.Length + this.BranchingFactor - 1) / this.BranchingFactor
-                let parents = Array.init parentCount (fun i ->
-                    let start = i * this.BranchingFactor
-                    let endIdx = min (start + this.BranchingFactor) nodes.Length
-                    let mutable combined = nodes.[start]
-                    for j in (start + 1)..(endIdx - 1) do
-                        combined <- AVal.map2 (+) combined nodes.[j]
-                    combined)
+
+                let parents =
+                    Array.init parentCount (fun i ->
+                        let start = i * this.BranchingFactor
+                        let endIdx = min (start + this.BranchingFactor) nodes.Length
+                        let mutable combined = nodes.[start]
+
+                        for j in (start + 1) .. (endIdx - 1) do
+                            combined <- AVal.map2 (+) combined nodes.[j]
+
+                        combined)
+
                 buildFdaLevel parents
-        
+
         fdaRoot <- buildFdaLevel (fdaInputs |> Array.map (fun x -> x :> aval<int>))
 
-    [<Benchmark(Baseline=true)>]
+    [<Benchmark(Baseline = true)>]
     member this.AdaptiveSlop() =
-        for i in 1..this.Iterations do
+        for i in 1 .. this.Iterations do
             // Change a leaf node
             slopInputs.[slopInputs.Length / 2].Set(i)
             let _ = AdaptiveSlop.Core.AVal.getValue slopRoot
@@ -750,7 +814,7 @@ type DeepWideBenchmarks() =
 
     [<Benchmark>]
     member this.FSharpDataAdaptive() =
-        for i in 1..this.Iterations do
+        for i in 1 .. this.Iterations do
             transact (fun () -> fdaInputs.[fdaInputs.Length / 2].Value <- i)
             let _ = AVal.force fdaRoot
             ()
@@ -765,9 +829,14 @@ type UnbalancedTreeBenchmarks() =
     // Deep branch: input -> map -> map -> ... -> map (depth levels)
     // Shallow branches: input -> map (1 level each)
     // All combine at the end
-    let mutable slopDeepInput: AdaptiveSlop.Core.ChangeableValue<int> = Unchecked.defaultof<_>
+    let mutable slopDeepInput: AdaptiveSlop.Core.ChangeableValue<int> =
+        Unchecked.defaultof<_>
+
     let mutable slopShallowInputs: AdaptiveSlop.Core.ChangeableValue<int>[] = [||]
-    let mutable slopResult: AdaptiveSlop.Core.IAdaptiveValue<int> = Unchecked.defaultof<_>
+
+    let mutable slopResult: AdaptiveSlop.Core.IAdaptiveValue<int> =
+        Unchecked.defaultof<_>
+
     let mutable fdaDeepInput: cval<int> = Unchecked.defaultof<_>
     let mutable fdaShallowInputs: cval<int>[] = [||]
     let mutable fdaResult: aval<int> = Unchecked.defaultof<_>
@@ -785,59 +854,70 @@ type UnbalancedTreeBenchmarks() =
     member this.Setup() =
         // AdaptiveSlop unbalanced tree
         slopDeepInput <- AdaptiveSlop.Core.CVal.create 0
-        let mutable deepChain: AdaptiveSlop.Core.IAdaptiveValue<int> = AdaptiveSlop.Core.CVal.value slopDeepInput
-        for _ in 1..this.DeepBranchDepth do
+
+        let mutable deepChain: AdaptiveSlop.Core.IAdaptiveValue<int> =
+            AdaptiveSlop.Core.CVal.value slopDeepInput
+
+        for _ in 1 .. this.DeepBranchDepth do
             deepChain <- AdaptiveSlop.Core.AVal.map (fun v -> v + 1) deepChain
 
         slopShallowInputs <- Array.init this.ShallowBranchCount (fun i -> AdaptiveSlop.Core.CVal.create i)
-        let shallowMapped = slopShallowInputs |> Array.map (fun cv -> 
-            AdaptiveSlop.Core.AVal.map (fun v -> v * 2) (AdaptiveSlop.Core.CVal.value cv))
+
+        let shallowMapped =
+            slopShallowInputs
+            |> Array.map (fun cv -> AdaptiveSlop.Core.AVal.map (fun v -> v * 2) (AdaptiveSlop.Core.CVal.value cv))
 
         // Combine deep chain with all shallow branches
         let mutable combined = deepChain
+
         for shallow in shallowMapped do
             combined <- AdaptiveSlop.Core.AVal.map2 (+) combined shallow
+
         slopResult <- combined
 
         // FDA unbalanced tree
         fdaDeepInput <- cval 0
         let mutable fdaDeepChain: aval<int> = fdaDeepInput
-        for _ in 1..this.DeepBranchDepth do
+
+        for _ in 1 .. this.DeepBranchDepth do
             fdaDeepChain <- AVal.map (fun v -> v + 1) fdaDeepChain
 
         fdaShallowInputs <- Array.init this.ShallowBranchCount (fun i -> cval i)
-        let fdaShallowMapped = fdaShallowInputs |> Array.map (fun cv -> 
-            AVal.map (fun v -> v * 2) cv)
+
+        let fdaShallowMapped =
+            fdaShallowInputs |> Array.map (fun cv -> AVal.map (fun v -> v * 2) cv)
 
         let mutable fdaCombined = fdaDeepChain
+
         for shallow in fdaShallowMapped do
             fdaCombined <- AVal.map2 (+) fdaCombined shallow
+
         fdaResult <- fdaCombined
 
-    [<Benchmark(Baseline=true, Description="AdaptiveSlop_DeepChange")>]
+    [<Benchmark(Baseline = true, Description = "AdaptiveSlop_DeepChange")>]
     member this.AdaptiveSlop_ChangeDeep() =
-        for i in 1..this.Iterations do
+        for i in 1 .. this.Iterations do
             slopDeepInput.Set(i)
             let _ = AdaptiveSlop.Core.AVal.getValue slopResult
             ()
 
-    [<Benchmark(Description="FDA_DeepChange")>]
+    [<Benchmark(Description = "FDA_DeepChange")>]
     member this.FSharpDataAdaptive_ChangeDeep() =
-        for i in 1..this.Iterations do
+        for i in 1 .. this.Iterations do
             transact (fun () -> fdaDeepInput.Value <- i)
             let _ = AVal.force fdaResult
             ()
 
-    [<Benchmark(Description="AdaptiveSlop_ShallowChange")>]
+    [<Benchmark(Description = "AdaptiveSlop_ShallowChange")>]
     member this.AdaptiveSlop_ChangeShallow() =
-        for i in 1..this.Iterations do
+        for i in 1 .. this.Iterations do
             slopShallowInputs.[0].Set(i)
             let _ = AdaptiveSlop.Core.AVal.getValue slopResult
             ()
 
-    [<Benchmark(Description="FDA_ShallowChange")>]
+    [<Benchmark(Description = "FDA_ShallowChange")>]
     member this.FSharpDataAdaptive_ChangeShallow() =
-        for i in 1..this.Iterations do
+        for i in 1 .. this.Iterations do
             transact (fun () -> fdaShallowInputs.[0].Value <- i)
             let _ = AVal.force fdaResult
             ()
@@ -850,7 +930,9 @@ type UnbalancedTreeBenchmarks() =
 [<MemoryDiagnoser>]
 type IncrementalChainBenchmarks() =
     // AdaptiveSlop: source → *2 → filter even numbers
-    let mutable slopSource: AdaptiveSlop.Core.ChangeableSet<int> = Unchecked.defaultof<_>
+    let mutable slopSource: AdaptiveSlop.Core.ChangeableSet<int> =
+        Unchecked.defaultof<_>
+
     let mutable slopChain: AdaptiveSlop.Core.IAdaptiveSet<int> = Unchecked.defaultof<_>
     // FDA: same chain
     let mutable fdaSource: cset<int> = Unchecked.defaultof<_>
@@ -865,19 +947,20 @@ type IncrementalChainBenchmarks() =
     [<GlobalSetup>]
     member this.Setup() =
         // AdaptiveSlop
-        slopSource <- AdaptiveSlop.Core.CSet.ofSeq (seq { 1..this.InitialSize })
+        slopSource <- AdaptiveSlop.Core.CSet.ofSeq (seq { 1 .. this.InitialSize })
         let mapped = AdaptiveSlop.Core.ASet.map (fun x -> x * 2) slopSource
         slopChain <- AdaptiveSlop.Core.ASet.filter (fun x -> x % 4 = 0) mapped
 
         // FDA
-        fdaSource <- cset (seq { 1..this.InitialSize })
+        fdaSource <- cset (seq { 1 .. this.InitialSize })
         let fdaMapped = ASet.map (fun x -> x * 2) fdaSource
         fdaChain <- ASet.filter (fun x -> x % 4 = 0) fdaMapped
 
-    [<Benchmark(Baseline=true)>]
+    [<Benchmark(Baseline = true)>]
     member this.AdaptiveSlop() =
         let offset = this.InitialSize
-        for i in 1..this.Mutations do
+
+        for i in 1 .. this.Mutations do
             slopSource.Add(offset + i)
             slopSource.Remove(offset + i - 1)
             let _ = AdaptiveSlop.Core.ASet.getValue slopChain
@@ -886,10 +969,12 @@ type IncrementalChainBenchmarks() =
     [<Benchmark>]
     member this.FSharpDataAdaptive() =
         let offset = this.InitialSize
-        for i in 1..this.Mutations do
+
+        for i in 1 .. this.Mutations do
             transact (fun () ->
                 fdaSource.Add(offset + i) |> ignore
                 fdaSource.Remove(offset + i - 1) |> ignore)
+
             let _ = ASet.force fdaChain
             ()
 
@@ -899,5 +984,7 @@ type IncrementalChainBenchmarks() =
 
 [<EntryPoint>]
 let main args =
-    BenchmarkSwitcher.FromAssembly(typeof<ValueBenchmarks>.Assembly).Run(args) |> ignore
+    BenchmarkSwitcher.FromAssembly(typeof<ValueBenchmarks>.Assembly).Run(args)
+    |> ignore
+
     0

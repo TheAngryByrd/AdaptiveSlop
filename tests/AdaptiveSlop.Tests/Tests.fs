@@ -1,28 +1,12 @@
-#nowarn "893"
-
 module AdaptiveSlop.Tests
 
+#nowarn "893"
+
 open System
-open System.Collections.Concurrent
-open System.Threading
 open System.Threading.Tasks
 open global.Xunit
 open AdaptiveSlop.Core
 
-
-let private runParallel taskCount iterations (work: int -> unit) =
-    let errors = ConcurrentQueue<exn>()
-    let tasks =
-        Array.init taskCount (fun workerId ->
-            Task.Run(fun () ->
-                try
-                    for i in 1..iterations do
-                        work (workerId * iterations + i)
-                with ex ->
-                    errors.Enqueue(ex)))
-
-    Task.WaitAll(tasks)
-    errors
 
 type private DepTree =
     | Leaf of ChangeableValue<int>
@@ -41,11 +25,13 @@ let rec private buildAdaptive tree =
         | [] -> AVal.constant 0
         | first :: rest ->
             let initial = buildAdaptive first
+
             rest
-            |> List.fold (fun acc child ->
-                let right = buildAdaptive child
-                AVal.map2 (fun leftValue rightValue -> leftValue + rightValue) acc right
-            ) initial
+            |> List.fold
+                (fun acc child ->
+                    let right = buildAdaptive child
+                    AVal.map2 (fun leftValue rightValue -> leftValue + rightValue) acc right)
+                initial
 
 let private buildTree depth (values: int list) =
     let mutable index = 0
@@ -60,66 +46,13 @@ let private buildTree depth (values: int list) =
 
     let rec build currentDepth =
         if currentDepth <= 0 then
-            Leaf (CVal.create (nextValue ()))
+            Leaf(CVal.create (nextValue ()))
         else
             let left = build (currentDepth - 1)
             let right = build (currentDepth - 1)
             Node [ left; right ]
 
     build depth
-
-[<Fact>]
-let ``ChangeableValue supports concurrent write/read`` () =
-    let changeable = CVal.create 0
-    let adaptive = AVal.map (fun value -> value + 1) (CVal.value changeable)
-
-    let errors =
-        runParallel 8 5000 (fun value ->
-            changeable.Set(value)
-            let _ = AVal.getValue adaptive
-            ())
-
-    Assert.True(errors.IsEmpty, $"Errors found: {errors.Count}")
-    let result = AVal.getValue adaptive
-    Assert.InRange(result, 1, 8 * 5000 + 1)
-
-[<Fact>]
-let ``ChangeableSet supports concurrent adds`` () =
-    let changeable = CSet.empty<int>
-
-    let errors =
-        runParallel 8 2000 (fun value ->
-            changeable.Add(value))
-
-    Assert.True(errors.IsEmpty, $"Errors found: {errors.Count}")
-    let result = ASet.getValue (CSet.value changeable)
-    Assert.Equal(8 * 2000, result.Count)
-
-[<Fact>]
-let ``ChangeableMap supports concurrent updates`` () =
-    let changeable = CMap.empty<int, int>
-
-    let errors =
-        runParallel 8 2000 (fun value ->
-            changeable.AddOrUpdate value (value * 2))
-
-    Assert.True(errors.IsEmpty, $"Errors found: {errors.Count}")
-    let result = AMap.getValue (CMap.value changeable)
-    Assert.Equal(8 * 2000, result.Count)
-
-[<Fact>]
-let ``AdaptiveNode recomputes safely under concurrency`` () =
-    let changeable = CVal.create 0
-    let adaptive = AVal.map (fun value -> value * 2) (CVal.value changeable)
-
-    let errors =
-        runParallel 8 5000 (fun value ->
-            if value % 2 = 0 then
-                changeable.Set(value)
-            let _ = AVal.getValue adaptive
-            ())
-
-    Assert.True(errors.IsEmpty, $"Errors found: {errors.Count}")
 
 [<Fact>]
 let ``AVal map reflects changes`` () =
@@ -134,10 +67,13 @@ let ``AVal map reflects changes`` () =
 let ``AVal map avoids recompute when unchanged`` () =
     let input = CVal.create 3
     let mutable recomputeCount = 0
+
     let mapped =
-        AVal.map (fun v ->
-            recomputeCount <- recomputeCount + 1
-            v * 2) (CVal.value input)
+        AVal.map
+            (fun v ->
+                recomputeCount <- recomputeCount + 1
+                v * 2)
+            (CVal.value input)
 
     Assert.Equal(6, AVal.getValue mapped)
     Assert.Equal(1, recomputeCount)
@@ -203,7 +139,10 @@ let ``AVal mapTaskResult and bindTaskResult`` () =
 [<Fact>]
 let ``AVal mapValueTaskResult and bindValueTaskResult`` () =
     let source = CVal.create 1
-    let taskValue = AVal.mapValueTask (fun v -> ValueTask<int>(v + 2)) (CVal.value source)
+
+    let taskValue =
+        AVal.mapValueTask (fun v -> ValueTask<int>(v + 2)) (CVal.value source)
+
     let mapped = AVal.mapValueTaskResult (fun v -> v * 4) taskValue
     let bound = AVal.bindValueTaskResult (fun v -> ValueTask<int>(v + 1)) mapped
 
@@ -215,49 +154,49 @@ let ``AVal mapValueTaskResult and bindValueTaskResult`` () =
 
 [<Fact>]
 let ``ASet union matches expected output`` () =
-    let left = CSet.ofSeq [1; 2; 3]
-    let right = CSet.ofSeq [3; 4]
+    let left = CSet.ofSeq [ 1; 2; 3 ]
+    let right = CSet.ofSeq [ 3; 4 ]
 
     let unioned = ASet.union (CSet.value left) (CSet.value right)
-    let expectedInitial: Set<int> = Set.ofList [1; 2; 3; 4]
+    let expectedInitial: Set<int> = Set.ofList [ 1; 2; 3; 4 ]
     Assert.Equal<Set<int>>(expectedInitial, ASet.getValue unioned)
 
     right.Add(5)
-    let expectedAfterAdd: Set<int> = Set.ofList [1; 2; 3; 4; 5]
+    let expectedAfterAdd: Set<int> = Set.ofList [ 1; 2; 3; 4; 5 ]
     Assert.Equal<Set<int>>(expectedAfterAdd, ASet.getValue unioned)
 
 [<Fact>]
 let ``ASet map and filter`` () =
-    let source = CSet.ofSeq [1; 2; 3; 4]
+    let source = CSet.ofSeq [ 1; 2; 3; 4 ]
     let mapped = ASet.map (fun v -> v * 2) (CSet.value source)
     let filtered = ASet.filter (fun v -> v > 4) mapped
 
-    let expectedInitial: Set<int> = Set.ofList [6; 8]
+    let expectedInitial: Set<int> = Set.ofList [ 6; 8 ]
     Assert.Equal<Set<int>>(expectedInitial, ASet.getValue filtered)
 
     source.Add(5)
-    let expectedAfterAdd: Set<int> = Set.ofList [6; 8; 10]
+    let expectedAfterAdd: Set<int> = Set.ofList [ 6; 8; 10 ]
     Assert.Equal<Set<int>>(expectedAfterAdd, ASet.getValue filtered)
 
     source.Remove(4)
-    let expectedAfterRemove: Set<int> = Set.ofList [6; 10]
+    let expectedAfterRemove: Set<int> = Set.ofList [ 6; 10 ]
     Assert.Equal<Set<int>>(expectedAfterRemove, ASet.getValue filtered)
 
 [<Fact>]
 let ``AMap map and filter`` () =
-    let source = CMap.ofSeq [1, 10; 2, 20; 3, 30]
+    let source = CMap.ofSeq [ 1, 10; 2, 20; 3, 30 ]
     let mapped = AMap.map (fun _ v -> v + 1) (CMap.value source)
     let filtered = AMap.filter (fun _ v -> v > 15) mapped
 
-    let expectedInitial: Map<int, int> = Map.ofList [2, 21; 3, 31]
+    let expectedInitial: Map<int, int> = Map.ofList [ 2, 21; 3, 31 ]
     Assert.Equal<Map<int, int>>(expectedInitial, AMap.getValue filtered)
 
     source.AddOrUpdate 4 40
-    let expectedAfterAdd: Map<int, int> = Map.ofList [2, 21; 3, 31; 4, 41]
+    let expectedAfterAdd: Map<int, int> = Map.ofList [ 2, 21; 3, 31; 4, 41 ]
     Assert.Equal<Map<int, int>>(expectedAfterAdd, AMap.getValue filtered)
 
     source.Remove(3)
-    let expectedAfterRemove: Map<int, int> = Map.ofList [2, 21; 4, 41]
+    let expectedAfterRemove: Map<int, int> = Map.ofList [ 2, 21; 4, 41 ]
     Assert.Equal<Map<int, int>>(expectedAfterRemove, AMap.getValue filtered)
 
 [<Fact>]
@@ -266,8 +205,8 @@ let ``Transaction defers ChangeableValue updates`` () =
 
     Transaction.run (fun () ->
         value.Set(5)
-        Assert.Equal(1, AVal.getValue (CVal.value value))
-    ) |> ignore
+        Assert.Equal(1, AVal.getValue (CVal.value value)))
+    |> ignore
 
     Assert.Equal(5, AVal.getValue (CVal.value value))
 
@@ -277,11 +216,9 @@ let ``Transaction nesting defers updates until outer commit`` () =
 
     Transaction.run (fun () ->
         value.Set(2)
-        Transaction.run (fun () ->
-            value.Set(3)
-        ) |> ignore
-        Assert.Equal(1, AVal.getValue (CVal.value value))
-    ) |> ignore
+        Transaction.run (fun () -> value.Set(3)) |> ignore
+        Assert.Equal(1, AVal.getValue (CVal.value value)))
+    |> ignore
 
     Assert.Equal(3, AVal.getValue (CVal.value value))
 
@@ -292,38 +229,38 @@ let ``Transaction rollback on exception`` () =
     Assert.Throws<exn>(fun () ->
         Transaction.run (fun () ->
             value.Set(5)
-            failwith "boom"
-        ) |> ignore
-    ) |> ignore
+            failwith "boom")
+        |> ignore)
+    |> ignore
 
     Assert.Equal(1, AVal.getValue (CVal.value value))
 
 [<Fact>]
 let ``Transaction batches set updates`` () =
-    let setValue = CSet.ofSeq [1; 2]
+    let setValue = CSet.ofSeq [ 1; 2 ]
 
     Transaction.run (fun () ->
         setValue.Add(3)
         setValue.Remove(1)
-        let expectedDuring: Set<int> = Set.ofList [1; 2]
-        Assert.Equal<Set<int>>(expectedDuring, ASet.getValue (CSet.value setValue))
-    ) |> ignore
+        let expectedDuring: Set<int> = Set.ofList [ 1; 2 ]
+        Assert.Equal<Set<int>>(expectedDuring, ASet.getValue (CSet.value setValue)))
+    |> ignore
 
-    let expectedAfter: Set<int> = Set.ofList [2; 3]
+    let expectedAfter: Set<int> = Set.ofList [ 2; 3 ]
     Assert.Equal<Set<int>>(expectedAfter, ASet.getValue (CSet.value setValue))
 
 [<Fact>]
 let ``Transaction batches map updates`` () =
-    let mapValue = CMap.ofSeq [1, 10; 2, 20]
+    let mapValue = CMap.ofSeq [ 1, 10; 2, 20 ]
 
     Transaction.run (fun () ->
         mapValue.AddOrUpdate 3 30
         mapValue.Remove(1)
-        let expectedDuring: Map<int, int> = Map.ofList [1, 10; 2, 20]
-        Assert.Equal<Map<int, int>>(expectedDuring, AMap.getValue (CMap.value mapValue))
-    ) |> ignore
+        let expectedDuring: Map<int, int> = Map.ofList [ 1, 10; 2, 20 ]
+        Assert.Equal<Map<int, int>>(expectedDuring, AMap.getValue (CMap.value mapValue)))
+    |> ignore
 
-    let expectedAfter: Map<int, int> = Map.ofList [2, 20; 3, 30]
+    let expectedAfter: Map<int, int> = Map.ofList [ 2, 20; 3, 30 ]
     Assert.Equal<Map<int, int>>(expectedAfter, AMap.getValue (CMap.value mapValue))
 
 [<Fact>]
@@ -342,7 +279,9 @@ let ``AVal mapTask tracks latest value`` () =
 [<Fact>]
 let ``AVal mapValueTask tracks latest value`` () =
     let input = CVal.create 2
-    let mapped = AVal.mapValueTask (fun (v: int) -> ValueTask<int>(v * v)) (CVal.value input)
+
+    let mapped =
+        AVal.mapValueTask (fun (v: int) -> ValueTask<int>(v * v)) (CVal.value input)
 
     let initial = AVal.getValue mapped
     Assert.Equal(4, initial.Result)
@@ -354,30 +293,30 @@ let ``AVal mapValueTask tracks latest value`` () =
 
 [<Fact>]
 let ``ASet union updates with add/remove`` () =
-    let left = CSet.ofSeq [1; 2]
-    let right = CSet.ofSeq [2; 3]
+    let left = CSet.ofSeq [ 1; 2 ]
+    let right = CSet.ofSeq [ 2; 3 ]
 
     let unioned = ASet.union (CSet.value left) (CSet.value right)
-    let expectedInitial: Set<int> = Set.ofList [1; 2; 3]
+    let expectedInitial: Set<int> = Set.ofList [ 1; 2; 3 ]
     Assert.Equal<Set<int>>(expectedInitial, ASet.getValue unioned)
 
     left.Remove(2)
     right.Add(4)
-    let expectedAfterFirst: Set<int> = Set.ofList [1; 2; 3; 4]
+    let expectedAfterFirst: Set<int> = Set.ofList [ 1; 2; 3; 4 ]
     Assert.Equal<Set<int>>(expectedAfterFirst, ASet.getValue unioned)
 
     right.Remove(2)
     left.Add(5)
-    let expectedAfterSecond: Set<int> = Set.ofList [1; 3; 4; 5]
+    let expectedAfterSecond: Set<int> = Set.ofList [ 1; 3; 4; 5 ]
     Assert.Equal<Set<int>>(expectedAfterSecond, ASet.getValue unioned)
 
 [<Fact>]
 let ``AMap map and filter respond to updates`` () =
-    let source = CMap.ofSeq [1, 10; 2, 20]
+    let source = CMap.ofSeq [ 1, 10; 2, 20 ]
     let mapped = AMap.map (fun _ v -> v + 5) (CMap.value source)
     let filtered = AMap.filter (fun _ v -> v > 20) mapped
 
-    let expectedInitial: Map<int, int> = Map.ofList [2, 25]
+    let expectedInitial: Map<int, int> = Map.ofList [ 2, 25 ]
     Assert.Equal<Map<int, int>>(expectedInitial, AMap.getValue filtered)
 
     source.AddOrUpdate 2 12
@@ -385,7 +324,7 @@ let ``AMap map and filter respond to updates`` () =
     Assert.Equal<Map<int, int>>(expectedAfterUpdate, AMap.getValue filtered)
 
     source.AddOrUpdate 1 30
-    let expectedAfterSecond: Map<int, int> = Map.ofList [1, 35]
+    let expectedAfterSecond: Map<int, int> = Map.ofList [ 1, 35 ]
     Assert.Equal<Map<int, int>>(expectedAfterSecond, AMap.getValue filtered)
 
 [<Fact>]
@@ -395,8 +334,8 @@ let ``Transaction applies last value update`` () =
     Transaction.run (fun () ->
         value.Set(2)
         value.Set(5)
-        Assert.Equal(1, AVal.getValue (CVal.value value))
-    ) |> ignore
+        Assert.Equal(1, AVal.getValue (CVal.value value)))
+    |> ignore
 
     Assert.Equal(5, AVal.getValue (CVal.value value))
 
@@ -424,72 +363,72 @@ let ``AVal getValueValueTask reflects updates`` () =
 
 [<Fact>]
 let ``ASet map responds to CSet.set`` () =
-    let source = CSet.ofSeq [1; 2]
+    let source = CSet.ofSeq [ 1; 2 ]
     let mapped = ASet.map (fun v -> v + 1) (CSet.value source)
 
-    let expectedInitial: Set<int> = Set.ofList [2; 3]
+    let expectedInitial: Set<int> = Set.ofList [ 2; 3 ]
     Assert.Equal<Set<int>>(expectedInitial, ASet.getValue mapped)
 
-    CSet.set (Set.ofList [3; 4]) source
-    let expectedAfter: Set<int> = Set.ofList [4; 5]
+    CSet.set (Set.ofList [ 3; 4 ]) source
+    let expectedAfter: Set<int> = Set.ofList [ 4; 5 ]
     Assert.Equal<Set<int>>(expectedAfter, ASet.getValue mapped)
 
 [<Fact>]
 let ``AMap map responds to CMap.set`` () =
-    let source = CMap.ofSeq [1, 10; 2, 20]
+    let source = CMap.ofSeq [ 1, 10; 2, 20 ]
     let mapped = AMap.map (fun key value -> value + key) (CMap.value source)
 
-    let expectedInitial: Map<int, int> = Map.ofList [1, 11; 2, 22]
+    let expectedInitial: Map<int, int> = Map.ofList [ 1, 11; 2, 22 ]
     Assert.Equal<Map<int, int>>(expectedInitial, AMap.getValue mapped)
 
-    CMap.set (Map.ofList [2, 5; 3, 7]) source
-    let expectedAfter: Map<int, int> = Map.ofList [2, 7; 3, 10]
+    CMap.set (Map.ofList [ 2, 5; 3, 7 ]) source
+    let expectedAfter: Map<int, int> = Map.ofList [ 2, 7; 3, 10 ]
     Assert.Equal<Map<int, int>>(expectedAfter, AMap.getValue mapped)
 
 [<Fact>]
 let ``Transaction defers CSet.set in unions`` () =
-    let left = CSet.ofSeq [1; 2]
-    let right = CSet.ofSeq [2; 3]
+    let left = CSet.ofSeq [ 1; 2 ]
+    let right = CSet.ofSeq [ 2; 3 ]
     let unioned = ASet.union (CSet.value left) (CSet.value right)
 
     Transaction.run (fun () ->
-        CSet.set (Set.ofList [5]) left
-        CSet.set (Set.ofList [6]) right
-        let expectedDuring: Set<int> = Set.ofList [1; 2; 3]
-        Assert.Equal<Set<int>>(expectedDuring, ASet.getValue unioned)
-    ) |> ignore
+        CSet.set (Set.ofList [ 5 ]) left
+        CSet.set (Set.ofList [ 6 ]) right
+        let expectedDuring: Set<int> = Set.ofList [ 1; 2; 3 ]
+        Assert.Equal<Set<int>>(expectedDuring, ASet.getValue unioned))
+    |> ignore
 
-    let expectedAfter: Set<int> = Set.ofList [5; 6]
+    let expectedAfter: Set<int> = Set.ofList [ 5; 6 ]
     Assert.Equal<Set<int>>(expectedAfter, ASet.getValue unioned)
 
 [<Fact>]
 let ``ASet union preserves duplicates until fully removed`` () =
-    let left = CSet.ofSeq [1; 2]
-    let right = CSet.ofSeq [2; 3]
+    let left = CSet.ofSeq [ 1; 2 ]
+    let right = CSet.ofSeq [ 2; 3 ]
     let unioned = ASet.union (CSet.value left) (CSet.value right)
 
-    let expectedInitial: Set<int> = Set.ofList [1; 2; 3]
+    let expectedInitial: Set<int> = Set.ofList [ 1; 2; 3 ]
     Assert.Equal<Set<int>>(expectedInitial, ASet.getValue unioned)
 
     left.Remove(2)
-    let expectedAfterLeft: Set<int> = Set.ofList [1; 2; 3]
+    let expectedAfterLeft: Set<int> = Set.ofList [ 1; 2; 3 ]
     Assert.Equal<Set<int>>(expectedAfterLeft, ASet.getValue unioned)
 
     right.Remove(2)
-    let expectedAfterRight: Set<int> = Set.ofList [1; 3]
+    let expectedAfterRight: Set<int> = Set.ofList [ 1; 3 ]
     Assert.Equal<Set<int>>(expectedAfterRight, ASet.getValue unioned)
 
 [<Fact>]
 let ``AMap filter ignores non-matching updates`` () =
-    let source = CMap.ofSeq [1, 5; 2, 20]
+    let source = CMap.ofSeq [ 1, 5; 2, 20 ]
     let filtered = AMap.filter (fun _ value -> value > 10) (CMap.value source)
 
-    let expectedInitial: Map<int, int> = Map.ofList [2, 20]
+    let expectedInitial: Map<int, int> = Map.ofList [ 2, 20 ]
     Assert.Equal<Map<int, int>>(expectedInitial, AMap.getValue filtered)
 
     source.AddOrUpdate 1 8
     source.AddOrUpdate 3 9
-    let expectedAfter: Map<int, int> = Map.ofList [2, 20]
+    let expectedAfter: Map<int, int> = Map.ofList [ 2, 20 ]
     Assert.Equal<Map<int, int>>(expectedAfter, AMap.getValue filtered)
 
 [<Fact>]
@@ -501,8 +440,8 @@ let ``Transaction defers updates across multiple values`` () =
         first.Set(2)
         second.Set(20)
         Assert.Equal(1, AVal.getValue (CVal.value first))
-        Assert.Equal(10, AVal.getValue (CVal.value second))
-    ) |> ignore
+        Assert.Equal(10, AVal.getValue (CVal.value second)))
+    |> ignore
 
     Assert.Equal(2, AVal.getValue (CVal.value first))
     Assert.Equal(20, AVal.getValue (CVal.value second))
@@ -519,6 +458,7 @@ let ``AVal map stays stable on idempotent updates`` () =
 [<Fact>]
 let ``AVal chained maps reflect updates`` () =
     let source = CVal.create 2
+
     let mapped =
         source
         |> CVal.value
@@ -531,54 +471,54 @@ let ``AVal chained maps reflect updates`` () =
 
 [<Fact>]
 let ``ASet union with empty set behaves`` () =
-    let left = CSet.ofSeq [1; 2]
+    let left = CSet.ofSeq [ 1; 2 ]
     let right = CSet.ofSeq []
     let unioned = ASet.union (CSet.value left) (CSet.value right)
 
-    let expectedInitial: Set<int> = Set.ofList [1; 2]
+    let expectedInitial: Set<int> = Set.ofList [ 1; 2 ]
     Assert.Equal<Set<int>>(expectedInitial, ASet.getValue unioned)
 
     right.Add(3)
-    let expectedAfterAdd: Set<int> = Set.ofList [1; 2; 3]
+    let expectedAfterAdd: Set<int> = Set.ofList [ 1; 2; 3 ]
     Assert.Equal<Set<int>>(expectedAfterAdd, ASet.getValue unioned)
 
     left.Remove(1)
-    let expectedAfterRemove: Set<int> = Set.ofList [2; 3]
+    let expectedAfterRemove: Set<int> = Set.ofList [ 2; 3 ]
     Assert.Equal<Set<int>>(expectedAfterRemove, ASet.getValue unioned)
 
 [<Fact>]
 let ``AMap filter updates on removals`` () =
-    let source = CMap.ofSeq [1, 10; 2, 20; 3, 30]
+    let source = CMap.ofSeq [ 1, 10; 2, 20; 3, 30 ]
     let filtered = AMap.filter (fun _ value -> value >= 20) (CMap.value source)
 
-    let expectedInitial: Map<int, int> = Map.ofList [2, 20; 3, 30]
+    let expectedInitial: Map<int, int> = Map.ofList [ 2, 20; 3, 30 ]
     Assert.Equal<Map<int, int>>(expectedInitial, AMap.getValue filtered)
 
     source.Remove(3)
-    let expectedAfterRemove: Map<int, int> = Map.ofList [2, 20]
+    let expectedAfterRemove: Map<int, int> = Map.ofList [ 2, 20 ]
     Assert.Equal<Map<int, int>>(expectedAfterRemove, AMap.getValue filtered)
 
     source.AddOrUpdate 1 25
-    let expectedAfterUpdate: Map<int, int> = Map.ofList [1, 25; 2, 20]
+    let expectedAfterUpdate: Map<int, int> = Map.ofList [ 1, 25; 2, 20 ]
     Assert.Equal<Map<int, int>>(expectedAfterUpdate, AMap.getValue filtered)
 
 [<Fact>]
 let ``Transaction defers set and map together`` () =
-    let setValue = CSet.ofSeq [1]
-    let mapValue = CMap.ofSeq [1, 1]
+    let setValue = CSet.ofSeq [ 1 ]
+    let mapValue = CMap.ofSeq [ 1, 1 ]
 
     Transaction.run (fun () ->
         setValue.Add(2)
         mapValue.AddOrUpdate 2 2
 
-        let expectedSet: Set<int> = Set.ofList [1]
-        let expectedMap: Map<int, int> = Map.ofList [1, 1]
+        let expectedSet: Set<int> = Set.ofList [ 1 ]
+        let expectedMap: Map<int, int> = Map.ofList [ 1, 1 ]
         Assert.Equal<Set<int>>(expectedSet, ASet.getValue (CSet.value setValue))
-        Assert.Equal<Map<int, int>>(expectedMap, AMap.getValue (CMap.value mapValue))
-    ) |> ignore
+        Assert.Equal<Map<int, int>>(expectedMap, AMap.getValue (CMap.value mapValue)))
+    |> ignore
 
-    let expectedSetAfter: Set<int> = Set.ofList [1; 2]
-    let expectedMapAfter: Map<int, int> = Map.ofList [1, 1; 2, 2]
+    let expectedSetAfter: Set<int> = Set.ofList [ 1; 2 ]
+    let expectedMapAfter: Map<int, int> = Map.ofList [ 1, 1; 2, 2 ]
     Assert.Equal<Map<int, int>>(expectedMapAfter, AMap.getValue (CMap.value mapValue))
 
 [<Fact>]
@@ -602,40 +542,40 @@ let ``AVal getValueTask and getValueValueTask match`` () =
 
 [<Fact>]
 let ``ASet map responds to multiple updates`` () =
-    let source = CSet.ofSeq [1; 3]
+    let source = CSet.ofSeq [ 1; 3 ]
     let mapped = ASet.map (fun v -> v * 10) (CSet.value source)
 
-    let expectedInitial: Set<int> = Set.ofList [10; 30]
+    let expectedInitial: Set<int> = Set.ofList [ 10; 30 ]
     Assert.Equal<Set<int>>(expectedInitial, ASet.getValue mapped)
 
     source.Add(2)
     source.Remove(1)
-    let expectedAfter: Set<int> = Set.ofList [20; 30]
+    let expectedAfter: Set<int> = Set.ofList [ 20; 30 ]
     Assert.Equal<Set<int>>(expectedAfter, ASet.getValue mapped)
 
 [<Fact>]
 let ``AMap filter removes when threshold increases`` () =
-    let source = CMap.ofSeq [1, 5; 2, 15; 3, 25]
+    let source = CMap.ofSeq [ 1, 5; 2, 15; 3, 25 ]
     let filtered = AMap.filter (fun _ value -> value >= 10) (CMap.value source)
 
-    let expectedInitial: Map<int, int> = Map.ofList [2, 15; 3, 25]
+    let expectedInitial: Map<int, int> = Map.ofList [ 2, 15; 3, 25 ]
     Assert.Equal<Map<int, int>>(expectedInitial, AMap.getValue filtered)
 
     source.AddOrUpdate 2 8
-    let expectedAfter: Map<int, int> = Map.ofList [3, 25]
+    let expectedAfter: Map<int, int> = Map.ofList [ 3, 25 ]
     Assert.Equal<Map<int, int>>(expectedAfter, AMap.getValue filtered)
 
 [<Fact>]
 let ``Transaction defers map set updates`` () =
-    let mapValue = CMap.ofSeq [1, 1; 2, 2]
+    let mapValue = CMap.ofSeq [ 1, 1; 2, 2 ]
 
     Transaction.run (fun () ->
-        CMap.set (Map.ofList [3, 3]) mapValue
-        let expectedDuring: Map<int, int> = Map.ofList [1, 1; 2, 2]
-        Assert.Equal<Map<int, int>>(expectedDuring, AMap.getValue (CMap.value mapValue))
-    ) |> ignore
+        CMap.set (Map.ofList [ 3, 3 ]) mapValue
+        let expectedDuring: Map<int, int> = Map.ofList [ 1, 1; 2, 2 ]
+        Assert.Equal<Map<int, int>>(expectedDuring, AMap.getValue (CMap.value mapValue)))
+    |> ignore
 
-    let expectedAfter: Map<int, int> = Map.ofList [3, 3]
+    let expectedAfter: Map<int, int> = Map.ofList [ 3, 3 ]
     Assert.Equal<Map<int, int>>(expectedAfter, AMap.getValue (CMap.value mapValue))
 
 [<FsCheck.Xunit.Property(MaxTest = 200)>]
@@ -647,343 +587,22 @@ let ``Deep dependency trees propagate updates`` (depth: FsCheck.PositiveInt) (up
     let leaves = collectLeaves tree
 
     let sumLeaves () =
-        leaves
-        |> List.sumBy (fun leaf -> AVal.getValue (leaf :> IAdaptiveValue<int>))
+        leaves |> List.sumBy (fun leaf -> AVal.getValue (leaf :> IAdaptiveValue<int>))
 
     let mutable ok = AVal.getValue root = sumLeaves ()
+
     if ok then
         let mutable idx = 0
+
         for value in values do
             let leaf = leaves[idx % leaves.Length]
             leaf.Set(value)
             idx <- idx + 1
+
             if AVal.getValue root <> sumLeaves () then
                 ok <- false
+
     ok
-
-// =============================================================================
-// Concurrency Hazard Tests
-// =============================================================================
-
-/// Test 1: Reentrancy test for nested dependency collection
-/// Build a graph where AVal.map of one node reads another node that itself
-/// triggers dependency collection; run in parallel with updates.
-/// This exposes issues where the thread-static collector can be swapped
-/// during nested recompute calls.
-[<Fact>]
-let ``Nested dependency collection handles reentrancy under concurrency`` () =
-    // Create a chain: leaf -> middle -> outer
-    // where middle's compute reads leaf, and outer's compute reads both middle AND leaf
-    // This creates nested GetValue calls during a single Recompute
-    let leaf = CVal.create 1
-    
-    // Middle node reads leaf
-    let middle = AVal.map (fun v -> v * 2) (CVal.value leaf)
-    
-    // Outer node reads BOTH middle (which triggers leaf read) AND leaf directly
-    // This creates nested dependency collection: outer.GetValue -> middle.GetValue -> leaf.GetValue
-    let outer = AVal.map2 (fun m l -> m + l) middle (CVal.value leaf)
-    
-    // Add another layer to stress reentrancy further
-    let deep = 
-        AVal.bind (fun o -> 
-            // During this bind's compute, we read leaf again
-            AVal.map (fun l -> o + l) (CVal.value leaf)) outer
-    
-    let errors = ConcurrentQueue<exn>()
-    let stabilized = ConcurrentQueue<int>()
-    let iterations = 3000
-    
-    let readerTask = Task.Run(fun () ->
-        try
-            for _ in 1..iterations do
-                let v = AVal.getValue deep
-                stabilized.Enqueue(v)
-        with ex ->
-            errors.Enqueue(ex))
-    
-    let writerTask = Task.Run(fun () ->
-        try
-            for i in 1..iterations do
-                leaf.Set(i)
-        with ex ->
-            errors.Enqueue(ex))
-    
-    Task.WaitAll([| readerTask; writerTask |])
-    
-    Assert.True(errors.IsEmpty, $"Errors during nested collection: {errors.Count}")
-    
-    // Verify final value is consistent
-    let finalLeaf = AVal.getValue (CVal.value leaf)
-    let expectedFinal = (finalLeaf * 2) + finalLeaf + finalLeaf // middle + leaf + leaf
-    let actualFinal = AVal.getValue deep
-    Assert.Equal(expectedFinal, actualFinal)
-
-/// Test 2: Cross-thread transaction test
-/// Start Transaction.run on one thread, mutate in another thread.
-/// This exposes the thread-local nature of transactions - updates on other
-/// threads bypass the transaction and apply immediately.
-[<Fact>]
-let ``Cross-thread updates bypass thread-local transaction`` () =
-    let value1 = CVal.create 0
-    let value2 = CVal.create 0
-    let observedDuringTransaction = ConcurrentQueue<int * int>()
-    let transactionStarted = new ManualResetEventSlim(false)
-    let updateDone = new ManualResetEventSlim(false)
-    
-    // Thread 1: Start a transaction and wait for thread 2 to mutate
-    let txThread = Task.Run(fun () ->
-        Transaction.run (fun () ->
-            value1.Set(100) // This should be deferred
-            transactionStarted.Set()
-            
-            // Wait for the other thread to mutate value2
-            updateDone.Wait()
-            
-            // Read both values INSIDE the transaction
-            let v1 = AVal.getValue (CVal.value value1)
-            let v2 = AVal.getValue (CVal.value value2)
-            observedDuringTransaction.Enqueue((v1, v2))
-        ))
-    
-    // Thread 2: Wait for transaction to start, then mutate
-    let updateThread = Task.Run(fun () ->
-        transactionStarted.Wait()
-        // This update happens outside the transaction context (different thread)
-        // so it should apply IMMEDIATELY, not be deferred
-        value2.Set(200)
-        updateDone.Set())
-    
-    Task.WaitAll([| txThread; updateThread |])
-    
-    // The key observation: value1.Set(100) should be deferred (seen as 0 inside tx)
-    // but value2.Set(200) from another thread should apply immediately (seen as 200)
-    let observed = observedDuringTransaction.ToArray()
-    Assert.Single(observed) |> ignore
-    let (v1Observed, v2Observed) = observed[0]
-    
-    // value1 should still be 0 inside the transaction (deferred)
-    Assert.Equal(0, v1Observed)
-    // value2 should be 200 because the cross-thread update bypassed the transaction
-    Assert.Equal(200, v2Observed)
-    
-    // After transaction commits, value1 should be 100
-    Assert.Equal(100, AVal.getValue (CVal.value value1))
-    Assert.Equal(200, AVal.getValue (CVal.value value2))
-
-/// Test 3: Concurrent ChangeableSet read/write stress test
-/// Spin multiple reader threads calling AVal.getValue while a writer thread
-/// mutates rapidly. Assert no exceptions and final state consistency.
-[<Fact>]
-let ``ChangeableSet concurrent rapid read/write stress test`` () =
-    let changeable = CSet.ofSeq [0]
-    let adaptive = CSet.value changeable
-    let mapped = ASet.map (fun v -> v * 2) adaptive
-    let filtered = ASet.filter (fun v -> v % 4 = 0) mapped
-    
-    let errors = ConcurrentQueue<exn>()
-    let readerSnapshots = ConcurrentQueue<Set<int>>()
-    let writerIterations = 5000
-    let readerCount = 4
-    
-    // Writer thread: rapidly add and remove items
-    let writerTask = Task.Run(fun () ->
-        try
-            for i in 1..writerIterations do
-                changeable.Add(i)
-                if i > 10 then
-                    changeable.Remove(i - 10)
-        with ex ->
-            errors.Enqueue(ex))
-    
-    // Multiple reader threads: constantly read the filtered set
-    let readerTasks = Array.init readerCount (fun _ ->
-        Task.Run(fun () ->
-            try
-                for _ in 1..(writerIterations / 2) do
-                    let snapshot = ASet.getValue filtered
-                    readerSnapshots.Enqueue(snapshot)
-            with ex ->
-                errors.Enqueue(ex)))
-    
-    Task.WaitAll(Array.append [| writerTask |] readerTasks)
-    
-    Assert.True(errors.IsEmpty, $"Errors during concurrent Set access: {errors.Count}")
-    
-    // Verify final state is consistent
-    let finalSet = ASet.getValue adaptive
-    let finalFiltered = ASet.getValue filtered
-    let expectedFiltered = finalSet |> Set.map (fun v -> v * 2) |> Set.filter (fun v -> v % 4 = 0)
-    Assert.Equal<Set<int>>(expectedFiltered, finalFiltered)
-
-/// Test 3b: Concurrent ChangeableMap read/write stress test
-[<Fact>]
-let ``ChangeableMap concurrent rapid read/write stress test`` () =
-    let changeable = CMap.ofSeq [0, 0]
-    let adaptive = CMap.value changeable
-    let mapped = AMap.map (fun k v -> v + k) adaptive
-    let filtered = AMap.filter (fun _ v -> v > 5) mapped
-    
-    let errors = ConcurrentQueue<exn>()
-    let readerSnapshots = ConcurrentQueue<Map<int, int>>()
-    let writerIterations = 5000
-    let readerCount = 4
-    
-    // Writer thread: rapidly add and remove items
-    let writerTask = Task.Run(fun () ->
-        try
-            for i in 1..writerIterations do
-                changeable.AddOrUpdate i (i * 2)
-                if i > 10 then
-                    changeable.Remove(i - 10)
-        with ex ->
-            errors.Enqueue(ex))
-    
-    // Multiple reader threads: constantly read the filtered map
-    let readerTasks = Array.init readerCount (fun _ ->
-        Task.Run(fun () ->
-            try
-                for _ in 1..(writerIterations / 2) do
-                    let snapshot = AMap.getValue filtered
-                    readerSnapshots.Enqueue(snapshot)
-            with ex ->
-                errors.Enqueue(ex)))
-    
-    Task.WaitAll(Array.append [| writerTask |] readerTasks)
-    
-    Assert.True(errors.IsEmpty, $"Errors during concurrent Map access: {errors.Count}")
-    
-    // Verify final state is consistent
-    let finalMap = AMap.getValue adaptive
-    let finalFiltered = AMap.getValue filtered
-    let expectedFiltered = finalMap |> Map.map (fun k v -> v + k) |> Map.filter (fun _ v -> v > 5)
-    Assert.Equal<Map<int, int>>(expectedFiltered, finalFiltered)
-
-/// Test 4: Timer race regression test - version monotonicity
-/// Use two timers with different periods; track render output version
-/// and ensure it never regresses. This detects inconsistent snapshots.
-[<Fact>]
-let ``Timer race does not cause version regression`` () =
-    let tickValue = CVal.create 0
-    let statusValue = CVal.create "init"
-    
-    // Composite view that reads both values
-    let compositeView = 
-        AVal.map2 (fun tick status -> $"{status}:{tick}") (CVal.value tickValue) (CVal.value statusValue)
-    
-    let errors = ConcurrentQueue<string>()
-    let versionHistory = ConcurrentQueue<int64>()
-    let stopSignal = new CancellationTokenSource()
-    let testDuration = TimeSpan.FromMilliseconds(500)
-    
-    // Fast tick timer (every 5ms)
-    let tickTimer = Task.Run(fun () ->
-        let mutable counter = 0
-        while not stopSignal.Token.IsCancellationRequested do
-            counter <- counter + 1
-            tickValue.Set(counter)
-            Thread.Sleep(5))
-    
-    // Slow status timer (every 17ms - prime to avoid sync)
-    let statusTimer = Task.Run(fun () ->
-        let statuses = [| "running"; "idle"; "busy"; "waiting" |]
-        let mutable idx = 0
-        while not stopSignal.Token.IsCancellationRequested do
-            idx <- (idx + 1) % statuses.Length
-            statusValue.Set(statuses[idx])
-            Thread.Sleep(17))
-    
-    // Render loop (every 33ms - ~30fps)
-    let renderTask = Task.Run(fun () ->
-        let mutable lastVersion = -1L
-        while not stopSignal.Token.IsCancellationRequested do
-            let currentVersion = (compositeView :> IAdaptiveObject).Version
-            versionHistory.Enqueue(currentVersion)
-            
-            // Check for version regression
-            if currentVersion < lastVersion then
-                errors.Enqueue($"Version regressed from {lastVersion} to {currentVersion}")
-            lastVersion <- currentVersion
-            
-            // Also read the value to trigger recompute
-            let _ = AVal.getValue compositeView
-            Thread.Sleep(33))
-    
-    // Let it run
-    Thread.Sleep(int testDuration.TotalMilliseconds)
-    stopSignal.Cancel()
-    
-    try
-        Task.WaitAll([| tickTimer; statusTimer; renderTask |], TimeSpan.FromSeconds(2)) |> ignore
-    with
-    | :? AggregateException -> () // Expected due to cancellation
-    
-    let errorMsg = String.Join("; ", errors)
-    Assert.True(errors.IsEmpty, $"Version regressions detected: {errorMsg}")
-    
-    // Verify we actually ran multiple iterations
-    Assert.True(versionHistory.Count > 5, $"Too few render iterations: {versionHistory.Count}")
-    
-    // Verify versions are monotonically non-decreasing
-    let versions = versionHistory.ToArray()
-    let regressions = 
-        versions 
-        |> Array.pairwise 
-        |> Array.filter (fun (prev, curr) -> curr < prev)
-    Assert.True(regressions.Length = 0, $"Found {regressions.Length} version regressions")
-
-/// Test 4b: Deep nested graph with concurrent updates and reads
-/// Tests version consistency across a complex dependency graph
-[<Fact>]
-let ``Deep graph maintains version consistency under concurrent updates`` () =
-    // Create a 3-level deep graph
-    let sources = Array.init 4 (fun i -> CVal.create i)
-    
-    // Level 1: Combine pairs
-    let level1 = [|
-        AVal.map2 (+) (CVal.value sources[0]) (CVal.value sources[1])
-        AVal.map2 (+) (CVal.value sources[2]) (CVal.value sources[3])
-    |]
-    
-    // Level 2: Combine level 1
-    let level2 = AVal.map2 (+) level1[0] level1[1]
-    
-    // Level 3: Map the result
-    let root = AVal.map (fun v -> v * 2) level2
-    
-    let errors = ConcurrentQueue<string>()
-    let readValues = ConcurrentQueue<int>()
-    let iterations = 3000
-    
-    // Writer tasks: update sources concurrently
-    let writerTasks = sources |> Array.mapi (fun idx source ->
-        Task.Run(fun () ->
-            try
-                for i in 1..iterations do
-                    source.Set(i + idx * 1000)
-            with ex ->
-                errors.Enqueue($"Writer {idx} error: {ex.Message}")))
-    
-    // Reader task: continuously read the root
-    let readerTask = Task.Run(fun () ->
-        try
-            for _ in 1..(iterations * 2) do
-                let v = AVal.getValue root
-                readValues.Enqueue(v)
-        with ex ->
-            errors.Enqueue($"Reader error: {ex.Message}"))
-    
-    Task.WaitAll(Array.append writerTasks [| readerTask |])
-    
-    let errorMsg = String.Join("; ", errors)
-    Assert.True(errors.IsEmpty, $"Errors: {errorMsg}")
-    
-    // Verify final consistency
-    let finalSources = sources |> Array.map (fun s -> AVal.getValue (CVal.value s))
-    let expectedFinal = (finalSources |> Array.sum) * 2
-    let actualFinal = AVal.getValue root
-    Assert.Equal(expectedFinal, actualFinal)
-
 // =============================================================================
 // N-ary Node Tests (map3, map4, mapN, reduce, sum)
 // =============================================================================
@@ -993,16 +612,18 @@ let ``AVal map3 combines three values correctly`` () =
     let a = CVal.create 1
     let b = CVal.create 2
     let c = CVal.create 3
-    let combined = AVal.map3 (fun x y z -> x + y + z) (CVal.value a) (CVal.value b) (CVal.value c)
-    
+
+    let combined =
+        AVal.map3 (fun x y z -> x + y + z) (CVal.value a) (CVal.value b) (CVal.value c)
+
     Assert.Equal(6, AVal.getValue combined)
-    
+
     a.Set(10)
     Assert.Equal(15, AVal.getValue combined)
-    
+
     b.Set(20)
     Assert.Equal(33, AVal.getValue combined)
-    
+
     c.Set(30)
     Assert.Equal(60, AVal.getValue combined)
 
@@ -1012,20 +633,23 @@ let ``AVal map3 avoids recompute when unchanged`` () =
     let b = CVal.create 2
     let c = CVal.create 3
     let mutable computeCount = 0
-    let combined = 
-        AVal.map3 
-            (fun x y z -> 
+
+    let combined =
+        AVal.map3
+            (fun x y z ->
                 computeCount <- computeCount + 1
-                x * y * z) 
-            (CVal.value a) (CVal.value b) (CVal.value c)
-    
+                x * y * z)
+            (CVal.value a)
+            (CVal.value b)
+            (CVal.value c)
+
     Assert.Equal(6, AVal.getValue combined)
     Assert.Equal(1, computeCount)
-    
+
     // Reading again should not recompute
     Assert.Equal(6, AVal.getValue combined)
     Assert.Equal(1, computeCount)
-    
+
     // Changing a value should recompute
     a.Set(2)
     Assert.Equal(12, AVal.getValue combined)
@@ -1037,13 +661,15 @@ let ``AVal map4 combines four values correctly`` () =
     let b = CVal.create 2
     let c = CVal.create 3
     let d = CVal.create 4
-    let combined = AVal.map4 (fun w x y z -> w + x + y + z) (CVal.value a) (CVal.value b) (CVal.value c) (CVal.value d)
-    
+
+    let combined =
+        AVal.map4 (fun w x y z -> w + x + y + z) (CVal.value a) (CVal.value b) (CVal.value c) (CVal.value d)
+
     Assert.Equal(10, AVal.getValue combined)
-    
+
     a.Set(10)
     Assert.Equal(19, AVal.getValue combined)
-    
+
     d.Set(40)
     Assert.Equal(55, AVal.getValue combined)
 
@@ -1054,20 +680,24 @@ let ``AVal map4 avoids recompute when unchanged`` () =
     let c = CVal.create 3
     let d = CVal.create 4
     let mutable computeCount = 0
-    let combined = 
-        AVal.map4 
-            (fun w x y z -> 
+
+    let combined =
+        AVal.map4
+            (fun w x y z ->
                 computeCount <- computeCount + 1
-                w * x * y * z) 
-            (CVal.value a) (CVal.value b) (CVal.value c) (CVal.value d)
-    
+                w * x * y * z)
+            (CVal.value a)
+            (CVal.value b)
+            (CVal.value c)
+            (CVal.value d)
+
     Assert.Equal(24, AVal.getValue combined)
     Assert.Equal(1, computeCount)
-    
+
     // Reading again should not recompute
     Assert.Equal(24, AVal.getValue combined)
     Assert.Equal(1, computeCount)
-    
+
     // Changing a value should recompute
     b.Set(3)
     Assert.Equal(36, AVal.getValue combined)
@@ -1075,15 +705,17 @@ let ``AVal map4 avoids recompute when unchanged`` () =
 
 [<Fact>]
 let ``AVal mapN combines array of values correctly`` () =
-    let sources = [| CVal.create 1; CVal.create 2; CVal.create 3; CVal.create 4; CVal.create 5 |]
+    let sources =
+        [| CVal.create 1; CVal.create 2; CVal.create 3; CVal.create 4; CVal.create 5 |]
+
     let deps = sources |> Array.map CVal.value
     let combined = AVal.mapN (fun arr -> arr |> Array.sum) deps
-    
+
     Assert.Equal(15, AVal.getValue combined)
-    
+
     sources.[0].Set(10)
     Assert.Equal(24, AVal.getValue combined)
-    
+
     sources.[4].Set(50)
     Assert.Equal(69, AVal.getValue combined)
 
@@ -1092,20 +724,21 @@ let ``AVal mapN avoids recompute when unchanged`` () =
     let sources = [| CVal.create 1; CVal.create 2; CVal.create 3 |]
     let deps = sources |> Array.map CVal.value
     let mutable computeCount = 0
-    let combined = 
-        AVal.mapN 
-            (fun arr -> 
+
+    let combined =
+        AVal.mapN
+            (fun arr ->
                 computeCount <- computeCount + 1
-                arr |> Array.fold (*) 1) 
+                arr |> Array.fold (*) 1)
             deps
-    
+
     Assert.Equal(6, AVal.getValue combined)
     Assert.Equal(1, computeCount)
-    
+
     // Reading again should not recompute
     Assert.Equal(6, AVal.getValue combined)
     Assert.Equal(1, computeCount)
-    
+
     // Changing a value should recompute
     sources.[1].Set(5)
     Assert.Equal(15, AVal.getValue combined)
@@ -1115,7 +748,7 @@ let ``AVal mapN avoids recompute when unchanged`` () =
 let ``AVal mapN handles empty array`` () =
     let deps: IAdaptiveValue<int>[] = [||]
     let combined = AVal.mapN (fun arr -> arr.Length) deps
-    
+
     Assert.Equal(0, AVal.getValue combined)
 
 [<Fact>]
@@ -1123,9 +756,9 @@ let ``AVal mapN handles single element`` () =
     let source = CVal.create 42
     let deps = [| CVal.value source |]
     let combined = AVal.mapN (fun arr -> arr.[0] * 2) deps
-    
+
     Assert.Equal(84, AVal.getValue combined)
-    
+
     source.Set(10)
     Assert.Equal(20, AVal.getValue combined)
 
@@ -1134,12 +767,12 @@ let ``AVal reduce combines values with binary operation`` () =
     let sources = [| CVal.create 1; CVal.create 2; CVal.create 3; CVal.create 4 |]
     let deps = sources |> Array.map CVal.value
     let reduced = AVal.reduce 0 (+) deps
-    
+
     Assert.Equal(10, AVal.getValue reduced)
-    
+
     sources.[0].Set(10)
     Assert.Equal(19, AVal.getValue reduced)
-    
+
     sources.[3].Set(40)
     Assert.Equal(55, AVal.getValue reduced)
 
@@ -1147,7 +780,7 @@ let ``AVal reduce combines values with binary operation`` () =
 let ``AVal reduce handles empty array with init value`` () =
     let deps: IAdaptiveValue<int>[] = [||]
     let reduced = AVal.reduce 42 (+) deps
-    
+
     Assert.Equal(42, AVal.getValue reduced)
 
 [<Fact>]
@@ -1155,9 +788,9 @@ let ``AVal reduce handles single element`` () =
     let source = CVal.create 10
     let deps = [| CVal.value source |]
     let reduced = AVal.reduce 5 (+) deps
-    
+
     Assert.Equal(15, AVal.getValue reduced)
-    
+
     source.Set(20)
     Assert.Equal(25, AVal.getValue reduced)
 
@@ -1166,9 +799,9 @@ let ``AVal reduce works with multiplication`` () =
     let sources = [| CVal.create 2; CVal.create 3; CVal.create 4 |]
     let deps = sources |> Array.map CVal.value
     let reduced = AVal.reduce 1 (*) deps
-    
+
     Assert.Equal(24, AVal.getValue reduced)
-    
+
     sources.[1].Set(5)
     Assert.Equal(40, AVal.getValue reduced)
 
@@ -1177,12 +810,12 @@ let ``AVal sum sums integer values`` () =
     let sources = [| CVal.create 10; CVal.create 20; CVal.create 30 |]
     let deps = sources |> Array.map CVal.value
     let summed = AVal.sum deps
-    
+
     Assert.Equal(60, AVal.getValue summed)
-    
+
     sources.[0].Set(100)
     Assert.Equal(150, AVal.getValue summed)
-    
+
     sources.[2].Set(300)
     Assert.Equal(420, AVal.getValue summed)
 
@@ -1190,7 +823,7 @@ let ``AVal sum sums integer values`` () =
 let ``AVal sum handles empty array`` () =
     let deps: IAdaptiveValue<int>[] = [||]
     let summed = AVal.sum deps
-    
+
     Assert.Equal(0, AVal.getValue summed)
 
 [<Fact>]
@@ -1198,9 +831,9 @@ let ``AVal sum handles single element`` () =
     let source = CVal.create 42
     let deps = [| CVal.value source |]
     let summed = AVal.sum deps
-    
+
     Assert.Equal(42, AVal.getValue summed)
-    
+
     source.Set(100)
     Assert.Equal(100, AVal.getValue summed)
 
@@ -1208,16 +841,16 @@ let ``AVal sum handles single element`` () =
 let ``AVal sum avoids recompute when unchanged`` () =
     let sources = [| CVal.create 1; CVal.create 2; CVal.create 3 |]
     let deps = sources |> Array.map CVal.value
-    
+
     // Note: We can't easily count recomputes here without exposing internals,
     // but we can verify version doesn't change on repeated reads
     let summed = AVal.sum deps
     let v1 = (summed :> IAdaptiveObject).Version
     let _ = AVal.getValue summed
     let v2 = (summed :> IAdaptiveObject).Version
-    
+
     Assert.Equal(v1, v2)
-    
+
     // After change, version should increase
     sources.[0].Set(10)
     let _ = AVal.getValue summed
@@ -1229,91 +862,500 @@ let ``N-ary nodes work in chains with other adaptive operations`` () =
     let a = CVal.create 1
     let b = CVal.create 2
     let c = CVal.create 3
-    
+
     // map3 -> map -> map2
-    let sum3 = AVal.map3 (fun x y z -> x + y + z) (CVal.value a) (CVal.value b) (CVal.value c)
+    let sum3 =
+        AVal.map3 (fun x y z -> x + y + z) (CVal.value a) (CVal.value b) (CVal.value c)
+
     let doubled = AVal.map (fun x -> x * 2) sum3
     let final = AVal.map2 (fun x y -> x + y) doubled (CVal.value a)
-    
+
     // (1+2+3)*2 + 1 = 13
     Assert.Equal(13, AVal.getValue final)
-    
+
     a.Set(10)
     // (10+2+3)*2 + 10 = 40
     Assert.Equal(40, AVal.getValue final)
 
-[<Fact>]
-let ``N-ary nodes handle concurrent reads and writes`` () =
-    let sources = Array.init 10 (fun i -> CVal.create i)
-    let deps = sources |> Array.map CVal.value
-    let summed = AVal.sum deps
-    
-    let errors = ConcurrentQueue<exn>()
-    let iterations = 2000
-    
-    let writerTask = Task.Run(fun () ->
-        try
-            for i in 1..iterations do
-                let idx = i % sources.Length
-                sources.[idx].Set(i)
-        with ex ->
-            errors.Enqueue(ex))
-    
-    let readerTask = Task.Run(fun () ->
-        try
-            for _ in 1..iterations do
-                let _ = AVal.getValue summed
-                ()
-        with ex ->
-            errors.Enqueue(ex))
-    
-    Task.WaitAll([| writerTask; readerTask |])
-    
-    Assert.True(errors.IsEmpty, $"Errors during concurrent N-ary access: {errors.Count}")
-
 // =============================================================================
-// Concurrency Hazard Tests
+// Phase 0 — Characterization Tests
 // =============================================================================
 
-/// Test 5: Snapshot thrash test - rapidly invalidate while building snapshot
 [<Fact>]
-let ``ChangeableSet snapshot building handles rapid invalidation`` () =
-    let changeable = CSet.ofSeq (seq { 1..100 })
-    let adaptive = CSet.value changeable
-    
-    let errors = ConcurrentQueue<exn>()
-    let snapshots = ConcurrentQueue<int>() // Store snapshot sizes
-    let iterations = 2000
-    
-    // Invalidator thread: rapidly add/remove to invalidate snapshots
-    let invalidatorTask = Task.Run(fun () ->
-        try
-            for i in 1..iterations do
-                changeable.Add(1000 + i)
-                changeable.Remove(1000 + i - 1)
-                // Also do bulk replace occasionally
-                if i % 100 = 0 then
-                    let current = ASet.getValue adaptive
-                    changeable.Set(current) // Replace with same value
-        with ex ->
-            errors.Enqueue(ex))
-    
-    // Reader threads: try to get snapshots during rapid invalidation
-    let readerTasks = Array.init 3 (fun _ ->
-        Task.Run(fun () ->
-            try
-                for _ in 1..iterations do
-                    let snapshot = ASet.getValue adaptive
-                    snapshots.Enqueue(snapshot.Count)
-            with ex ->
-                errors.Enqueue(ex)))
-    
-    Task.WaitAll(Array.append [| invalidatorTask |] readerTasks)
-    
-    Assert.True(errors.IsEmpty, $"Errors during snapshot thrash: {errors.Count}")
-    
-    // All snapshots should have had positive counts
-    let allSnapshots = snapshots.ToArray()
-    let invalidSnapshots = allSnapshots |> Array.filter (fun c -> c <= 0)
-    Assert.True(invalidSnapshots.Length = 0, $"Found {invalidSnapshots.Length} empty/invalid snapshots")
+let ``Deep chain propagates one update end to end`` () =
+    let depth = 500
+    let source = CVal.create 1
+    let mutable recomputeCount = 0
 
+    let root =
+        (CVal.value source, [ 1..depth ])
+        ||> List.fold (fun acc _ ->
+            AVal.map
+                (fun v ->
+                    recomputeCount <- recomputeCount + 1
+                    v + 1)
+                acc)
+
+    Assert.Equal(1 + depth, AVal.getValue root)
+    Assert.Equal(depth, recomputeCount)
+
+    // Repeated clean reads must not recompute.
+    Assert.Equal(1 + depth, AVal.getValue root)
+    Assert.Equal(depth, recomputeCount)
+
+    // One write must recompute each node at most once.
+    source.Set(2)
+    Assert.Equal(2 + depth, AVal.getValue root)
+    Assert.Equal(2 * depth, recomputeCount)
+
+[<Fact>]
+let ``Diamond recomputes the join node at most once per change`` () =
+    let source = CVal.create 1
+    let left = AVal.map (fun v -> v + 1) (CVal.value source)
+    let right = AVal.map (fun v -> v * 2) (CVal.value source)
+    let mutable joinCount = 0
+
+    let join =
+        AVal.map2
+            (fun l r ->
+                joinCount <- joinCount + 1
+                l + r)
+            left
+            right
+
+    Assert.Equal(4, AVal.getValue join) // (1+1) + (1*2)
+    Assert.Equal(1, joinCount)
+
+    source.Set(2)
+    Assert.Equal(7, AVal.getValue join) // (2+1) + (2*2)
+    Assert.Equal(2, joinCount)
+
+    source.Set(3)
+    Assert.Equal(10, AVal.getValue join) // (3+1) + (3*2)
+    Assert.Equal(3, joinCount)
+
+[<Fact>]
+let ``Bind stops tracking the dropped branch`` () =
+    let selector = CVal.create true
+    let left = CVal.create 1
+    let right = CVal.create 10
+    let mutable recomputeCount = 0
+
+    let bound =
+        AVal.bind
+            (fun useLeft ->
+                recomputeCount <- recomputeCount + 1
+                if useLeft then CVal.value left else CVal.value right)
+            (CVal.value selector)
+
+    Assert.Equal(1, AVal.getValue bound)
+    Assert.Equal(1, recomputeCount)
+
+    // Switch to the right branch.
+    selector.Set(false)
+    Assert.Equal(10, AVal.getValue bound)
+    Assert.Equal(2, recomputeCount)
+
+    // Writes to the dropped branch must not recompute the bound node.
+    left.Set(99)
+    Assert.Equal(10, AVal.getValue bound)
+    Assert.Equal(2, recomputeCount)
+
+    // Writes to the live branch must propagate.
+    right.Set(20)
+    Assert.Equal(20, AVal.getValue bound)
+    Assert.Equal(3, recomputeCount)
+
+    // Switching back re-establishes tracking of the left branch.
+    selector.Set(true)
+    Assert.Equal(99, AVal.getValue bound)
+    Assert.Equal(4, recomputeCount)
+
+    right.Set(30)
+    Assert.Equal(99, AVal.getValue bound)
+    Assert.Equal(4, recomputeCount)
+
+[<Fact>]
+let ``Bind nested in bind switches inner graphs`` () =
+    let outer = CVal.create true
+    let inner = CVal.create true
+    let a = CVal.create 1
+    let b = CVal.create 2
+    let c = CVal.create 3
+
+    let innerBound =
+        AVal.bind (fun pick -> if pick then CVal.value a else CVal.value b) (CVal.value inner)
+
+    let outerBound =
+        AVal.bind (fun pick -> if pick then innerBound else CVal.value c) (CVal.value outer)
+
+    Assert.Equal(1, AVal.getValue outerBound)
+
+    inner.Set(false)
+    Assert.Equal(2, AVal.getValue outerBound)
+
+    // outer switches away from innerBound; inner writes must not matter.
+    outer.Set(false)
+    Assert.Equal(3, AVal.getValue outerBound)
+    inner.Set(true)
+    a.Set(100)
+    Assert.Equal(3, AVal.getValue outerBound)
+
+    // Switching back picks up the current inner value.
+    outer.Set(true)
+    Assert.Equal(100, AVal.getValue outerBound)
+
+[<Fact>]
+let ``Computed reads inside a transaction see pre-transaction values`` () =
+    let source = CVal.create 1
+    let mutable recomputeCount = 0
+
+    let mapped =
+        AVal.map
+            (fun v ->
+                recomputeCount <- recomputeCount + 1
+                v * 10)
+            (CVal.value source)
+
+    Assert.Equal(10, AVal.getValue mapped)
+    Assert.Equal(1, recomputeCount)
+
+    Transaction.run (fun () ->
+        source.Set(5)
+        // The computed node must still see the pre-transaction value.
+        Assert.Equal(10, AVal.getValue mapped))
+    |> ignore
+
+    // No recompute happened inside the transaction.
+    Assert.Equal(1, recomputeCount)
+
+    // After commit the next read recomputes exactly once.
+    Assert.Equal(50, AVal.getValue mapped)
+    Assert.Equal(2, recomputeCount)
+
+[<Fact>]
+let ``Reads inside a transaction see values committed before it`` () =
+    let source = CVal.create 1
+
+    source.Set(7)
+
+    Transaction.run (fun () -> Assert.Equal(7, AVal.getValue (CVal.value source)))
+    |> ignore
+
+[<Fact>]
+let ``Several writes between reads yield the last value`` () =
+    let source = CVal.create 0
+    let mutable recomputeCount = 0
+
+    let mapped =
+        AVal.map
+            (fun v ->
+                recomputeCount <- recomputeCount + 1
+                v + 1)
+            (CVal.value source)
+
+    Assert.Equal(1, AVal.getValue mapped)
+
+    source.Set(1)
+    source.Set(2)
+    source.Set(3)
+    Assert.Equal(4, AVal.getValue mapped)
+    Assert.Equal(2, recomputeCount)
+
+[<Fact>]
+let ``Arbitrary interleaving of writes and reads stays correct`` () =
+    let a = CVal.create 0
+    let b = CVal.create 0
+    let sum = AVal.map2 (+) (CVal.value a) (CVal.value b)
+    let doubled = AVal.map (fun v -> v * 2) sum
+    let rng = Random(42)
+
+    for _ in 1..200 do
+        if rng.NextDouble() < 0.5 then
+            a.Set(rng.Next(100))
+        else
+            b.Set(rng.Next(100))
+
+        let expected = 2 * (AVal.getValue (CVal.value a) + AVal.getValue (CVal.value b))
+        Assert.Equal(expected, AVal.getValue doubled)
+
+[<Fact>]
+let ``Collection delta sequences match a reference model`` () =
+    let source = CSet.empty<int>
+    let mapped = ASet.map (fun v -> v * 3) (CSet.value source)
+    let filtered = ASet.filter (fun v -> v % 2 = 0) mapped
+    let mutable model = Set.empty<int>
+    let rng = Random(7)
+
+    for i in 1..300 do
+        let v = rng.Next(50)
+
+        if rng.NextDouble() < 0.6 then
+            source.Add(v)
+            model <- model.Add(v)
+        else
+            source.Remove(v)
+            model <- model.Remove(v)
+
+        let expected = model |> Set.map (fun v -> v * 3) |> Set.filter (fun v -> v % 2 = 0)
+        Assert.Equal<Set<int>>(expected, ASet.getValue filtered)
+
+    // Bulk replace must match as well.
+    let replacement = Set.ofList [ 1; 2; 3; 60 ]
+    CSet.set replacement source
+
+    let expected =
+        replacement |> Set.map (fun v -> v * 3) |> Set.filter (fun v -> v % 2 = 0)
+
+    Assert.Equal<Set<int>>(expected, ASet.getValue filtered)
+
+[<Fact>]
+let ``Map delta sequences match a reference model`` () =
+    let source = CMap.empty<int, int>
+    let mapped = AMap.map (fun k v -> v + k) (CMap.value source)
+    let mutable model = Map.empty<int, int>
+    let rng = Random(11)
+
+    for _ in 1..300 do
+        let k = rng.Next(30)
+
+        if rng.NextDouble() < 0.6 then
+            source.AddOrUpdate k (rng.Next(100))
+            model <- model.Add(k, AMap.getValue (CMap.value source) |> Map.find k)
+        else
+            source.Remove(k)
+            model <- model.Remove k
+
+        let expected = model |> Map.map (fun k v -> v + k)
+        Assert.Equal<Map<int, int>>(expected, AMap.getValue mapped)
+
+[<Fact>]
+let ``Union delta sequences preserve duplicate semantics`` () =
+    let left = CSet.empty<int>
+    let right = CSet.empty<int>
+    let unioned = ASet.union (CSet.value left) (CSet.value right)
+    let rng = Random(13)
+
+    for _ in 1..200 do
+        let v = rng.Next(20)
+
+        match rng.Next(4) with
+        | 0 -> left.Add(v)
+        | 1 -> right.Add(v)
+        | 2 -> left.Remove(v)
+        | _ -> right.Remove(v)
+
+        let expected =
+            Set.union (ASet.getValue (CSet.value left)) (ASet.getValue (CSet.value right))
+
+        Assert.Equal<Set<int>>(expected, ASet.getValue unioned)
+
+
+// =============================================================================
+// Phase 3/4 — Push-marking and observation
+// =============================================================================
+
+[<Fact>]
+let ``Observed chain updates after source write`` () =
+    let a = CVal.create 1
+    let m1 = AVal.map (fun v -> v + 1) (CVal.value a)
+    let m2 = AVal.map (fun v -> v * 2) m1
+    let joined = AVal.map2 (+) m2 (CVal.value a)
+    let mutable seen = []
+    use _obs = AVal.observe (fun v -> seen <- v :: seen) joined
+
+    a.Set(2)
+    Assert.Equal<int list>([ 8 ], seen) // (2+1)*2 + 2
+
+    a.Set(3)
+    Assert.Equal<int list>([ 11; 8 ], seen)
+
+[<Fact>]
+let ``Observed mixed chain of generic and wide nodes updates after source write`` () =
+    let a = CVal.create 1
+    let b = CVal.create 2
+    let c = CVal.create 3
+    let sum = AVal.sum [| CVal.value a; CVal.value b; CVal.value c |]
+
+    let wide =
+        AVal.mapN (fun values -> values |> Array.fold (*) 1) [| CVal.value a; CVal.value c |]
+
+    let joined = AVal.map2 (+) sum wide
+    let mutable seen = []
+    use _obs = AVal.observe (fun v -> seen <- v :: seen) joined
+
+    a.Set(10)
+    Assert.Equal<int list>([ 45 ], seen) // (10+2+3) + (10*3)
+
+[<Fact>]
+let ``Several writes between reads produce the last value`` () =
+    let a = CVal.create 0
+    let m = AVal.map (fun v -> v + 1) (CVal.value a)
+    use _obs = AVal.observe ignore m
+
+    a.Set(1)
+    a.Set(2)
+    a.Set(3)
+    Assert.Equal(4, AVal.getValue m)
+
+[<Fact>]
+let ``Writes inside one transaction produce one notification after the batch`` () =
+    let a = CVal.create 0
+    let m = AVal.map (fun v -> v + 1) (CVal.value a)
+    let mutable count = 0
+    let mutable last = 0
+
+    use _obs =
+        AVal.observe
+            (fun v ->
+                count <- count + 1
+                last <- v)
+            m
+
+    Transaction.run (fun () ->
+        a.Set(1)
+        a.Set(2)
+        a.Set(3)
+        // No notification during the batch.
+        Assert.Equal(0, count))
+    |> ignore
+
+    Assert.Equal(1, count)
+    Assert.Equal(4, last)
+
+[<Fact>]
+let ``Arbitrary interleaving stays correct under observation`` () =
+    let a = CVal.create 0
+    let b = CVal.create 0
+    let sum = AVal.map2 (+) (CVal.value a) (CVal.value b)
+    let doubled = AVal.map (fun v -> v * 2) sum
+    use _obs = AVal.observe ignore doubled
+    let rng = Random(43)
+
+    for _ in 1..200 do
+        if rng.NextDouble() < 0.5 then
+            a.Set(rng.Next 100)
+        else
+            b.Set(rng.Next 100)
+
+        let expected = 2 * (AVal.getValue (CVal.value a) + AVal.getValue (CVal.value b))
+
+        Assert.Equal(expected, AVal.getValue doubled)
+
+[<Fact>]
+let ``Disposed observation stops notifications and reads fall back to version checks`` () =
+    let a = CVal.create 1
+    let m = AVal.map (fun v -> v + 1) (CVal.value a)
+    let mutable count = 0
+    let obs = AVal.observe (fun _ -> count <- count + 1) m
+
+    a.Set(2)
+    Assert.Equal(1, count)
+
+    obs.Dispose()
+    Assert.False(obs.IsActive)
+
+    a.Set(3)
+    Assert.Equal(1, count)
+    // Reads still work through the version-check fallback.
+    Assert.Equal(4, AVal.getValue m)
+
+[<Fact>]
+let ``Bind switch under observation tracks the live branch`` () =
+    let selector = CVal.create true
+    let left = CVal.create 1
+    let right = CVal.create 10
+
+    let bound =
+        AVal.bind (fun useLeft -> if useLeft then CVal.value left else CVal.value right) (CVal.value selector)
+
+    let mutable count = 0
+    let mutable last = 0
+
+    use _obs =
+        AVal.observe
+            (fun v ->
+                count <- count + 1
+                last <- v)
+            bound
+
+    left.Set(2)
+    Assert.Equal(2, last)
+
+    selector.Set(false)
+    Assert.Equal(10, last)
+    let countAfterSwitch = count
+
+    // The dropped branch must not notify.
+    left.Set(99)
+    Assert.Equal(countAfterSwitch, count)
+
+    // The live branch notifies.
+    right.Set(20)
+    Assert.Equal(20, last)
+
+[<Fact>]
+let ``Writing an equal value does not mark and does not notify`` () =
+    let a = CVal.create 5
+    let m = AVal.map (fun v -> v + 1) (CVal.value a)
+    let mutable count = 0
+    use _obs = AVal.observe (fun _ -> count <- count + 1) m
+
+    let versionBefore = (CVal.value a :> IAdaptiveObject).Version
+    a.Set(5)
+
+    Assert.Equal(versionBefore, (CVal.value a :> IAdaptiveObject).Version)
+    Assert.Equal(0, count)
+
+[<Fact>]
+let ``Transaction rollback resets collection journals`` () =
+    let s = CSet.ofSeq [ 1 ]
+
+    Assert.Throws<exn>(fun () ->
+        Transaction.run (fun () ->
+            s.Add(2)
+            failwith "boom")
+        |> ignore)
+    |> ignore
+
+    Assert.Equal<Set<int>>(Set.ofList [ 1 ], ASet.getValue (CSet.value s))
+    // The journal must be clean: the next write applies normally.
+    s.Add(3)
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 3 ], ASet.getValue (CSet.value s))
+
+[<Fact>]
+let ``Steady-state observed operations allocate zero bytes`` () =
+    let a = CVal.create 1
+    let m = AVal.map (fun v -> v + 1) (CVal.value a)
+    use _obs = AVal.observe ignore m
+    let _ = AVal.getValue m
+
+    let beforeRead = GC.GetAllocatedBytesForCurrentThread()
+
+    for _ in 1..1000 do
+        AVal.getValue m |> ignore
+
+    let readAllocated = GC.GetAllocatedBytesForCurrentThread() - beforeRead
+
+    Assert.Equal(0L, readAllocated)
+
+    let beforeWrite = GC.GetAllocatedBytesForCurrentThread()
+
+    for i in 1..1000 do
+        a.Set(i)
+
+    let writeAllocated = GC.GetAllocatedBytesForCurrentThread() - beforeWrite
+
+    Assert.Equal(0L, writeAllocated)
+
+
+[<Fact>]
+let ``Transaction run returns the function result`` () =
+    let a = CVal.create 1
+
+    let result =
+        Transaction.run (fun () ->
+            a.Set(2)
+            40 + 2)
+
+    Assert.Equal(42, result)
