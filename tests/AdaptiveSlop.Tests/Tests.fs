@@ -1936,3 +1936,326 @@ let ``sequential transactions each apply their collection writes`` () =
     Transaction.run (fun () -> CMap.addOrUpdate "a" 1 mapSource)
     Transaction.run (fun () -> CMap.addOrUpdate "b" 2 mapSource)
     Assert.Equal(2, (AMap.force (CMap.value mapSource)).Count)
+
+// =============================================================================
+// Phase 7.2 — Incremental reductions and derived checks
+// =============================================================================
+
+[<Fact>]
+let ``ASet count isEmpty contains track the state`` () =
+    let source = CSet.empty<int>
+    let count = ASet.count (CSet.value source)
+    let isEmpty = ASet.isEmpty (CSet.value source)
+    let hasFive = ASet.contains 5 (CSet.value source)
+
+    Assert.Equal(0, AVal.getValue count)
+    Assert.True(AVal.getValue isEmpty)
+    Assert.False(AVal.getValue hasFive)
+
+    CSet.add 5 source
+    Assert.Equal(1, AVal.getValue count)
+    Assert.False(AVal.getValue isEmpty)
+    Assert.True(AVal.getValue hasFive)
+
+    CSet.add 7 source
+    CSet.remove 5 source
+    Assert.Equal(1, AVal.getValue count)
+    Assert.False(AVal.getValue hasFive)
+    Assert.True(AVal.getValue (ASet.contains 7 (CSet.value source)))
+
+[<Fact>]
+let ``ASet exists forall countBy are delta-driven`` () =
+    let source = CSet.empty<int>
+    let existsEven = ASet.exists (fun v -> v % 2 = 0) (CSet.value source)
+    let forallEven = ASet.forall (fun v -> v % 2 = 0) (CSet.value source)
+    let evenCount = ASet.countBy (fun v -> v % 2 = 0) (CSet.value source)
+
+    Assert.False(AVal.getValue existsEven)
+    Assert.True(AVal.getValue forallEven)
+    Assert.Equal(0, AVal.getValue evenCount)
+
+    CSet.add 2 source
+    Assert.True(AVal.getValue existsEven)
+    Assert.True(AVal.getValue forallEven)
+    Assert.Equal(1, AVal.getValue evenCount)
+
+    CSet.add 3 source
+    Assert.True(AVal.getValue existsEven)
+    Assert.False(AVal.getValue forallEven)
+    Assert.Equal(1, AVal.getValue evenCount)
+
+    CSet.add 4 source
+    CSet.remove 2 source
+    Assert.True(AVal.getValue existsEven)
+    Assert.Equal(1, AVal.getValue evenCount)
+
+    CSet.remove 4 source
+    Assert.False(AVal.getValue existsEven)
+    Assert.False(AVal.getValue forallEven)
+    Assert.Equal(0, AVal.getValue evenCount)
+
+[<Fact>]
+let ``ASet fold recomputes on removals`` () =
+    let source = CSet.empty<int>
+    let folded = ASet.fold (+) 0 (CSet.value source)
+
+    CSet.add 10 source
+    CSet.add 20 source
+    Assert.Equal(30, AVal.getValue folded)
+
+    // fold has no inverse: the removal triggers a full recompute.
+    CSet.remove 10 source
+    Assert.Equal(20, AVal.getValue folded)
+
+[<Fact>]
+let ``ASet foldGroup inverts removals`` () =
+    let source = CSet.empty<int>
+    let folded = ASet.foldGroup (+) (-) 0 (CSet.value source)
+
+    CSet.add 10 source
+    CSet.add 20 source
+    Assert.Equal(30, AVal.getValue folded)
+
+    CSet.remove 10 source
+    Assert.Equal(20, AVal.getValue folded)
+
+    CSet.add 5 source
+    CSet.add 15 source
+    CSet.remove 20 source
+    Assert.Equal(20, AVal.getValue folded)
+
+[<Fact>]
+let ``ASet sum sumBy tryMin tryMax`` () =
+    let source = CSet.empty<int>
+    let total = ASet.sum (CSet.value source)
+    let totalBy = ASet.sumBy (fun v -> v * 2) (CSet.value source)
+    let min = ASet.tryMin (CSet.value source)
+    let max = ASet.tryMax (CSet.value source)
+
+    Assert.Equal(ValueNone, AVal.getValue min)
+    CSet.add 3 source
+    CSet.add 1 source
+    CSet.add 5 source
+    Assert.Equal(9, AVal.getValue total)
+    Assert.Equal(18, AVal.getValue totalBy)
+    Assert.Equal(ValueSome 1, AVal.getValue min)
+    Assert.Equal(ValueSome 5, AVal.getValue max)
+    CSet.remove 5 source
+    Assert.Equal(4, AVal.getValue total)
+    Assert.Equal(ValueSome 3, AVal.getValue max)
+
+[<Fact>]
+let ``ASet reduceBy with a mapping`` () =
+    let source = CSet.empty<string>
+    // Count the strings longer than one character, via reduceBy.
+    // The pipe resolves the element type before the lambda is checked (F#
+    // checks InlineIfLambda arguments eagerly; the subject-last order makes
+    // member access work).
+    let longCount =
+        CSet.value source
+        |> ASet.reduceBy AdaptiveReduction.countPositive (fun s -> s.Length > 1)
+
+    Assert.Equal(0, AVal.getValue longCount)
+    CSet.add "a" source
+    CSet.add "bb" source
+    CSet.add "ccc" source
+    Assert.Equal(2, AVal.getValue longCount)
+    CSet.remove "bb" source
+    Assert.Equal(1, AVal.getValue longCount)
+
+[<Fact>]
+let ``AMap tryFind find track entries`` () =
+    let source = CMap.empty<string, int>
+    let lookup = AMap.tryFind "a" (CMap.value source)
+
+    Assert.Equal(ValueNone, AVal.getValue lookup)
+
+    CMap.addOrUpdate "a" 1 source
+    Assert.Equal(ValueSome 1, AVal.getValue lookup)
+
+    CMap.addOrUpdate "a" 2 source
+    Assert.Equal(ValueSome 2, AVal.getValue lookup)
+
+    CMap.remove "a" source
+    Assert.Equal(ValueNone, AVal.getValue lookup)
+
+    CMap.addOrUpdate "a" 9 source
+    let findValue = AMap.find "a" (CMap.value source)
+    Assert.Equal(9, AVal.getValue findValue)
+
+    Assert.Throws<System.Collections.Generic.KeyNotFoundException>(fun () ->
+        AVal.getValue (AMap.find "missing" (CMap.value source)) |> ignore)
+
+[<Fact>]
+let ``AMap reduce updates subtract the old value`` () =
+    let source = CMap.empty<string, int>
+    let total = AMap.reduce (AdaptiveReduction.sum ()) (CMap.value source)
+
+    CMap.addOrUpdate "a" 10 source
+    CMap.addOrUpdate "b" 20 source
+    Assert.Equal(30, AVal.getValue total)
+
+    // Update: the old value must be subtracted before the new one is added.
+    CMap.addOrUpdate "a" 15 source
+    Assert.Equal(35, AVal.getValue total)
+
+    CMap.remove "b" source
+    Assert.Equal(15, AVal.getValue total)
+
+[<Fact>]
+let ``AMap fold recomputes on removals`` () =
+    let source = CMap.empty<int, int>
+    let folded = AMap.fold (fun s k v -> s + k * v) 0 (CMap.value source)
+
+    CMap.addOrUpdate 2 3 source
+    CMap.addOrUpdate 4 5 source
+    Assert.Equal(26, AVal.getValue folded)
+
+    CMap.remove 2 source
+    Assert.Equal(20, AVal.getValue folded)
+
+[<Fact>]
+let ``AMap foldGroup inverts removals`` () =
+    let source = CMap.empty<int, int>
+
+    let folded =
+        AMap.foldGroup (fun s k v -> s + k * v) (fun s k v -> s - k * v) 0 (CMap.value source)
+
+    CMap.addOrUpdate 2 3 source
+    CMap.addOrUpdate 4 5 source
+    Assert.Equal(26, AVal.getValue folded)
+
+    CMap.remove 2 source
+    Assert.Equal(20, AVal.getValue folded)
+
+    CMap.addOrUpdate 4 1 source // update: subtract old (20), add new (4)
+    Assert.Equal(4, AVal.getValue folded)
+
+[<Fact>]
+let ``AMap exists forall countBy`` () =
+    let source = CMap.empty<int, int>
+    let hasBig = AMap.exists (fun _ v -> v > 100) (CMap.value source)
+    let allBig = AMap.forall (fun _ v -> v > 100) (CMap.value source)
+    let bigCount = AMap.countBy (fun _ v -> v > 100) (CMap.value source)
+
+    Assert.False(AVal.getValue hasBig)
+    Assert.True(AVal.getValue allBig)
+    Assert.Equal(0, AVal.getValue bigCount)
+
+    CMap.addOrUpdate 1 50 source
+    Assert.False(AVal.getValue hasBig)
+    Assert.False(AVal.getValue allBig)
+    Assert.Equal(0, AVal.getValue bigCount)
+
+    CMap.addOrUpdate 2 200 source
+    Assert.True(AVal.getValue hasBig)
+    Assert.Equal(1, AVal.getValue bigCount)
+
+    CMap.addOrUpdate 2 5 source // update flips the group
+    Assert.False(AVal.getValue hasBig)
+    Assert.Equal(0, AVal.getValue bigCount)
+
+[<Fact>]
+let ``toAVal materializes stable snapshots`` () =
+    let source = CSet.empty<int>
+    let snap = ASet.toAVal (CSet.value source)
+    CSet.add 1 source
+    CSet.add 2 source
+
+    let first = AVal.getValue snap
+    Assert.Equal(2, first.Count)
+    Assert.True(first.Contains 1)
+
+    CSet.add 3 source
+    Assert.Equal(3, (AVal.getValue snap).Count)
+    // The earlier snapshot is untouched by later writes.
+    Assert.Equal(2, first.Count)
+
+    let mapSource = CMap.empty<string, int>
+    let mapSnap = AMap.toAVal (CMap.value mapSource)
+    CMap.addOrUpdate "x" 1 mapSource
+    Assert.Equal(1, (AVal.getValue mapSnap).Count)
+
+[<Fact>]
+let ``single builds constant singletons`` () =
+    let set = ASet.single 42
+    Assert.Equal(1, (ASet.force set).Count)
+    Assert.True((ASet.force set).Contains 42)
+
+    let mapValue = AMap.single "k" 7
+    Assert.Equal(7, (AMap.force mapValue)["k"])
+
+[<Fact>]
+let ``reductions compose with observation`` () =
+    let source = CSet.empty<int>
+    let count = ASet.count (CSet.value source)
+    let seen = ResizeArray<int>()
+
+    use obs = AVal.observe (fun v -> seen.Add v) count
+
+    CSet.add 1 source
+    CSet.add 2 source
+    CSet.remove 1 source
+    Assert.Equal<int list>([ 1; 2; 1 ], List.ofSeq seen)
+
+[<Fact>]
+let ``reduction over a derived set receives deltas`` () =
+    let source = CSet.empty<int>
+    let doubled = ASet.map (fun v -> v * 2) (CSet.value source)
+    let total = ASet.sum doubled
+
+    CSet.add 1 source
+    CSet.add 3 source
+    Assert.Equal(8, AVal.getValue total)
+
+    CSet.remove 1 source
+    Assert.Equal(6, AVal.getValue total)
+
+[<Fact>]
+let ``reduction matches a reference model under random churn`` () =
+    let source = CSet.empty<int>
+    let folded = ASet.foldGroup (+) (-) 0 (CSet.value source)
+    let evenCount = ASet.countBy (fun v -> v % 2 = 0) (CSet.value source)
+    let mutable model = Set.empty<int>
+    let rng = Random(11)
+
+    for _ in 1..500 do
+        let v = rng.Next(100)
+
+        if rng.NextDouble() < 0.6 then
+            CSet.add v source
+            model <- model.Add v
+        else
+            CSet.remove v source
+            model <- model.Remove v
+
+        Assert.Equal(Set.fold (+) 0 model, AVal.getValue folded)
+        Assert.Equal(Set.count (Set.filter (fun x -> x % 2 = 0) model), AVal.getValue evenCount)
+
+[<Fact>]
+let ``reduce node steady-state drain allocates zero`` () =
+    let source = CSet.empty<int>
+    let total = ASet.foldGroup (+) (-) 0 (CSet.value source)
+
+    for i in 1..50 do
+        CSet.add i source
+
+    for i in 1..25 do
+        CSet.remove i source
+
+    // Warm up the first read: the initial load enumerates the view once
+    // (one-time cost, like every node's initial load).
+    AVal.getValue total |> ignore
+
+    let before = GC.GetAllocatedBytesForCurrentThread()
+
+    for i in 1..100 do
+        CSet.remove ((i % 25) + 26) source
+        CSet.add ((i % 25) + 26) source
+
+        if AVal.getValue total <> 950 then
+            failwith "sum drifted"
+
+    let allocated = GC.GetAllocatedBytesForCurrentThread() - before
+    Assert.Equal(950, AVal.getValue total)
+    Assert.Equal(0L, allocated)

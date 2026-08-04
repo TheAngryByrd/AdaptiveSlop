@@ -58,6 +58,115 @@ module ASet =
         node :> IObservation
 
     /// <summary>
+    /// Adaptively reduces the set with the given <see cref="AdaptiveReduction"/>.
+    /// The state is updated incrementally from deltas: added elements apply
+    /// <c>add</c>; removed elements apply <c>sub</c> (or recompute the whole
+    /// state when <c>sub</c> returns <c>ValueNone</c>).
+    /// </summary>
+    let reduce (reduction: AdaptiveReduction<'a, 's, 'v>) (set: IAdaptiveSet<'a>) : IAdaptiveValue<'v> =
+        new SetReduceNode<'a, 'a, 's, 'v>(set, id, reduction) :> IAdaptiveValue<'v>
+
+    /// <summary>
+    /// Maps every element, then reduces the mapped values with the given
+    /// <see cref="AdaptiveReduction"/>. The mapping runs per delta element.
+    /// </summary>
+    let inline reduceBy
+        (reduction: AdaptiveReduction<'b, 's, 'v>)
+        ([<InlineIfLambda>] mapping: 'a -> 'b)
+        (set: IAdaptiveSet<'a>)
+        : IAdaptiveValue<'v> =
+        new SetReduceNode<'a, 'b, 's, 'v>(set, mapping, reduction) :> IAdaptiveValue<'v>
+
+    /// <summary>
+    /// Adaptively folds the set with <c>add</c>; every removal recomputes the
+    /// whole fold (the fold operation is not invertible in general). Use
+    /// <see cref="foldGroup"/> when the operation has an inverse.
+    /// </summary>
+    let inline fold (add: 's -> 'a -> 's) (zero: 's) (set: IAdaptiveSet<'a>) : IAdaptiveValue<'s> =
+        reduce (AdaptiveReduction.fold zero add) set
+
+    /// <summary>
+    /// Adaptively folds the set with an invertible <c>subtract</c>: removals
+    /// update the state without a recompute.
+    /// </summary>
+    let inline foldGroup
+        (add: 's -> 'a -> 's)
+        (subtract: 's -> 'a -> 's)
+        (zero: 's)
+        (set: IAdaptiveSet<'a>)
+        : IAdaptiveValue<'s> =
+        reduce (AdaptiveReduction.group zero add subtract) set
+
+    /// <summary>
+    /// Adaptively folds the set; a removal applies <c>trySubtract</c> when it
+    /// returns a value, otherwise the whole fold recomputes.
+    /// </summary>
+    let inline foldHalfGroup
+        (add: 's -> 'a -> 's)
+        (trySubtract: 's -> 'a -> 's voption)
+        (zero: 's)
+        (set: IAdaptiveSet<'a>)
+        : IAdaptiveValue<'s> =
+        reduce (AdaptiveReduction.halfGroup zero add trySubtract) set
+
+    /// <summary>Adaptively gets the number of elements.</summary>
+    let count (set: IAdaptiveSet<'T>) : IAdaptiveValue<int> =
+        AdaptiveNode<int>(fun () -> set.GetValue().Count) :> IAdaptiveValue<int>
+
+    /// <summary>Adaptively tests if the set is empty.</summary>
+    let isEmpty (set: IAdaptiveSet<'T>) : IAdaptiveValue<bool> =
+        AdaptiveNode<bool>(fun () -> set.GetValue().Count = 0) :> IAdaptiveValue<bool>
+
+    /// <summary>Adaptively tests if the set contains the given element.</summary>
+    let contains (value: 'T) (set: IAdaptiveSet<'T>) : IAdaptiveValue<bool> =
+        AdaptiveNode<bool>(fun () -> set.GetValue().Contains value) :> IAdaptiveValue<bool>
+
+    /// <summary>Adaptively tests if any element satisfies the predicate.</summary>
+    let inline exists ([<InlineIfLambda>] predicate: 'T -> bool) (set: IAdaptiveSet<'T>) : IAdaptiveValue<bool> =
+        let reduction =
+            AdaptiveReduction.countPositive |> AdaptiveReduction.mapOut (fun c -> c <> 0)
+
+        new SetReduceNode<'T, bool, int, bool>(set, predicate, reduction) :> IAdaptiveValue<bool>
+
+    /// <summary>Adaptively tests if every element satisfies the predicate.</summary>
+    let inline forall ([<InlineIfLambda>] predicate: 'T -> bool) (set: IAdaptiveSet<'T>) : IAdaptiveValue<bool> =
+        let reduction =
+            AdaptiveReduction.countNegative |> AdaptiveReduction.mapOut (fun c -> c = 0)
+
+        new SetReduceNode<'T, bool, int, bool>(set, predicate, reduction) :> IAdaptiveValue<bool>
+
+    /// <summary>Adaptively counts the elements that satisfy the predicate.</summary>
+    let inline countBy ([<InlineIfLambda>] predicate: 'T -> bool) (set: IAdaptiveSet<'T>) : IAdaptiveValue<int> =
+        new SetReduceNode<'T, bool, int, int>(set, predicate, AdaptiveReduction.countPositive) :> IAdaptiveValue<int>
+
+    /// <summary>Adaptively sums the elements.</summary>
+    let inline sum (set: IAdaptiveSet<'T>) : IAdaptiveValue<'T> = reduce (AdaptiveReduction.sum ()) set
+
+    /// <summary>Adaptively sums the mapped elements.</summary>
+    let inline sumBy ([<InlineIfLambda>] mapping: 'T -> 'U) (set: IAdaptiveSet<'T>) : IAdaptiveValue<'U> =
+        reduceBy (AdaptiveReduction.sum ()) mapping set
+
+    /// <summary>Adaptively gets the minimum element, or <c>ValueNone</c> when empty.</summary>
+    let inline tryMin (set: IAdaptiveSet<'T>) : IAdaptiveValue<'T voption> =
+        reduce (AdaptiveReduction.tryMin ()) set
+
+    /// <summary>Adaptively gets the maximum element, or <c>ValueNone</c> when empty.</summary>
+    let inline tryMax (set: IAdaptiveSet<'T>) : IAdaptiveValue<'T voption> =
+        reduce (AdaptiveReduction.tryMax ()) set
+
+    /// <summary>A constant set with a single element.</summary>
+    let single (value: 'T) : IAdaptiveSet<'T> =
+        new ConstantSet<'T>([ value ].ToFrozenSet())
+
+    /// <summary>
+    /// Materializes the set as an adaptive value. Every change materializes a
+    /// new immutable <see cref="FrozenSet&lt;'T&gt;"/> (the retain boundary,
+    /// like <see cref="force"/>); the value is safe to retain.
+    /// </summary>
+    let toAVal (set: IAdaptiveSet<'T>) : IAdaptiveValue<FrozenSet<'T>> =
+        AdaptiveNode<FrozenSet<'T>>(fun () -> set.GetValue().ToFrozenSet()) :> IAdaptiveValue<FrozenSet<'T>>
+
+    /// <summary>
     /// Returns a transient view of the current state. Valid only until the next
     /// write on the owner thread; do not retain or mutate it. Use
     /// <see cref="force"/> to materialize a snapshot that is safe to retain.
@@ -152,6 +261,129 @@ module AMap =
         let node = ObserveMapNode<'K, 'V>(mapValue, callback)
         node.Attach()
         node :> IObservation
+
+    /// <summary>
+    /// Adaptively reduces the map with the given <see cref="AdaptiveReduction"/>
+    /// over the values. The state is updated incrementally from deltas: a Set
+    /// on an existing key subtracts the old value, then adds the new one.
+    /// </summary>
+    let reduce (reduction: AdaptiveReduction<'a, 's, 'v>) (mapValue: IAdaptiveMap<'k, 'a>) : IAdaptiveValue<'v> =
+        new MapReduceNode<'k, 'a, 'a, 's, 'v>(mapValue, (fun _ v -> v), reduction) :> IAdaptiveValue<'v>
+
+    /// <summary>
+    /// Maps every entry, then reduces the mapped values with the given
+    /// <see cref="AdaptiveReduction"/>. The mapping runs per delta entry.
+    /// </summary>
+    let inline reduceBy
+        (reduction: AdaptiveReduction<'b, 's, 'v>)
+        ([<InlineIfLambda>] mapping: 'k -> 'a -> 'b)
+        (mapValue: IAdaptiveMap<'k, 'a>)
+        : IAdaptiveValue<'v> =
+        new MapReduceNode<'k, 'a, 'b, 's, 'v>(mapValue, mapping, reduction) :> IAdaptiveValue<'v>
+
+    /// <summary>
+    /// Adaptively folds the map with <c>add</c>; every removal recomputes the
+    /// whole fold. Use <see cref="foldGroup"/> when the operation has an inverse.
+    /// </summary>
+    let inline fold (add: 's -> 'k -> 'v -> 's) (zero: 's) (mapValue: IAdaptiveMap<'k, 'v>) : IAdaptiveValue<'s> =
+        let mapping k v = struct (k, v)
+        let add2 s struct (k, v) = add s k v
+
+        new MapReduceNode<'k, 'v, struct ('k * 'v), 's, 's>(mapValue, mapping, AdaptiveReduction.fold zero add2)
+        :> IAdaptiveValue<'s>
+
+    /// <summary>
+    /// Adaptively folds the map with an invertible <c>subtract</c>: removals
+    /// update the state without a recompute.
+    /// </summary>
+    let inline foldGroup
+        (add: 's -> 'k -> 'v -> 's)
+        (subtract: 's -> 'k -> 'v -> 's)
+        (zero: 's)
+        (mapValue: IAdaptiveMap<'k, 'v>)
+        : IAdaptiveValue<'s> =
+        let mapping k v = struct (k, v)
+        let add2 s struct (k, v) = add s k v
+        let sub2 s struct (k, v) = subtract s k v
+
+        new MapReduceNode<'k, 'v, struct ('k * 'v), 's, 's>(mapValue, mapping, AdaptiveReduction.group zero add2 sub2)
+        :> IAdaptiveValue<'s>
+
+    /// <summary>Adaptively gets the number of entries.</summary>
+    let count (mapValue: IAdaptiveMap<'K, 'V>) : IAdaptiveValue<int> =
+        AdaptiveNode<int>(fun () -> mapValue.GetValue().Count) :> IAdaptiveValue<int>
+
+    /// <summary>Adaptively tests if the map is empty.</summary>
+    let isEmpty (mapValue: IAdaptiveMap<'K, 'V>) : IAdaptiveValue<bool> =
+        AdaptiveNode<bool>(fun () -> mapValue.GetValue().Count = 0) :> IAdaptiveValue<bool>
+
+    /// <summary>Adaptively tests if any entry satisfies the predicate.</summary>
+    let inline exists
+        ([<InlineIfLambda>] predicate: 'K -> 'V -> bool)
+        (mapValue: IAdaptiveMap<'K, 'V>)
+        : IAdaptiveValue<bool> =
+        let reduction =
+            AdaptiveReduction.countPositive |> AdaptiveReduction.mapOut (fun c -> c <> 0)
+
+        new MapReduceNode<'K, 'V, bool, int, bool>(mapValue, predicate, reduction) :> IAdaptiveValue<bool>
+
+    /// <summary>Adaptively tests if every entry satisfies the predicate.</summary>
+    let inline forall
+        ([<InlineIfLambda>] predicate: 'K -> 'V -> bool)
+        (mapValue: IAdaptiveMap<'K, 'V>)
+        : IAdaptiveValue<bool> =
+        let reduction =
+            AdaptiveReduction.countNegative |> AdaptiveReduction.mapOut (fun c -> c = 0)
+
+        new MapReduceNode<'K, 'V, bool, int, bool>(mapValue, predicate, reduction) :> IAdaptiveValue<bool>
+
+    /// <summary>Adaptively counts the entries that satisfy the predicate.</summary>
+    let inline countBy
+        ([<InlineIfLambda>] predicate: 'K -> 'V -> bool)
+        (mapValue: IAdaptiveMap<'K, 'V>)
+        : IAdaptiveValue<int> =
+        new MapReduceNode<'K, 'V, bool, int, int>(mapValue, predicate, AdaptiveReduction.countPositive)
+        :> IAdaptiveValue<int>
+
+    /// <summary>
+    /// Adaptively looks up the key: the value, or <c>ValueNone</c> when the
+    /// key is absent. The lookup is O(1) on read.
+    /// </summary>
+    let tryFind (key: 'K) (mapValue: IAdaptiveMap<'K, 'V>) : IAdaptiveValue<'V voption> =
+        AdaptiveNode<'V voption>(fun () ->
+            let view = mapValue.GetValue()
+            let mutable v = Unchecked.defaultof<'V>
+
+            if view.TryGetValue(key, &v) then ValueSome v else ValueNone)
+        :> IAdaptiveValue<'V voption>
+
+    /// <summary>
+    /// Adaptively looks up the key. Reading the value throws
+    /// <see cref="KeyNotFoundException"/> when the key is absent.
+    /// </summary>
+    let find (key: 'K) (mapValue: IAdaptiveMap<'K, 'V>) : IAdaptiveValue<'V> =
+        AdaptiveNode<'V>(fun () ->
+            let view = mapValue.GetValue()
+            let mutable v = Unchecked.defaultof<'V>
+
+            if view.TryGetValue(key, &v) then
+                v
+            else
+                raise (KeyNotFoundException(sprintf "could not get key: %A" key)))
+        :> IAdaptiveValue<'V>
+
+    /// <summary>A constant map with a single entry.</summary>
+    let single (key: 'K) (value: 'V) : IAdaptiveMap<'K, 'V> =
+        ConstantMap([ KeyValuePair(key, value) ] |> FrozenDictionary.ToFrozenDictionary)
+
+    /// <summary>
+    /// Materializes the map as an adaptive value. Every change materializes a
+    /// new immutable <see cref="FrozenDictionary&lt;'K,'V&gt;"/> (the retain
+    /// boundary, like <see cref="force"/>); the value is safe to retain.
+    /// </summary>
+    let toAVal (mapValue: IAdaptiveMap<'K, 'V>) : IAdaptiveValue<FrozenDictionary<'K, 'V>> =
+        AdaptiveNode<FrozenDictionary<'K, 'V>>(fun () -> mapValue.GetValue().ToFrozenDictionary())
+        :> IAdaptiveValue<FrozenDictionary<'K, 'V>>
 
     /// <summary>
     /// Returns a transient view of the current state. Valid only until the next

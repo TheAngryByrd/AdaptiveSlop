@@ -17,6 +17,7 @@
     <Compile Include="Collections/SetNodes.fs" />
     <Compile Include="Collections/MapNodes.fs" />
     <Compile Include="Collections/ObserveNodes.fs" />
+    <Compile Include="Collections/Reductions.fs" />
     <Compile Include="Collections/Api.fs" />
   </ItemGroup>
 
