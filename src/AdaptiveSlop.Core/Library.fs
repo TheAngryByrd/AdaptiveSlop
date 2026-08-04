@@ -307,6 +307,9 @@ type internal ParentEdges() =
 type internal GraphContext() =
     let mutable evaluationId = 0L
     let mutable evaluationDepth = 0
+    // Incremented on every applied write. Invalidates per-evaluation dirty caches
+    // when a write lands in the middle of an evaluation.
+    let mutable writeGeneration = 0L
     let collector = DependencyCollector()
     let mutable collectorActive = false
     let txBuffer = TransactionBuffer()
@@ -328,6 +331,7 @@ type internal GraphContext() =
     static member internal Default = defaultContext
 
     member internal _.EvaluationId = evaluationId
+    member internal _.WriteGeneration = writeGeneration
 
     /// Debug builds only: claim the graph for the current thread at the start of
     /// an operation. Throws when another thread is inside a graph operation.
@@ -398,6 +402,8 @@ type internal GraphContext() =
     /// Mark every parent in the edge list and propagate. Delivers queued
     /// notifications when no transaction is running.
     member internal this.MarkFrom(edges: ParentEdges) =
+        writeGeneration <- writeGeneration + 1L
+
         for i in 0 .. edges.Count - 1 do
             this.PushDirty(edges[i])
 
@@ -427,6 +433,7 @@ type internal GraphContext() =
 
 module internal AdaptiveRuntime =
     let internal getEvaluationId () = GraphContext.Default.EvaluationId
+    let internal getWriteGeneration () = GraphContext.Default.WriteGeneration
 
     let internal enterEvaluation () = GraphContext.Default.EnterEvaluation()
     let internal exitEvaluation () = GraphContext.Default.ExitEvaluation()
@@ -524,13 +531,15 @@ and AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
     let mutable dirtyState = DirtyState.MaybeDirty
     // Per-evaluation dirty cache to avoid O(depth^2) in deep chains
     let mutable lastCheckedEvalId = 0L
+    let mutable lastCheckedWriteGen = -1L
     let mutable dirtyCache = true
 
     /// Check if dirty, using per-evaluation cache to avoid redundant deep traversals
     member private this.IsDirty() =
         let evalId = AdaptiveRuntime.getEvaluationId ()
+        let writeGen = AdaptiveRuntime.getWriteGeneration ()
 
-        if lastCheckedEvalId = evalId then
+        if lastCheckedEvalId = evalId && lastCheckedWriteGen = writeGen then
             // Already checked in this evaluation, return cached result
             dirtyCache
         else
@@ -558,6 +567,7 @@ and AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
                     d
 
             lastCheckedEvalId <- evalId
+            lastCheckedWriteGen <- writeGen
             dirtyCache <- dirty
             dirty
 
@@ -662,6 +672,9 @@ and AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
         member this.MarkDirty() =
             if dirtyState <> DirtyState.Dirty then
                 dirtyState <- DirtyState.Dirty
+                // Invalidate the per-evaluation dirty cache: a mark can arrive in the
+                // middle of an evaluation (a write from user code inside a compute).
+                lastCheckedEvalId <- -1L
                 let ctx = GraphContext.Default
 
                 for i in 0 .. edges.Count - 1 do
@@ -758,6 +771,8 @@ and MapNNode<'T, 'U>(deps: IAdaptiveValue<'T>[], [<InlineIfLambda>] compute: 'T[
     let mutable version = 0L
     let mutable hasValue = false
     let mutable value = Unchecked.defaultof<'U>
+    // Node-owned buffer, reused across recomputes. The compute function must not retain it.
+    let values = Array.zeroCreate deps.Length
     let depVersions = Array.zeroCreate<int64> deps.Length
     // Position of this node in the parents array of each dependency. -1 = no edge.
     let depSlots = Array.create deps.Length -1
@@ -787,8 +802,6 @@ and MapNNode<'T, 'U>(deps: IAdaptiveValue<'T>[], [<InlineIfLambda>] compute: 'T[
             dirty
 
     member private this.Recompute() =
-        let values = Array.zeroCreate deps.Length
-
         for i in 0 .. deps.Length - 1 do
             values.[i] <- deps.[i].GetValue()
             depVersions.[i] <- (deps.[i] :> IAdaptiveObject).Version
@@ -1803,8 +1816,9 @@ module AVal =
     /// Memory usage is constant regardless of input count.
     /// </para>
     /// <para>
-    /// <strong>Note:</strong> The array passed to the compute function is freshly allocated on each recomputation.
-    /// If you only need a reduction (sum, min, max, etc.), prefer <see cref="reduce"/> for better performance.
+    /// <strong>Note:</strong> The array passed to the compute function is reused by the node and is valid only
+    /// during the call. Do not retain it. If you only need a reduction (sum, min, max, etc.), prefer
+    /// <see cref="reduce"/> for better performance.
     /// </para>
     /// </remarks>
     /// <example>

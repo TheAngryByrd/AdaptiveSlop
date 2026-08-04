@@ -1359,3 +1359,44 @@ let ``Transaction run returns the function result`` () =
             40 + 2)
 
     Assert.Equal(42, result)
+
+[<Fact>]
+let ``Writes during an evaluation are visible to re-reads in the same evaluation`` () =
+    let a = CVal.create 1
+    let m = AVal.map (fun v -> v + 1) (CVal.value a)
+
+    let trigger =
+        AVal.map
+            (fun s ->
+                if s > 100 then
+                    a.Set(0)
+
+                // Re-read m after the write, inside the same evaluation.
+                AVal.getValue m + s)
+            m
+
+    Assert.Equal(4, AVal.getValue trigger) // (1+1) + (1+1)
+
+    a.Set(101)
+
+    // m is 102 after the write; the re-read inside the same evaluation must see 1.
+    Assert.Equal(103, AVal.getValue trigger) // 102 + 1, not 102 + 102
+
+[<Fact>]
+let ``mapN recompute allocates zero bytes`` () =
+    let deps = Array.init 10 (fun _ -> CVal.create 1)
+
+    let node =
+        AVal.mapN (fun values -> values |> Array.fold (+) 0) (deps |> Array.map CVal.value)
+
+    deps[0].Set(2)
+    AVal.getValue node |> ignore // warm up: first recompute
+
+    let before = GC.GetAllocatedBytesForCurrentThread()
+
+    for i in 1..1000 do
+        deps[0].Set(i)
+        AVal.getValue node |> ignore
+
+    let allocated = GC.GetAllocatedBytesForCurrentThread() - before
+    Assert.Equal(0L, allocated)
