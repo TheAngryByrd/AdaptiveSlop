@@ -1,153 +1,59 @@
 namespace AdaptiveSlop.Core
 
 open System
-open System.Buffers
 open System.Collections.Generic
+open System.Collections.Frozen
 
 // =============================================================================
-// Constant adaptive collections
+// AdaptiveMap transform nodes (PLAN.md Section 6.9)
+//
+// Same journal/drain model as the set nodes. Registration happens through the
+// IMapSinkRegistry interface on every node type, so derived maps compose freely.
 // =============================================================================
 
-type ConstantMap<'K, 'V when 'K: comparison>(value: Map<'K, 'V>) =
+/// <summary>An adaptive map over a fixed, immutable value.</summary>
+type ConstantMap<'K, 'V when 'K: equality>(value: FrozenDictionary<'K, 'V>) =
     interface IAdaptiveMap<'K, 'V> with
         member this.GetValue() =
             AdaptiveRuntime.addDependency (this :> IAdaptiveObject) 0L
-            value
+            value :> IReadOnlyDictionary<'K, 'V>
 
         member _.Version = 0L
 
-// =============================================================================
-// AdaptiveMap transform nodes
-// =============================================================================
+    interface IDisposable with
+        member _.Dispose() = ()
 
-type MapMapNode<'K, 'V, 'U when 'K: comparison>
-    (source: IAdaptiveMap<'K, 'V>, [<InlineIfLambda>] mapping: 'K -> 'V -> 'U) as this =
-
-    let mutable version = 0L
-    let data = Dictionary<'K, 'U>()
-    let mutable snapshot = Map.empty<'K, 'U>
-    let mutable snapshotVersion = -1L
-    let mutable sinks: obj[] = Array.zeroCreate 4
-    let mutable sinkCount = 0
-    let mutable registered = false
+/// <summary>Maps every entry of a map.</summary>
+type MapMapNode<'K, 'V, 'U when 'K: equality>(source: IAdaptiveMap<'K, 'V>, [<InlineIfLambda>] mapping: 'K -> 'V -> 'U)
+    =
+    let mapOpt = fun k v -> ValueSome(mapping k v)
+    let mutable state = MapNodeState<'K, 'V, 'U>.Create(1)
     let mutable initialized = false
-
-    do this.Register()
-
-    member private this.DoInitialLoad() =
-        if not initialized then
-            initialized <- true
-            let sourceItems = source.GetValue()
-
-            for (KeyValue(k, v)) in sourceItems do
-                data[k] <- mapping k v
-
-            snapshot <- Map.ofSeq (data |> Seq.map (fun (KeyValue(k, v)) -> (k, v)))
-            snapshotVersion <- 0L
+    let mutable disposed = false
 
     member private this.Register() =
-        if not registered then
-            registered <- true
-
-            match box source with
-            | :? IMapSinkRegistry as r -> r.AddMapSink(box (this :> IMapDeltaSink<'K, 'V>))
-            | _ -> ()
+        match box source with
+        | :? IMapSinkRegistry as r -> r.AddMapSink(box (this :> IMapDeltaSink<'K, 'V>))
+        | _ -> ()
 
     member private this.Unregister() =
-        if registered then
-            registered <- false
+        match box source with
+        | :? IMapSinkRegistry as r -> r.RemoveMapSink(box (this :> IMapDeltaSink<'K, 'V>))
+        | _ -> ()
 
-            match box source with
-            | :? IMapSinkRegistry as r -> r.RemoveMapSink(box (this :> IMapDeltaSink<'K, 'V>))
-            | _ -> ()
-
-    member internal this.AddSink(sink: IMapDeltaSink<'K, 'U>) =
-        if sinkCount = sinks.Length then
-            let next = Array.zeroCreate (sinks.Length * 2)
-            Array.Copy(sinks, next, sinks.Length)
-            sinks <- next
-
-        sinks[sinkCount] <- box sink
-        sinkCount <- sinkCount + 1
-
-        if sinkCount = 1 then
+    member private this.EnsureInitialized() =
+        if not initialized then
+            initialized <- true
             this.Register()
-
-    member internal this.RemoveSink(sink: IMapDeltaSink<'K, 'U>) =
-        let mutable becameZero = false
-        let mutable found = -1
-        let mutable i = 0
-
-        while found < 0 && i < sinkCount do
-            if obj.ReferenceEquals(sinks[i], box sink) then
-                found <- i
-            else
-                i <- i + 1
-
-        if found >= 0 then
-            sinkCount <- sinkCount - 1
-
-            for j in found .. sinkCount - 1 do
-                sinks[j] <- sinks[j + 1]
-
-            sinks[sinkCount] <- null
-            becameZero <- sinkCount = 0
-
-        if becameZero then
-            this.Unregister()
-
-    member private this.FlushDeltas(ver: int64, sets: struct ('K * 'U)[], setCnt: int, rems: 'K[], remCnt: int) =
-        if setCnt > 0 || remCnt > 0 then
-            let sinksSnapshot =
-                if sinkCount = 0 then
-                    [||]
-                else
-                    let arr = Array.zeroCreate sinkCount
-                    Array.Copy(sinks, arr, sinkCount)
-                    arr
-
-            for i in 0 .. sinksSnapshot.Length - 1 do
-                (unbox<IMapDeltaSink<'K, 'U>> sinksSnapshot[i]).OnDeltas(ver, sets, setCnt, rems, remCnt)
+            Collections.loadMap mapOpt source &state
+            state.DepVersions[0] <- source.Version
 
     interface IMapDeltaSink<'K, 'V> with
-        member this.OnDeltas(ver, sets, setCnt, rems, remCnt) =
-            let ownSets =
-                if setCnt > 0 then
-                    ArrayPool<struct ('K * 'U)>.Shared.Rent setCnt
-                else
-                    ArrayPool<struct ('K * 'U)>.Shared.Rent 1
-
-            let ownRems =
-                if remCnt > 0 then
-                    ArrayPool<'K>.Shared.Rent remCnt
-                else
-                    ArrayPool<'K>.Shared.Rent 1
-
-            let mutable ownSetCnt = 0
-            let mutable ownRemCnt = 0
-
-            for i in 0 .. remCnt - 1 do
-                let k = rems[i]
-
-                if data.Remove k then
-                    snapshot <- Map.remove k snapshot
-                    ownRems[ownRemCnt] <- k
-                    ownRemCnt <- ownRemCnt + 1
-
-            for i in 0 .. setCnt - 1 do
-                let struct (k, v) = sets[i]
-                let u = mapping k v
-                data[k] <- u
-                snapshot <- Map.add k u snapshot
-                ownSets[ownSetCnt] <- struct (k, u)
-                ownSetCnt <- ownSetCnt + 1
-
-            version <- ver
-            snapshotVersion <- ver
-
-            this.FlushDeltas(ver, ownSets, ownSetCnt, ownRems, ownRemCnt)
-            ArrayPool<struct ('K * 'U)>.Shared.Return(ownSets, true)
-            ArrayPool<'K>.Shared.Return(ownRems, true)
+        member this.OnDeltas(sets: struct ('K * 'V)[], setCnt: int, rems: 'K[], remCnt: int) =
+            if not disposed then
+                Collections.journalAppendMap &state.Journal sets setCnt rems remCnt
+                state.Version <- state.Version + 1L
+                GraphContext.Default.MarkFrom(state.Edges)
 
     interface IAdaptiveMap<'K, 'U> with
         member this.GetValue() =
@@ -155,160 +61,74 @@ type MapMapNode<'K, 'V, 'U when 'K: comparison>
             ctx.ClaimOwner()
 
             try
-                this.DoInitialLoad()
-                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
-                snapshot
+                if disposed then
+                    invalidOp "This adaptive map has been disposed."
+
+                this.EnsureInitialized()
+
+                if source.Version <> state.DepVersions[0] then
+                    source.GetValue() |> ignore
+                    state.DepVersions[0] <- source.Version
+
+                if not state.Journal.IsEmpty then
+                    Collections.drainMapPush mapOpt &state
+
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) state.Version
+                state.Data :> IReadOnlyDictionary<'K, 'U>
             finally
                 ctx.ReleaseOwner()
 
-        member _.Version = version
+        member _.Version = state.Version
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                this.Unregister()
+                Collections.clearSinks &state.Sinks
 
     interface IMapSinkRegistry with
-        member this.AddMapSink(sink) =
-            this.AddSink(unbox<IMapDeltaSink<'K, 'U>> sink)
+        member this.AddMapSink(sink) = Collections.addSink &state.Sinks sink
 
         member this.RemoveMapSink(sink) =
-            this.RemoveSink(unbox<IMapDeltaSink<'K, 'U>> sink)
+            Collections.removeSink &state.Sinks sink
 
+    interface IEdgeTarget with
+        member _.EdgeCount = state.Edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
 
-type FilterMapNode<'K, 'V when 'K: comparison>
-    (source: IAdaptiveMap<'K, 'V>, [<InlineIfLambda>] predicate: 'K -> 'V -> bool) as this =
-
-    let mutable version = 0L
-    let data = Dictionary<'K, 'V>()
-    let mutable snapshot = Map.empty<'K, 'V>
-    let mutable snapshotVersion = -1L
-    let mutable sinks: obj[] = Array.zeroCreate 4
-    let mutable sinkCount = 0
-    let mutable registered = false
+/// <summary>Keeps the entries of a map that satisfy a predicate.</summary>
+type FilterMapNode<'K, 'V when 'K: equality>
+    (source: IAdaptiveMap<'K, 'V>, [<InlineIfLambda>] predicate: 'K -> 'V -> bool) =
+    let mapOpt = fun k v -> if predicate k v then ValueSome v else ValueNone
+    let mutable state = MapNodeState<'K, 'V, 'V>.Create(1)
     let mutable initialized = false
-
-    do this.Register()
-
-    member private this.DoInitialLoad() =
-        if not initialized then
-            initialized <- true
-            let sourceItems = source.GetValue()
-
-            for (KeyValue(k, v)) in sourceItems do
-                if predicate k v then
-                    data[k] <- v
-
-            snapshot <- Map.ofSeq (data |> Seq.map (fun (KeyValue(k, v)) -> (k, v)))
-            snapshotVersion <- 0L
+    let mutable disposed = false
 
     member private this.Register() =
-        if not registered then
-            registered <- true
-
-            match source with
-            | :? ChangeableMap<'K, 'V> as cm -> cm.AddSink(this :> IMapDeltaSink<'K, 'V>)
-            | :? MapMapNode<'K, 'V, 'V> as mn -> mn.AddSink(this :> IMapDeltaSink<'K, 'V>)
-            | :? FilterMapNode<'K, 'V> as fn -> fn.AddSink(this :> IMapDeltaSink<'K, 'V>)
-            | _ -> ()
+        match box source with
+        | :? IMapSinkRegistry as r -> r.AddMapSink(box (this :> IMapDeltaSink<'K, 'V>))
+        | _ -> ()
 
     member private this.Unregister() =
-        if registered then
-            registered <- false
+        match box source with
+        | :? IMapSinkRegistry as r -> r.RemoveMapSink(box (this :> IMapDeltaSink<'K, 'V>))
+        | _ -> ()
 
-            match source with
-            | :? ChangeableMap<'K, 'V> as cm -> cm.RemoveSink(this :> IMapDeltaSink<'K, 'V>)
-            | :? MapMapNode<'K, 'V, 'V> as mn -> mn.RemoveSink(this :> IMapDeltaSink<'K, 'V>)
-            | :? FilterMapNode<'K, 'V> as fn -> fn.RemoveSink(this :> IMapDeltaSink<'K, 'V>)
-            | _ -> ()
-
-    member internal this.AddSink(sink: IMapDeltaSink<'K, 'V>) =
-        if sinkCount = sinks.Length then
-            let next = Array.zeroCreate (sinks.Length * 2)
-            Array.Copy(sinks, next, sinks.Length)
-            sinks <- next
-
-        sinks[sinkCount] <- box sink
-        sinkCount <- sinkCount + 1
-
-        if sinkCount = 1 then
+    member private this.EnsureInitialized() =
+        if not initialized then
+            initialized <- true
             this.Register()
-
-    member internal this.RemoveSink(sink: IMapDeltaSink<'K, 'V>) =
-        let mutable becameZero = false
-        let mutable found = -1
-        let mutable i = 0
-
-        while found < 0 && i < sinkCount do
-            if obj.ReferenceEquals(sinks[i], box sink) then
-                found <- i
-            else
-                i <- i + 1
-
-        if found >= 0 then
-            sinkCount <- sinkCount - 1
-
-            for j in found .. sinkCount - 1 do
-                sinks[j] <- sinks[j + 1]
-
-            sinks[sinkCount] <- null
-            becameZero <- sinkCount = 0
-
-        if becameZero then
-            this.Unregister()
-
-    member private this.FlushDeltas(ver: int64, sets: struct ('K * 'V)[], setCnt: int, rems: 'K[], remCnt: int) =
-        if setCnt > 0 || remCnt > 0 then
-            let sinksSnapshot =
-                if sinkCount = 0 then
-                    [||]
-                else
-                    let arr = Array.zeroCreate sinkCount
-                    Array.Copy(sinks, arr, sinkCount)
-                    arr
-
-            for i in 0 .. sinksSnapshot.Length - 1 do
-                (unbox<IMapDeltaSink<'K, 'V>> sinksSnapshot[i]).OnDeltas(ver, sets, setCnt, rems, remCnt)
+            Collections.loadMap mapOpt source &state
+            state.DepVersions[0] <- source.Version
 
     interface IMapDeltaSink<'K, 'V> with
-        member this.OnDeltas(ver, sets, setCnt, rems, remCnt) =
-            let ownSets =
-                if setCnt > 0 then
-                    ArrayPool<struct ('K * 'V)>.Shared.Rent setCnt
-                else
-                    ArrayPool<struct ('K * 'V)>.Shared.Rent 1
-
-            let ownRems =
-                if remCnt > 0 then
-                    ArrayPool<'K>.Shared.Rent remCnt
-                else
-                    ArrayPool<'K>.Shared.Rent 1
-
-            let mutable ownSetCnt = 0
-            let mutable ownRemCnt = 0
-
-            for i in 0 .. remCnt - 1 do
-                let k = rems[i]
-
-                if data.Remove k then
-                    snapshot <- Map.remove k snapshot
-                    ownRems[ownRemCnt] <- k
-                    ownRemCnt <- ownRemCnt + 1
-
-            for i in 0 .. setCnt - 1 do
-                let struct (k, v) = sets[i]
-
-                if predicate k v then
-                    data[k] <- v
-                    snapshot <- Map.add k v snapshot
-                    ownSets[ownSetCnt] <- struct (k, v)
-                    ownSetCnt <- ownSetCnt + 1
-                elif data.Remove k then
-                    snapshot <- Map.remove k snapshot
-                    ownRems[ownRemCnt] <- k
-                    ownRemCnt <- ownRemCnt + 1
-
-            version <- ver
-            snapshotVersion <- ver
-
-            this.FlushDeltas(ver, ownSets, ownSetCnt, ownRems, ownRemCnt)
-            ArrayPool<struct ('K * 'V)>.Shared.Return(ownSets, true)
-            ArrayPool<'K>.Shared.Return(ownRems, true)
+        member this.OnDeltas(sets: struct ('K * 'V)[], setCnt: int, rems: 'K[], remCnt: int) =
+            if not disposed then
+                Collections.journalAppendMap &state.Journal sets setCnt rems remCnt
+                state.Version <- state.Version + 1L
+                GraphContext.Default.MarkFrom(state.Edges)
 
     interface IAdaptiveMap<'K, 'V> with
         member this.GetValue() =
@@ -316,10 +136,39 @@ type FilterMapNode<'K, 'V when 'K: comparison>
             ctx.ClaimOwner()
 
             try
-                this.DoInitialLoad()
-                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
-                snapshot
+                if disposed then
+                    invalidOp "This adaptive map has been disposed."
+
+                this.EnsureInitialized()
+
+                if source.Version <> state.DepVersions[0] then
+                    source.GetValue() |> ignore
+                    state.DepVersions[0] <- source.Version
+
+                if not state.Journal.IsEmpty then
+                    Collections.drainMapPush mapOpt &state
+
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) state.Version
+                state.Data :> IReadOnlyDictionary<'K, 'V>
             finally
                 ctx.ReleaseOwner()
 
-        member _.Version = version
+        member _.Version = state.Version
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                this.Unregister()
+                Collections.clearSinks &state.Sinks
+
+    interface IMapSinkRegistry with
+        member this.AddMapSink(sink) = Collections.addSink &state.Sinks sink
+
+        member this.RemoveMapSink(sink) =
+            Collections.removeSink &state.Sinks sink
+
+    interface IEdgeTarget with
+        member _.EdgeCount = state.Edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)

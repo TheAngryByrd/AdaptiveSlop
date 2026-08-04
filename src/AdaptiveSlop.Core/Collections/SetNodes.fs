@@ -1,171 +1,61 @@
 namespace AdaptiveSlop.Core
 
 open System
-open System.Buffers
 open System.Collections.Generic
+open System.Collections.Frozen
 
 // =============================================================================
-// Constant adaptive collections
+// AdaptiveSet transform nodes (PLAN.md Section 6.9)
+//
+// A derived node registers with its dependencies on first read. A dependency
+// push appends to the journal, advances the version, and marks the scalar
+// parents. Reads cascade over changed dependencies, drain the journal, and
+// return a transient view of the internal state. `force` materializes a
+// FrozenSet. Disposal unregisters and stops all delta processing.
 // =============================================================================
 
-type ConstantSet<'T when 'T: comparison>(value: Set<'T>) =
+/// <summary>An adaptive set over a fixed, immutable value.</summary>
+type ConstantSet<'T>(value: FrozenSet<'T>) =
     interface IAdaptiveSet<'T> with
         member this.GetValue() =
             AdaptiveRuntime.addDependency (this :> IAdaptiveObject) 0L
-            value
+            value :> IReadOnlySet<'T>
 
         member _.Version = 0L
 
-// =============================================================================
-// AdaptiveSet transform nodes
-// =============================================================================
+    interface IDisposable with
+        member _.Dispose() = ()
 
-type MapSetNode<'T, 'U when 'T: comparison and 'U: comparison>
-    (source: IAdaptiveSet<'T>, [<InlineIfLambda>] mapping: 'T -> 'U) as this =
-
-    let mutable version = 0L
-    let data = HashSet<'U>()
-    let refcounts = Dictionary<'U, int>()
-    let mutable snapshot = Set.empty<'U>
-    let mutable snapshotVersion = -1L
-    let mutable sinks: obj[] = Array.zeroCreate 4
-    let mutable sinkCount = 0
-    let mutable registered = false
+/// <summary>Maps every element of a set. Duplicate outputs share one reference count.</summary>
+type MapSetNode<'T, 'U when 'U: equality>(source: IAdaptiveSet<'T>, [<InlineIfLambda>] mapping: 'T -> 'U) =
+    let mapOpt = fun x -> ValueSome(mapping x)
+    let mutable state = SetNodeState<'T, 'U>.Create(1)
     let mutable initialized = false
-
-    do this.Register()
-
-    member private this.DoInitialLoad() =
-        if not initialized then
-            initialized <- true
-            let sourceItems = source.GetValue()
-
-            for item in sourceItems do
-                let y = mapping item
-                data.Add y |> ignore
-
-                match refcounts.TryGetValue y with
-                | true, n -> refcounts[y] <- n + 1
-                | _ -> refcounts[y] <- 1
-
-            snapshot <- Set.ofSeq data
-            snapshotVersion <- 0L
+    let mutable disposed = false
 
     member private this.Register() =
-        if not registered then
-            registered <- true
-
-            match box source with
-            | :? ISetSinkRegistry as r -> r.AddSetSink(box (this :> ISetDeltaSink<'T>))
-            | _ -> ()
+        match box source with
+        | :? ISetSinkRegistry as r -> r.AddSetSink(box (this :> ISetDeltaSink<'T>))
+        | _ -> ()
 
     member private this.Unregister() =
-        if registered then
-            registered <- false
+        match box source with
+        | :? ISetSinkRegistry as r -> r.RemoveSetSink(box (this :> ISetDeltaSink<'T>))
+        | _ -> ()
 
-            match box source with
-            | :? ISetSinkRegistry as r -> r.RemoveSetSink(box (this :> ISetDeltaSink<'T>))
-            | _ -> ()
-
-    member internal this.AddSink(sink: ISetDeltaSink<'U>) =
-        if sinkCount = sinks.Length then
-            let next = Array.zeroCreate (sinks.Length * 2)
-            Array.Copy(sinks, next, sinks.Length)
-            sinks <- next
-
-        sinks[sinkCount] <- box sink
-        sinkCount <- sinkCount + 1
-
-        if sinkCount = 1 then
+    member private this.EnsureInitialized() =
+        if not initialized then
+            initialized <- true
             this.Register()
-
-    member internal this.RemoveSink(sink: ISetDeltaSink<'U>) =
-        let mutable becameZero = false
-        let mutable found = -1
-        let mutable i = 0
-
-        while found < 0 && i < sinkCount do
-            if obj.ReferenceEquals(sinks[i], box sink) then
-                found <- i
-            else
-                i <- i + 1
-
-        if found >= 0 then
-            sinkCount <- sinkCount - 1
-
-            for j in found .. sinkCount - 1 do
-                sinks[j] <- sinks[j + 1]
-
-            sinks[sinkCount] <- null
-            becameZero <- sinkCount = 0
-
-        if becameZero then
-            this.Unregister()
-
-    member private this.FlushDeltas(ver: int64, adds: 'U[], addCnt: int, rems: 'U[], remCnt: int) =
-        if addCnt > 0 || remCnt > 0 then
-            let sinksSnapshot =
-                if sinkCount = 0 then
-                    [||]
-                else
-                    let arr = Array.zeroCreate sinkCount
-                    Array.Copy(sinks, arr, sinkCount)
-                    arr
-
-            for i in 0 .. sinksSnapshot.Length - 1 do
-                (unbox<ISetDeltaSink<'U>> sinksSnapshot[i]).OnDeltas(ver, adds, addCnt, rems, remCnt)
+            Collections.loadRefSet mapOpt source &state
+            state.DepVersions[0] <- source.Version
 
     interface ISetDeltaSink<'T> with
-        member this.OnDeltas(ver, adds, addCnt, rems, remCnt) =
-            let ownAdds =
-                if addCnt > 0 then
-                    ArrayPool<'U>.Shared.Rent addCnt
-                else
-                    ArrayPool<'U>.Shared.Rent 1
-
-            let ownRems =
-                if remCnt > 0 then
-                    ArrayPool<'U>.Shared.Rent remCnt
-                else
-                    ArrayPool<'U>.Shared.Rent 1
-
-            let mutable ownAddCnt = 0
-            let mutable ownRemCnt = 0
-
-            for i in 0 .. remCnt - 1 do
-                let y = mapping rems[i]
-
-                match refcounts.TryGetValue y with
-                | true, 1 ->
-                    refcounts.Remove y |> ignore
-                    data.Remove y |> ignore
-                    snapshot <- Set.remove y snapshot
-                    ownRems[ownRemCnt] <- y
-                    ownRemCnt <- ownRemCnt + 1
-                | true, n -> refcounts[y] <- n - 1
-                | _ -> ()
-
-            for i in 0 .. addCnt - 1 do
-                let y = mapping adds[i]
-
-                match refcounts.TryGetValue y with
-                | true, n ->
-                    refcounts[y] <- n + 1
-                    ownAdds[ownAddCnt] <- y
-                    ownAddCnt <- ownAddCnt + 1
-                | _ ->
-                    refcounts[y] <- 1
-                    data.Add y |> ignore
-                    snapshot <- Set.add y snapshot
-                    ownAdds[ownAddCnt] <- y
-                    ownAddCnt <- ownAddCnt + 1
-
-            version <- ver
-            snapshotVersion <- ver
-
-            this.FlushDeltas(ver, ownAdds, ownAddCnt, ownRems, ownRemCnt)
-            ArrayPool<'U>.Shared.Return(ownAdds, true)
-            ArrayPool<'U>.Shared.Return(ownRems, true)
+        member this.OnDeltas(adds: 'T[], addCnt: int, rems: 'T[], remCnt: int) =
+            if not disposed then
+                Collections.journalAppendSet &state.Journal adds addCnt rems remCnt
+                state.Version <- state.Version + 1L
+                GraphContext.Default.MarkFrom(state.Edges)
 
     interface IAdaptiveSet<'U> with
         member this.GetValue() =
@@ -173,168 +63,73 @@ type MapSetNode<'T, 'U when 'T: comparison and 'U: comparison>
             ctx.ClaimOwner()
 
             try
-                this.DoInitialLoad()
-                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
-                snapshot
+                if disposed then
+                    invalidOp "This adaptive set has been disposed."
+
+                this.EnsureInitialized()
+
+                if source.Version <> state.DepVersions[0] then
+                    source.GetValue() |> ignore
+                    state.DepVersions[0] <- source.Version
+
+                if not state.Journal.IsEmpty then
+                    Collections.drainSetPush mapOpt &state
+
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) state.Version
+                state.Set.Data :> IReadOnlySet<'U>
             finally
                 ctx.ReleaseOwner()
 
-        member _.Version = version
+        member _.Version = state.Version
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                this.Unregister()
+                Collections.clearSinks &state.Sinks
 
     interface ISetSinkRegistry with
-        member this.AddSetSink(sink) =
-            this.AddSink(unbox<ISetDeltaSink<'U>> sink)
+        member this.AddSetSink(sink) = Collections.addSink &state.Sinks sink
 
         member this.RemoveSetSink(sink) =
-            this.RemoveSink(unbox<ISetDeltaSink<'U>> sink)
+            Collections.removeSink &state.Sinks sink
 
+    interface IEdgeTarget with
+        member _.EdgeCount = state.Edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
 
-type FilterSetNode<'T when 'T: comparison>(source: IAdaptiveSet<'T>, [<InlineIfLambda>] predicate: 'T -> bool) as this =
-
-    let mutable version = 0L
-    let data = HashSet<'T>()
-    let refcounts = Dictionary<'T, int>()
-    let mutable snapshot = Set.empty<'T>
-    let mutable snapshotVersion = -1L
-    let mutable sinks: obj[] = Array.zeroCreate 4
-    let mutable sinkCount = 0
-    let mutable registered = false
+/// <summary>Keeps the elements of a set that satisfy a predicate.</summary>
+type FilterSetNode<'T when 'T: equality>(source: IAdaptiveSet<'T>, [<InlineIfLambda>] predicate: 'T -> bool) =
+    let mapOpt = fun x -> if predicate x then ValueSome x else ValueNone
+    let mutable state = SetNodeState<'T, 'T>.Create(1)
     let mutable initialized = false
-
-    do this.Register()
-
-    member private this.DoInitialLoad() =
-        if not initialized then
-            initialized <- true
-            let sourceItems = source.GetValue()
-
-            for item in sourceItems do
-                if predicate item then
-                    data.Add item |> ignore
-
-                    match refcounts.TryGetValue item with
-                    | true, n -> refcounts[item] <- n + 1
-                    | _ -> refcounts[item] <- 1
-
-            snapshot <- Set.ofSeq data
-            snapshotVersion <- 0L
+    let mutable disposed = false
 
     member private this.Register() =
-        if not registered then
-            registered <- true
-
-            match box source with
-            | :? ISetSinkRegistry as r -> r.AddSetSink(box (this :> ISetDeltaSink<'T>))
-            | _ -> ()
+        match box source with
+        | :? ISetSinkRegistry as r -> r.AddSetSink(box (this :> ISetDeltaSink<'T>))
+        | _ -> ()
 
     member private this.Unregister() =
-        if registered then
-            registered <- false
+        match box source with
+        | :? ISetSinkRegistry as r -> r.RemoveSetSink(box (this :> ISetDeltaSink<'T>))
+        | _ -> ()
 
-            match box source with
-            | :? ISetSinkRegistry as r -> r.RemoveSetSink(box (this :> ISetDeltaSink<'T>))
-            | _ -> ()
-
-    member internal this.AddSink(sink: ISetDeltaSink<'T>) =
-        if sinkCount = sinks.Length then
-            let next = Array.zeroCreate (sinks.Length * 2)
-            Array.Copy(sinks, next, sinks.Length)
-            sinks <- next
-
-        sinks[sinkCount] <- box sink
-        sinkCount <- sinkCount + 1
-
-        if sinkCount = 1 then
+    member private this.EnsureInitialized() =
+        if not initialized then
+            initialized <- true
             this.Register()
-
-    member internal this.RemoveSink(sink: ISetDeltaSink<'T>) =
-        let mutable becameZero = false
-        let mutable found = -1
-        let mutable i = 0
-
-        while found < 0 && i < sinkCount do
-            if obj.ReferenceEquals(sinks[i], box sink) then
-                found <- i
-            else
-                i <- i + 1
-
-        if found >= 0 then
-            sinkCount <- sinkCount - 1
-
-            for j in found .. sinkCount - 1 do
-                sinks[j] <- sinks[j + 1]
-
-            sinks[sinkCount] <- null
-            becameZero <- sinkCount = 0
-
-        if becameZero then
-            this.Unregister()
-
-    member private this.FlushDeltas(ver: int64, adds: 'T[], addCnt: int, rems: 'T[], remCnt: int) =
-        if addCnt > 0 || remCnt > 0 then
-            let sinksSnapshot =
-                if sinkCount = 0 then
-                    [||]
-                else
-                    let arr = Array.zeroCreate sinkCount
-                    Array.Copy(sinks, arr, sinkCount)
-                    arr
-
-            for i in 0 .. sinksSnapshot.Length - 1 do
-                (unbox<ISetDeltaSink<'T>> sinksSnapshot[i]).OnDeltas(ver, adds, addCnt, rems, remCnt)
+            Collections.loadPlainSet mapOpt source &state
+            state.DepVersions[0] <- source.Version
 
     interface ISetDeltaSink<'T> with
-        member this.OnDeltas(ver, adds, addCnt, rems, remCnt) =
-            let ownAdds =
-                if addCnt > 0 then
-                    ArrayPool<'T>.Shared.Rent addCnt
-                else
-                    ArrayPool<'T>.Shared.Rent 1
-
-            let ownRems =
-                if remCnt > 0 then
-                    ArrayPool<'T>.Shared.Rent remCnt
-                else
-                    ArrayPool<'T>.Shared.Rent 1
-
-            let mutable ownAddCnt = 0
-            let mutable ownRemCnt = 0
-
-            for i in 0 .. remCnt - 1 do
-                let x = rems[i]
-
-                match refcounts.TryGetValue x with
-                | true, 1 ->
-                    refcounts.Remove x |> ignore
-                    data.Remove x |> ignore
-                    snapshot <- Set.remove x snapshot
-                    ownRems[ownRemCnt] <- x
-                    ownRemCnt <- ownRemCnt + 1
-                | true, n -> refcounts[x] <- n - 1
-                | _ -> ()
-
-            for i in 0 .. addCnt - 1 do
-                let x = adds[i]
-
-                if predicate x then
-                    match refcounts.TryGetValue x with
-                    | true, n ->
-                        refcounts[x] <- n + 1
-                        ownAdds[ownAddCnt] <- x
-                        ownAddCnt <- ownAddCnt + 1
-                    | _ ->
-                        refcounts[x] <- 1
-                        data.Add x |> ignore
-                        snapshot <- Set.add x snapshot
-                        ownAdds[ownAddCnt] <- x
-                        ownAddCnt <- ownAddCnt + 1
-
-            version <- ver
-            snapshotVersion <- ver
-
-            this.FlushDeltas(ver, ownAdds, ownAddCnt, ownRems, ownRemCnt)
-            ArrayPool<'T>.Shared.Return(ownAdds, true)
-            ArrayPool<'T>.Shared.Return(ownRems, true)
+        member this.OnDeltas(adds: 'T[], addCnt: int, rems: 'T[], remCnt: int) =
+            if not disposed then
+                Collections.journalAppendSet &state.Journal adds addCnt rems remCnt
+                state.Version <- state.Version + 1L
+                GraphContext.Default.MarkFrom(state.Edges)
 
     interface IAdaptiveSet<'T> with
         member this.GetValue() =
@@ -342,64 +137,50 @@ type FilterSetNode<'T when 'T: comparison>(source: IAdaptiveSet<'T>, [<InlineIfL
             ctx.ClaimOwner()
 
             try
-                this.DoInitialLoad()
-                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
-                snapshot
+                if disposed then
+                    invalidOp "This adaptive set has been disposed."
+
+                this.EnsureInitialized()
+
+                if source.Version <> state.DepVersions[0] then
+                    source.GetValue() |> ignore
+                    state.DepVersions[0] <- source.Version
+
+                if not state.Journal.IsEmpty then
+                    Collections.drainPlainSetPush mapOpt &state
+
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) state.Version
+                state.Set.Data :> IReadOnlySet<'T>
             finally
                 ctx.ReleaseOwner()
 
-        member _.Version = version
+        member _.Version = state.Version
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                this.Unregister()
+                Collections.clearSinks &state.Sinks
 
     interface ISetSinkRegistry with
-        member this.AddSetSink(sink) =
-            this.AddSink(unbox<ISetDeltaSink<'T>> sink)
+        member this.AddSetSink(sink) = Collections.addSink &state.Sinks sink
 
         member this.RemoveSetSink(sink) =
-            this.RemoveSink(unbox<ISetDeltaSink<'T>> sink)
+            Collections.removeSink &state.Sinks sink
 
+    interface IEdgeTarget with
+        member _.EdgeCount = state.Edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
 
-type UnionSetNode<'T when 'T: comparison>(left: IAdaptiveSet<'T>, right: IAdaptiveSet<'T>) as this =
-
-    let mutable version = 0L
-    let data = HashSet<'T>()
-    let refcounts = Dictionary<'T, int>()
-    let mutable snapshot = Set.empty<'T>
-    let mutable snapshotVersion = -1L
-    let mutable sinks: obj[] = Array.zeroCreate 4
-    let mutable sinkCount = 0
-    let mutable regLeft = false
-    let mutable regRight = false
+/// <summary>The union of two sets. One reference count per element across both sides.</summary>
+type UnionSetNode<'T when 'T: equality>(left: IAdaptiveSet<'T>, right: IAdaptiveSet<'T>) =
+    let identity = fun x -> ValueSome x
+    let deps = [| left; right |]
+    let mutable state = SetNodeState<'T, 'T>.Create(2)
     let mutable initialized = false
-
-    do
-        regLeft <- true
-        regRight <- true
-        this.RegisterSide left
-        this.RegisterSide right
-
-    member private this.DoInitialLoad() =
-        if not initialized then
-            initialized <- true
-
-            let addItem (x: 'T) =
-                data.Add x |> ignore
-
-                match refcounts.TryGetValue x with
-                | true, n -> refcounts[x] <- n + 1
-                | _ -> refcounts[x] <- 1
-
-            let leftItems = left.GetValue()
-
-            for item in leftItems do
-                addItem item
-
-            let rightItems = right.GetValue()
-
-            for item in rightItems do
-                addItem item
-
-            snapshot <- Set.ofSeq data
-            snapshotVersion <- 0L
+    let mutable disposed = false
 
     member private this.RegisterSide(s: IAdaptiveSet<'T>) =
         match box s with
@@ -411,121 +192,22 @@ type UnionSetNode<'T when 'T: comparison>(left: IAdaptiveSet<'T>, right: IAdapti
         | :? ISetSinkRegistry as r -> r.RemoveSetSink(box (this :> ISetDeltaSink<'T>))
         | _ -> ()
 
-    member internal this.AddSink(sink: ISetDeltaSink<'T>) =
-        if sinkCount = sinks.Length then
-            let next = Array.zeroCreate (sinks.Length * 2)
-            Array.Copy(sinks, next, sinks.Length)
-            sinks <- next
-
-        sinks[sinkCount] <- box sink
-        sinkCount <- sinkCount + 1
-
-        if sinkCount = 1 then
-            regLeft <- true
-            regRight <- true
-
-        if sinkCount = 1 then
+    member private this.EnsureInitialized() =
+        if not initialized then
+            initialized <- true
             this.RegisterSide left
             this.RegisterSide right
-
-    member internal this.RemoveSink(sink: ISetDeltaSink<'T>) =
-        let mutable becameZero = false
-        let mutable found = -1
-        let mutable i = 0
-
-        while found < 0 && i < sinkCount do
-            if obj.ReferenceEquals(sinks[i], box sink) then
-                found <- i
-            else
-                i <- i + 1
-
-        if found >= 0 then
-            sinkCount <- sinkCount - 1
-
-            for j in found .. sinkCount - 1 do
-                sinks[j] <- sinks[j + 1]
-
-            sinks[sinkCount] <- null
-            becameZero <- sinkCount = 0
-
-        if becameZero then
-            this.UnregisterSide left
-            this.UnregisterSide right
-
-    member private this.FlushDeltas(ver: int64, adds: 'T[], addCnt: int, rems: 'T[], remCnt: int) =
-        if addCnt > 0 || remCnt > 0 then
-            let sinksSnapshot =
-                if sinkCount = 0 then
-                    [||]
-                else
-                    let arr = Array.zeroCreate sinkCount
-                    Array.Copy(sinks, arr, sinkCount)
-                    arr
-
-            for i in 0 .. sinksSnapshot.Length - 1 do
-                (unbox<ISetDeltaSink<'T>> sinksSnapshot[i]).OnDeltas(ver, adds, addCnt, rems, remCnt)
-
-    member private this.ProcessDeltas(adds: 'T[], addCnt: int, rems: 'T[], remCnt: int) =
-        if addCnt = 0 && remCnt = 0 then
-            ()
-        else
-
-            let ownAdds =
-                if addCnt > 0 then
-                    ArrayPool<'T>.Shared.Rent addCnt
-                else
-                    ArrayPool<'T>.Shared.Rent 1
-
-            let ownRems =
-                if remCnt > 0 then
-                    ArrayPool<'T>.Shared.Rent remCnt
-                else
-                    ArrayPool<'T>.Shared.Rent 1
-
-            let mutable ownAddCnt = 0
-            let mutable ownRemCnt = 0
-
-            for i in 0 .. remCnt - 1 do
-                let x = rems[i]
-
-                match refcounts.TryGetValue x with
-                | true, 1 ->
-                    refcounts.Remove x |> ignore
-                    data.Remove x |> ignore
-                    snapshot <- Set.remove x snapshot
-                    ownRems[ownRemCnt] <- x
-                    ownRemCnt <- ownRemCnt + 1
-                | true, n -> refcounts[x] <- n - 1
-                | _ -> ()
-
-            for i in 0 .. addCnt - 1 do
-                let x = adds[i]
-
-                match refcounts.TryGetValue x with
-                | true, n -> refcounts[x] <- n + 1
-                | _ ->
-                    refcounts[x] <- 1
-                    data.Add x |> ignore
-                    snapshot <- Set.add x snapshot
-                    ownAdds[ownAddCnt] <- x
-                    ownAddCnt <- ownAddCnt + 1
-
-            snapshotVersion <- version
-
-            if ownAddCnt > 0 || ownRemCnt > 0 then
-                this.FlushDeltas(version, ownAdds, ownAddCnt, ownRems, ownRemCnt)
-
-            ArrayPool<'T>.Shared.Return(ownAdds, true)
-            ArrayPool<'T>.Shared.Return(ownRems, true)
+            Collections.loadRefSet identity left &state
+            Collections.loadRefSet identity right &state
+            state.DepVersions[0] <- left.Version
+            state.DepVersions[1] <- right.Version
 
     interface ISetDeltaSink<'T> with
-        member this.OnDeltas(ver, adds, addCnt, rems, remCnt) =
-            version <- ver
-            this.ProcessDeltas(adds, addCnt, rems, remCnt)
-
-    member this.OnRightDeltas(ver, adds, addCnt, rems, remCnt) =
-        version <- ver
-        this.ProcessDeltas(adds, addCnt, rems, remCnt)
+        member this.OnDeltas(adds: 'T[], addCnt: int, rems: 'T[], remCnt: int) =
+            if not disposed then
+                Collections.journalAppendSet &state.Journal adds addCnt rems remCnt
+                state.Version <- state.Version + 1L
+                GraphContext.Default.MarkFrom(state.Edges)
 
     interface IAdaptiveSet<'T> with
         member this.GetValue() =
@@ -533,17 +215,41 @@ type UnionSetNode<'T when 'T: comparison>(left: IAdaptiveSet<'T>, right: IAdapti
             ctx.ClaimOwner()
 
             try
-                this.DoInitialLoad()
-                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
-                snapshot
+                if disposed then
+                    invalidOp "This adaptive set has been disposed."
+
+                this.EnsureInitialized()
+
+                for j in 0..1 do
+                    if deps[j].Version <> state.DepVersions[j] then
+                        deps[j].GetValue() |> ignore
+                        state.DepVersions[j] <- deps[j].Version
+
+                if not state.Journal.IsEmpty then
+                    Collections.drainSetPush identity &state
+
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) state.Version
+                state.Set.Data :> IReadOnlySet<'T>
             finally
                 ctx.ReleaseOwner()
 
-        member _.Version = version
+        member _.Version = state.Version
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                this.UnregisterSide left
+                this.UnregisterSide right
+                Collections.clearSinks &state.Sinks
 
     interface ISetSinkRegistry with
-        member this.AddSetSink(sink) =
-            this.AddSink(unbox<ISetDeltaSink<'T>> sink)
+        member this.AddSetSink(sink) = Collections.addSink &state.Sinks sink
 
         member this.RemoveSetSink(sink) =
-            this.RemoveSink(unbox<ISetDeltaSink<'T>> sink)
+            Collections.removeSink &state.Sinks sink
+
+    interface IEdgeTarget with
+        member _.EdgeCount = state.Edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)

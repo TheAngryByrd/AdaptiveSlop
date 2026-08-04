@@ -3,6 +3,7 @@ module AdaptiveSlop.Tests
 #nowarn "893"
 
 open System
+open System.Collections.Generic
 open System.Threading
 open System.Threading.Tasks
 open global.Xunit
@@ -160,11 +161,11 @@ let ``ASet union matches expected output`` () =
 
     let unioned = ASet.union (CSet.value left) (CSet.value right)
     let expectedInitial: Set<int> = Set.ofList [ 1; 2; 3; 4 ]
-    Assert.Equal<Set<int>>(expectedInitial, ASet.getValue unioned)
+    Assert.Equal<Set<int>>(expectedInitial, ASet.toSet unioned)
 
     right.Add(5)
     let expectedAfterAdd: Set<int> = Set.ofList [ 1; 2; 3; 4; 5 ]
-    Assert.Equal<Set<int>>(expectedAfterAdd, ASet.getValue unioned)
+    Assert.Equal<Set<int>>(expectedAfterAdd, ASet.toSet unioned)
 
 [<Fact>]
 let ``ASet map and filter`` () =
@@ -173,15 +174,15 @@ let ``ASet map and filter`` () =
     let filtered = ASet.filter (fun v -> v > 4) mapped
 
     let expectedInitial: Set<int> = Set.ofList [ 6; 8 ]
-    Assert.Equal<Set<int>>(expectedInitial, ASet.getValue filtered)
+    Assert.Equal<Set<int>>(expectedInitial, ASet.toSet filtered)
 
     source.Add(5)
     let expectedAfterAdd: Set<int> = Set.ofList [ 6; 8; 10 ]
-    Assert.Equal<Set<int>>(expectedAfterAdd, ASet.getValue filtered)
+    Assert.Equal<Set<int>>(expectedAfterAdd, ASet.toSet filtered)
 
     source.Remove(4)
     let expectedAfterRemove: Set<int> = Set.ofList [ 6; 10 ]
-    Assert.Equal<Set<int>>(expectedAfterRemove, ASet.getValue filtered)
+    Assert.Equal<Set<int>>(expectedAfterRemove, ASet.toSet filtered)
 
 [<Fact>]
 let ``AMap map and filter`` () =
@@ -190,15 +191,15 @@ let ``AMap map and filter`` () =
     let filtered = AMap.filter (fun _ v -> v > 15) mapped
 
     let expectedInitial: Map<int, int> = Map.ofList [ 2, 21; 3, 31 ]
-    Assert.Equal<Map<int, int>>(expectedInitial, AMap.getValue filtered)
+    Assert.Equal<Map<int, int>>(expectedInitial, AMap.toMap filtered)
 
     source.AddOrUpdate 4 40
     let expectedAfterAdd: Map<int, int> = Map.ofList [ 2, 21; 3, 31; 4, 41 ]
-    Assert.Equal<Map<int, int>>(expectedAfterAdd, AMap.getValue filtered)
+    Assert.Equal<Map<int, int>>(expectedAfterAdd, AMap.toMap filtered)
 
     source.Remove(3)
     let expectedAfterRemove: Map<int, int> = Map.ofList [ 2, 21; 4, 41 ]
-    Assert.Equal<Map<int, int>>(expectedAfterRemove, AMap.getValue filtered)
+    Assert.Equal<Map<int, int>>(expectedAfterRemove, AMap.toMap filtered)
 
 [<Fact>]
 let ``Transaction defers ChangeableValue updates`` () =
@@ -244,11 +245,11 @@ let ``Transaction batches set updates`` () =
         setValue.Add(3)
         setValue.Remove(1)
         let expectedDuring: Set<int> = Set.ofList [ 1; 2 ]
-        Assert.Equal<Set<int>>(expectedDuring, ASet.getValue (CSet.value setValue)))
+        Assert.Equal<Set<int>>(expectedDuring, ASet.toSet (CSet.value setValue)))
     |> ignore
 
     let expectedAfter: Set<int> = Set.ofList [ 2; 3 ]
-    Assert.Equal<Set<int>>(expectedAfter, ASet.getValue (CSet.value setValue))
+    Assert.Equal<Set<int>>(expectedAfter, ASet.toSet (CSet.value setValue))
 
 [<Fact>]
 let ``Transaction batches map updates`` () =
@@ -258,11 +259,11 @@ let ``Transaction batches map updates`` () =
         mapValue.AddOrUpdate 3 30
         mapValue.Remove(1)
         let expectedDuring: Map<int, int> = Map.ofList [ 1, 10; 2, 20 ]
-        Assert.Equal<Map<int, int>>(expectedDuring, AMap.getValue (CMap.value mapValue)))
+        Assert.Equal<Map<int, int>>(expectedDuring, AMap.toMap (CMap.value mapValue)))
     |> ignore
 
     let expectedAfter: Map<int, int> = Map.ofList [ 2, 20; 3, 30 ]
-    Assert.Equal<Map<int, int>>(expectedAfter, AMap.getValue (CMap.value mapValue))
+    Assert.Equal<Map<int, int>>(expectedAfter, AMap.toMap (CMap.value mapValue))
 
 [<Fact>]
 let ``AVal mapTask tracks latest value`` () =
@@ -299,17 +300,17 @@ let ``ASet union updates with add/remove`` () =
 
     let unioned = ASet.union (CSet.value left) (CSet.value right)
     let expectedInitial: Set<int> = Set.ofList [ 1; 2; 3 ]
-    Assert.Equal<Set<int>>(expectedInitial, ASet.getValue unioned)
+    Assert.Equal<Set<int>>(expectedInitial, ASet.toSet unioned)
 
     left.Remove(2)
     right.Add(4)
     let expectedAfterFirst: Set<int> = Set.ofList [ 1; 2; 3; 4 ]
-    Assert.Equal<Set<int>>(expectedAfterFirst, ASet.getValue unioned)
+    Assert.Equal<Set<int>>(expectedAfterFirst, ASet.toSet unioned)
 
     right.Remove(2)
     left.Add(5)
     let expectedAfterSecond: Set<int> = Set.ofList [ 1; 3; 4; 5 ]
-    Assert.Equal<Set<int>>(expectedAfterSecond, ASet.getValue unioned)
+    Assert.Equal<Set<int>>(expectedAfterSecond, ASet.toSet unioned)
 
 [<Fact>]
 let ``AMap map and filter respond to updates`` () =
@@ -318,15 +319,15 @@ let ``AMap map and filter respond to updates`` () =
     let filtered = AMap.filter (fun _ v -> v > 20) mapped
 
     let expectedInitial: Map<int, int> = Map.ofList [ 2, 25 ]
-    Assert.Equal<Map<int, int>>(expectedInitial, AMap.getValue filtered)
+    Assert.Equal<Map<int, int>>(expectedInitial, AMap.toMap filtered)
 
     source.AddOrUpdate 2 12
     let expectedAfterUpdate: Map<int, int> = Map.empty
-    Assert.Equal<Map<int, int>>(expectedAfterUpdate, AMap.getValue filtered)
+    Assert.Equal<Map<int, int>>(expectedAfterUpdate, AMap.toMap filtered)
 
     source.AddOrUpdate 1 30
     let expectedAfterSecond: Map<int, int> = Map.ofList [ 1, 35 ]
-    Assert.Equal<Map<int, int>>(expectedAfterSecond, AMap.getValue filtered)
+    Assert.Equal<Map<int, int>>(expectedAfterSecond, AMap.toMap filtered)
 
 [<Fact>]
 let ``Transaction applies last value update`` () =
@@ -368,11 +369,11 @@ let ``ASet map responds to CSet.set`` () =
     let mapped = ASet.map (fun v -> v + 1) (CSet.value source)
 
     let expectedInitial: Set<int> = Set.ofList [ 2; 3 ]
-    Assert.Equal<Set<int>>(expectedInitial, ASet.getValue mapped)
+    Assert.Equal<Set<int>>(expectedInitial, ASet.toSet mapped)
 
     CSet.set (Set.ofList [ 3; 4 ]) source
     let expectedAfter: Set<int> = Set.ofList [ 4; 5 ]
-    Assert.Equal<Set<int>>(expectedAfter, ASet.getValue mapped)
+    Assert.Equal<Set<int>>(expectedAfter, ASet.toSet mapped)
 
 [<Fact>]
 let ``AMap map responds to CMap.set`` () =
@@ -380,11 +381,11 @@ let ``AMap map responds to CMap.set`` () =
     let mapped = AMap.map (fun key value -> value + key) (CMap.value source)
 
     let expectedInitial: Map<int, int> = Map.ofList [ 1, 11; 2, 22 ]
-    Assert.Equal<Map<int, int>>(expectedInitial, AMap.getValue mapped)
+    Assert.Equal<Map<int, int>>(expectedInitial, AMap.toMap mapped)
 
     CMap.set (Map.ofList [ 2, 5; 3, 7 ]) source
     let expectedAfter: Map<int, int> = Map.ofList [ 2, 7; 3, 10 ]
-    Assert.Equal<Map<int, int>>(expectedAfter, AMap.getValue mapped)
+    Assert.Equal<Map<int, int>>(expectedAfter, AMap.toMap mapped)
 
 [<Fact>]
 let ``Transaction defers CSet.set in unions`` () =
@@ -396,11 +397,11 @@ let ``Transaction defers CSet.set in unions`` () =
         CSet.set (Set.ofList [ 5 ]) left
         CSet.set (Set.ofList [ 6 ]) right
         let expectedDuring: Set<int> = Set.ofList [ 1; 2; 3 ]
-        Assert.Equal<Set<int>>(expectedDuring, ASet.getValue unioned))
+        Assert.Equal<Set<int>>(expectedDuring, ASet.toSet unioned))
     |> ignore
 
     let expectedAfter: Set<int> = Set.ofList [ 5; 6 ]
-    Assert.Equal<Set<int>>(expectedAfter, ASet.getValue unioned)
+    Assert.Equal<Set<int>>(expectedAfter, ASet.toSet unioned)
 
 [<Fact>]
 let ``ASet union preserves duplicates until fully removed`` () =
@@ -409,15 +410,15 @@ let ``ASet union preserves duplicates until fully removed`` () =
     let unioned = ASet.union (CSet.value left) (CSet.value right)
 
     let expectedInitial: Set<int> = Set.ofList [ 1; 2; 3 ]
-    Assert.Equal<Set<int>>(expectedInitial, ASet.getValue unioned)
+    Assert.Equal<Set<int>>(expectedInitial, ASet.toSet unioned)
 
     left.Remove(2)
     let expectedAfterLeft: Set<int> = Set.ofList [ 1; 2; 3 ]
-    Assert.Equal<Set<int>>(expectedAfterLeft, ASet.getValue unioned)
+    Assert.Equal<Set<int>>(expectedAfterLeft, ASet.toSet unioned)
 
     right.Remove(2)
     let expectedAfterRight: Set<int> = Set.ofList [ 1; 3 ]
-    Assert.Equal<Set<int>>(expectedAfterRight, ASet.getValue unioned)
+    Assert.Equal<Set<int>>(expectedAfterRight, ASet.toSet unioned)
 
 [<Fact>]
 let ``AMap filter ignores non-matching updates`` () =
@@ -425,12 +426,12 @@ let ``AMap filter ignores non-matching updates`` () =
     let filtered = AMap.filter (fun _ value -> value > 10) (CMap.value source)
 
     let expectedInitial: Map<int, int> = Map.ofList [ 2, 20 ]
-    Assert.Equal<Map<int, int>>(expectedInitial, AMap.getValue filtered)
+    Assert.Equal<Map<int, int>>(expectedInitial, AMap.toMap filtered)
 
     source.AddOrUpdate 1 8
     source.AddOrUpdate 3 9
     let expectedAfter: Map<int, int> = Map.ofList [ 2, 20 ]
-    Assert.Equal<Map<int, int>>(expectedAfter, AMap.getValue filtered)
+    Assert.Equal<Map<int, int>>(expectedAfter, AMap.toMap filtered)
 
 [<Fact>]
 let ``Transaction defers updates across multiple values`` () =
@@ -477,15 +478,15 @@ let ``ASet union with empty set behaves`` () =
     let unioned = ASet.union (CSet.value left) (CSet.value right)
 
     let expectedInitial: Set<int> = Set.ofList [ 1; 2 ]
-    Assert.Equal<Set<int>>(expectedInitial, ASet.getValue unioned)
+    Assert.Equal<Set<int>>(expectedInitial, ASet.toSet unioned)
 
     right.Add(3)
     let expectedAfterAdd: Set<int> = Set.ofList [ 1; 2; 3 ]
-    Assert.Equal<Set<int>>(expectedAfterAdd, ASet.getValue unioned)
+    Assert.Equal<Set<int>>(expectedAfterAdd, ASet.toSet unioned)
 
     left.Remove(1)
     let expectedAfterRemove: Set<int> = Set.ofList [ 2; 3 ]
-    Assert.Equal<Set<int>>(expectedAfterRemove, ASet.getValue unioned)
+    Assert.Equal<Set<int>>(expectedAfterRemove, ASet.toSet unioned)
 
 [<Fact>]
 let ``AMap filter updates on removals`` () =
@@ -493,15 +494,15 @@ let ``AMap filter updates on removals`` () =
     let filtered = AMap.filter (fun _ value -> value >= 20) (CMap.value source)
 
     let expectedInitial: Map<int, int> = Map.ofList [ 2, 20; 3, 30 ]
-    Assert.Equal<Map<int, int>>(expectedInitial, AMap.getValue filtered)
+    Assert.Equal<Map<int, int>>(expectedInitial, AMap.toMap filtered)
 
     source.Remove(3)
     let expectedAfterRemove: Map<int, int> = Map.ofList [ 2, 20 ]
-    Assert.Equal<Map<int, int>>(expectedAfterRemove, AMap.getValue filtered)
+    Assert.Equal<Map<int, int>>(expectedAfterRemove, AMap.toMap filtered)
 
     source.AddOrUpdate 1 25
     let expectedAfterUpdate: Map<int, int> = Map.ofList [ 1, 25; 2, 20 ]
-    Assert.Equal<Map<int, int>>(expectedAfterUpdate, AMap.getValue filtered)
+    Assert.Equal<Map<int, int>>(expectedAfterUpdate, AMap.toMap filtered)
 
 [<Fact>]
 let ``Transaction defers set and map together`` () =
@@ -514,13 +515,13 @@ let ``Transaction defers set and map together`` () =
 
         let expectedSet: Set<int> = Set.ofList [ 1 ]
         let expectedMap: Map<int, int> = Map.ofList [ 1, 1 ]
-        Assert.Equal<Set<int>>(expectedSet, ASet.getValue (CSet.value setValue))
-        Assert.Equal<Map<int, int>>(expectedMap, AMap.getValue (CMap.value mapValue)))
+        Assert.Equal<Set<int>>(expectedSet, ASet.toSet (CSet.value setValue))
+        Assert.Equal<Map<int, int>>(expectedMap, AMap.toMap (CMap.value mapValue)))
     |> ignore
 
     let expectedSetAfter: Set<int> = Set.ofList [ 1; 2 ]
     let expectedMapAfter: Map<int, int> = Map.ofList [ 1, 1; 2, 2 ]
-    Assert.Equal<Map<int, int>>(expectedMapAfter, AMap.getValue (CMap.value mapValue))
+    Assert.Equal<Map<int, int>>(expectedMapAfter, AMap.toMap (CMap.value mapValue))
 
 [<Fact>]
 let ``AVal constant returns stable value`` () =
@@ -547,12 +548,12 @@ let ``ASet map responds to multiple updates`` () =
     let mapped = ASet.map (fun v -> v * 10) (CSet.value source)
 
     let expectedInitial: Set<int> = Set.ofList [ 10; 30 ]
-    Assert.Equal<Set<int>>(expectedInitial, ASet.getValue mapped)
+    Assert.Equal<Set<int>>(expectedInitial, ASet.toSet mapped)
 
     source.Add(2)
     source.Remove(1)
     let expectedAfter: Set<int> = Set.ofList [ 20; 30 ]
-    Assert.Equal<Set<int>>(expectedAfter, ASet.getValue mapped)
+    Assert.Equal<Set<int>>(expectedAfter, ASet.toSet mapped)
 
 [<Fact>]
 let ``AMap filter removes when threshold increases`` () =
@@ -560,11 +561,11 @@ let ``AMap filter removes when threshold increases`` () =
     let filtered = AMap.filter (fun _ value -> value >= 10) (CMap.value source)
 
     let expectedInitial: Map<int, int> = Map.ofList [ 2, 15; 3, 25 ]
-    Assert.Equal<Map<int, int>>(expectedInitial, AMap.getValue filtered)
+    Assert.Equal<Map<int, int>>(expectedInitial, AMap.toMap filtered)
 
     source.AddOrUpdate 2 8
     let expectedAfter: Map<int, int> = Map.ofList [ 3, 25 ]
-    Assert.Equal<Map<int, int>>(expectedAfter, AMap.getValue filtered)
+    Assert.Equal<Map<int, int>>(expectedAfter, AMap.toMap filtered)
 
 [<Fact>]
 let ``Transaction defers map set updates`` () =
@@ -573,11 +574,11 @@ let ``Transaction defers map set updates`` () =
     Transaction.run (fun () ->
         CMap.set (Map.ofList [ 3, 3 ]) mapValue
         let expectedDuring: Map<int, int> = Map.ofList [ 1, 1; 2, 2 ]
-        Assert.Equal<Map<int, int>>(expectedDuring, AMap.getValue (CMap.value mapValue)))
+        Assert.Equal<Map<int, int>>(expectedDuring, AMap.toMap (CMap.value mapValue)))
     |> ignore
 
     let expectedAfter: Map<int, int> = Map.ofList [ 3, 3 ]
-    Assert.Equal<Map<int, int>>(expectedAfter, AMap.getValue (CMap.value mapValue))
+    Assert.Equal<Map<int, int>>(expectedAfter, AMap.toMap (CMap.value mapValue))
 
 [<FsCheck.Xunit.Property(MaxTest = 200)>]
 let ``Deep dependency trees propagate updates`` (depth: FsCheck.PositiveInt) (updates: int list) =
@@ -1099,7 +1100,7 @@ let ``Collection delta sequences match a reference model`` () =
             model <- model.Remove(v)
 
         let expected = model |> Set.map (fun v -> v * 3) |> Set.filter (fun v -> v % 2 = 0)
-        Assert.Equal<Set<int>>(expected, ASet.getValue filtered)
+        Assert.Equal<Set<int>>(expected, ASet.toSet filtered)
 
     // Bulk replace must match as well.
     let replacement = Set.ofList [ 1; 2; 3; 60 ]
@@ -1108,7 +1109,7 @@ let ``Collection delta sequences match a reference model`` () =
     let expected =
         replacement |> Set.map (fun v -> v * 3) |> Set.filter (fun v -> v % 2 = 0)
 
-    Assert.Equal<Set<int>>(expected, ASet.getValue filtered)
+    Assert.Equal<Set<int>>(expected, ASet.toSet filtered)
 
 [<Fact>]
 let ``Map delta sequences match a reference model`` () =
@@ -1122,13 +1123,13 @@ let ``Map delta sequences match a reference model`` () =
 
         if rng.NextDouble() < 0.6 then
             source.AddOrUpdate k (rng.Next(100))
-            model <- model.Add(k, AMap.getValue (CMap.value source) |> Map.find k)
+            model <- model.Add(k, AMap.toMap (CMap.value source) |> Map.find k)
         else
             source.Remove(k)
             model <- model.Remove k
 
         let expected = model |> Map.map (fun k v -> v + k)
-        Assert.Equal<Map<int, int>>(expected, AMap.getValue mapped)
+        Assert.Equal<Map<int, int>>(expected, AMap.toMap mapped)
 
 [<Fact>]
 let ``Union delta sequences preserve duplicate semantics`` () =
@@ -1147,9 +1148,9 @@ let ``Union delta sequences preserve duplicate semantics`` () =
         | _ -> right.Remove(v)
 
         let expected =
-            Set.union (ASet.getValue (CSet.value left)) (ASet.getValue (CSet.value right))
+            Set.union (ASet.toSet (CSet.value left)) (ASet.toSet (CSet.value right))
 
-        Assert.Equal<Set<int>>(expected, ASet.getValue unioned)
+        Assert.Equal<Set<int>>(expected, ASet.toSet unioned)
 
 
 // =============================================================================
@@ -1319,10 +1320,10 @@ let ``Transaction rollback resets collection journals`` () =
         |> ignore)
     |> ignore
 
-    Assert.Equal<Set<int>>(Set.ofList [ 1 ], ASet.getValue (CSet.value s))
+    Assert.Equal<Set<int>>(Set.ofList [ 1 ], ASet.toSet (CSet.value s))
     // The journal must be clean: the next write applies normally.
     s.Add(3)
-    Assert.Equal<Set<int>>(Set.ofList [ 1; 3 ], ASet.getValue (CSet.value s))
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 3 ], ASet.toSet (CSet.value s))
 
 [<Fact>]
 let ``Steady-state observed operations allocate zero bytes`` () =
@@ -1524,3 +1525,190 @@ let ``Stress: posts interleaved with pumps and reads stay consistent`` () =
     Assert.True(ok, "read an out-of-range value")
     Assert.InRange(final, 0, 999)
     Assert.Equal(final + 1, AVal.getValue m)
+
+
+// =============================================================================
+// Phase 6 — Collections lifecycle
+// =============================================================================
+
+[<Fact>]
+let ``AMap map on top of filter receives updates`` () =
+    // Regression: FilterMapNode used to register by concrete type dispatch,
+    // so a map node on top of a filter node never received deltas.
+    let source = CMap.ofSeq [ 1, 10; 2, 20 ]
+    let filtered = AMap.filter (fun _ v -> v > 15) (CMap.value source)
+    let mapped = AMap.map (fun _ v -> v + 1) filtered
+    Assert.Equal<Map<int, int>>(Map.ofList [ 2, 21 ], AMap.toMap mapped)
+
+    CMap.addOrUpdate 3 30 source
+    CMap.addOrUpdate 1 11 source // still filtered out
+    Assert.Equal<Map<int, int>>(Map.ofList [ 2, 21; 3, 31 ], AMap.toMap mapped)
+
+[<Fact>]
+let ``force materializes a checkpoint the library never touches again`` () =
+    let source = CSet.ofSeq [ 1; 2; 3 ]
+    let mapped = ASet.map (fun v -> v * 2) (CSet.value source)
+    let snapshot = ASet.force mapped
+    Assert.Equal(3, snapshot.Count)
+    Assert.True(snapshot.Contains 6)
+
+    // The live chain keeps working; the checkpoint is decoupled.
+    CSet.add 4 source
+    Assert.Equal(4, (ASet.force mapped).Count)
+    Assert.Equal(3, snapshot.Count)
+    Assert.True(snapshot.Contains 6)
+
+[<Fact>]
+let ``force on a map materializes FrozenDictionary`` () =
+    let source = CMap.ofSeq [ 1, 10; 2, 20 ]
+    let mapped = AMap.map (fun _ v -> v * 10) (CMap.value source)
+    let snapshot = AMap.force mapped
+    Assert.Equal(100, snapshot[1])
+    Assert.Equal(200, snapshot[2])
+    CMap.addOrUpdate 3 30 source
+    Assert.Equal(3, (AMap.force mapped).Count)
+    Assert.Equal(2, snapshot.Count)
+
+[<Fact>]
+let ``toSet and toMap materialize F# counterparts`` () =
+    let source = CSet.ofSeq [ 3; 1; 2 ]
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2; 3 ], ASet.toSet (CSet.value source))
+    let m = CMap.ofSeq [ 2, 20; 1, 10 ]
+    Assert.Equal<Map<int, int>>(Map.ofList [ 1, 10; 2, 20 ], AMap.toMap (CMap.value m))
+
+[<Fact>]
+let ``collections accept element types without comparison`` () =
+    // Regression: the collection interfaces used to require ': comparison'.
+    let s = ASet.ofSeq [ typeof<int>; typeof<string> ]
+    Assert.Equal(2, (ASet.force s).Count)
+    let m = AMap.ofSeq [ typeof<int>, 1 ]
+    Assert.Equal(1, (AMap.force m).Count)
+
+[<Fact>]
+let ``derived collections register lazily and dispose cleanly`` () =
+    let source = CSet.ofSeq [ 1; 2 ]
+    let mapped = ASet.map (fun v -> v * 2) (CSet.value source)
+    let cs = source :> AdaptiveSlop.Core.ChangeableSet<int>
+    Assert.Equal(0, cs.SinkCount) // not read yet: no registration
+
+    let _ = ASet.toSet mapped // first read: registers
+    Assert.Equal(1, cs.SinkCount)
+
+    (mapped :> IDisposable).Dispose()
+    Assert.Equal(0, cs.SinkCount)
+
+    // A disposed node throws on read and processes nothing.
+    Assert.Throws<InvalidOperationException>(fun () -> ASet.toSet mapped |> ignore)
+    |> ignore
+
+    CSet.add 3 source
+    Assert.Equal(0, cs.SinkCount)
+
+[<Fact>]
+let ``scalar dependency on a derived collection stays fresh`` () =
+    // A notification callback reads a derived collection: the chain
+    // (source -> map node -> scalar read in the callback) must deliver the
+    // updated state through the receipt marking and the drain.
+    let source = CSet.ofSeq [ 1; 2; 3 ]
+    let mapped = ASet.map (fun v -> v * 2) (CSet.value source)
+    let trigger = CVal.create 0
+    let mutable seen: int list = []
+
+    use _obs =
+        AVal.observe (fun _ -> seen <- (Set.count (ASet.toSet mapped)) :: seen) trigger
+
+    CSet.add 4 source
+    CSet.remove 1 source
+    trigger.Set(1) // fires the callback, which reads the derived collection
+    Assert.Equal(3, Set.count (ASet.toSet mapped)) // {4, 6, 8}
+    Assert.Equal(3, List.head seen)
+
+[<Fact>]
+let ``add and remove of one element in a transaction collapse to no delta`` () =
+    let source = CSet.ofSeq [ 1; 2 ]
+    let mutable processed = 0
+
+    let mapped =
+        ASet.map
+            (fun v ->
+                processed <- processed + 1
+                v * 2)
+            (CSet.value source)
+
+    let _ = ASet.toSet mapped // warm up
+    let before = processed
+
+    Transaction.run (fun () ->
+        CSet.add 5 source
+        CSet.remove 5 source)
+    |> ignore
+
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2 ], ASet.toSet (CSet.value source))
+    Assert.Equal(before, processed) // no delta reached the derived node
+
+[<Fact>]
+let ``remove then add of an existing element in a transaction keeps it`` () =
+    let source = CSet.ofSeq [ 1; 2 ]
+
+    Transaction.run (fun () ->
+        CSet.remove 2 source
+        CSet.add 2 source)
+    |> ignore
+
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2 ], ASet.toSet (CSet.value source))
+
+[<Fact>]
+let ``N-element delta delivery allocates zero bytes`` () =
+    let source = CSet.ofSeq [ 1..100 ]
+    let mapped = ASet.map (fun v -> v * 2) (CSet.value source)
+    let filtered = ASet.filter (fun v -> v % 4 = 0) mapped
+    let _ = ASet.toSet filtered // warm up: initial load, buffers, JIT
+
+    // Warm up the write path and grow every journal/out buffer past 16.
+    for i in 101..300 do
+        CSet.add i source
+
+    let _ = ASet.toSet filtered
+
+    for i in 101..300 do
+        CSet.remove i source
+
+    let _ = ASet.toSet filtered
+
+    GC.Collect()
+    GC.WaitForPendingFinalizers()
+    GC.Collect()
+    let before = GC.GetAllocatedBytesForCurrentThread()
+
+    // Measured: writes (journal append) plus one drain read (transient view).
+    // The remaining cost is a small constant per draining node (24 B, an F#
+    // codegen artifact of byref struct passing); it does not scale with the
+    // delta size. Materialization (force/toSet) is not part of the contract.
+    for i in 301..310 do
+        CSet.add i source
+
+    ASet.getValue filtered |> ignore
+    let after = GC.GetAllocatedBytesForCurrentThread()
+    Assert.True(after - before < 128L, sprintf "drain allocated %d bytes" (after - before))
+    Assert.Equal(55, (ASet.toSet filtered).Count)
+
+[<Fact>]
+let ``derived chain processes nothing when never read`` () =
+    let source = CSet.ofSeq [ 1 ]
+    let mutable processed = 0
+
+    let mapped =
+        ASet.map
+            (fun v ->
+                processed <- processed + 1
+                v)
+            (CSet.value source)
+
+    for i in 2..100 do
+        CSet.add i source
+
+    // No read happened: the mapping never ran (write is journal-append only).
+    Assert.Equal(0, processed)
+
+    let _ = ASet.toSet mapped
+    Assert.Equal(100, processed)

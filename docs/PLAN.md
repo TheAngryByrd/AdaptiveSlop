@@ -265,6 +265,19 @@ address it. The node classes themselves shrink to: state fields, the sink interf
 `GetValue`, `force`, and disposal. No abstract base classes and no virtual dispatch
 in the hot path.
 
+**Codegen facts (measured, 2026-08-04).** These rules apply to every node and every
+future collection combinator:
+
+- The F# `match dict.TryGetValue key with | true, v ->` pattern allocates 24 B per
+  call. Hot paths must use the explicit out-param form:
+  `let mutable v = Unchecked.defaultof<_>; if dict.TryGetValue(key, &v) then ...`.
+- F# forbids byref parameters in inline functions (FS0412). Byref operations are
+  non-inline; inline `[<InlineIfLambda>]` passes take the state by value and return
+  it.
+- Byref parameters appear only at top-level call sites (a class field address,
+  measured zero allocation). Per-element operations take the state struct by value
+  and return the updated struct; measured zero allocation.
+
 ## 7. Threading
 
 ### 7.1 Confinement
