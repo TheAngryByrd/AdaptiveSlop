@@ -707,6 +707,27 @@ and AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
 
                         i <- i + 1
 
+                    // Verified clean: promote to the flag-based check so later
+                    // reads do not re-walk the dependency closure. A registered
+                    // node that never recomputes would otherwise stay MaybeDirty
+                    // forever, making every read O(subtree) via the .Version
+                    // getters (measured: 16k walks per write on a 32k-node tree).
+                    // Promote only when every link is complete: a torn-down link
+                    // (depSlot = -1) means marks may not arrive, and the flag
+                    // would go stale.
+                    if not d && edges.Count > 0 then
+                        let mutable complete = true
+                        let mutable j = 0
+
+                        while complete && j < depCount do
+                            if depSlots[j] < 0 then
+                                complete <- false
+
+                            j <- j + 1
+
+                        if complete then
+                            dirtyState <- DirtyState.Clean
+
                     d
 
             lastCheckedEvalId <- evalId

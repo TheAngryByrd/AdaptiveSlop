@@ -167,6 +167,14 @@ Edge formation and maintenance:
 
 This split keeps unobserved subgraphs free on write and keeps observed reads at O(1).
 
+A version check that verifies a node is clean promotes it to `Clean` (observed nodes with
+complete dependency links only). Without the promotion, a registered node that never
+recomputes stays `MaybeDirty` forever and every read re-walks its dependency closure
+through the recursive `.Version` getters: measured 16,363 version checks per write on a
+32,767-node tree, ~2 ms per read (2026-08-04). Unobserved nodes are never promoted: their
+version check is the only signal, and the walk is inherent to the write-free-on-unobserved
+design.
+
 ### 6.4 Registration cascade
 
 - When a node gains its first parent, it registers itself with its dependencies. The
