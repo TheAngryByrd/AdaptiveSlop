@@ -979,6 +979,66 @@ type IncrementalChainBenchmarks() =
             ()
 
 // =============================================================================
+// Concurrent Post/Pump Benchmark
+// =============================================================================
+// AdaptiveSlop: foreign threads only Post; the owner thread pumps and reads.
+// FDA: threads write and read concurrently (its locked model).
+[<MemoryDiagnoser>]
+type ConcurrentBenchmarks() =
+    let mutable slopInput: AdaptiveSlop.Core.ChangeableValue<int> =
+        Unchecked.defaultof<_>
+
+    let mutable slopMapped: AdaptiveSlop.Core.IAdaptiveValue<int> =
+        Unchecked.defaultof<_>
+
+    let mutable fdaInput: cval<int> = Unchecked.defaultof<_>
+    let mutable fdaMapped: aval<int> = Unchecked.defaultof<_>
+
+    [<Params(4)>]
+    member val ThreadCount = 0 with get, set
+
+    [<Params(500)>]
+    member val IterationsPerThread = 0 with get, set
+
+    [<GlobalSetup>]
+    member _.Setup() =
+        slopInput <- AdaptiveSlop.Core.CVal.create 0
+        slopMapped <- AdaptiveSlop.Core.AVal.map (fun v -> v + 1) (AdaptiveSlop.Core.CVal.value slopInput)
+        fdaInput <- cval 0
+        fdaMapped <- AVal.map (fun v -> v + 1) fdaInput
+
+    [<Benchmark(Baseline = true)>]
+    member this.AdaptiveSlop() =
+        let tasks =
+            Array.init this.ThreadCount (fun threadId ->
+                Task.Run(fun () ->
+                    for i in 1 .. this.IterationsPerThread do
+                        slopInput.Post(threadId * 10000 + i)))
+
+        // Owner thread: pump and read while the producers run.
+        while not (Task.WaitAll(tasks, 1)) do
+            AdaptiveSlop.Core.Posting.pump ()
+            let _ = AdaptiveSlop.Core.AVal.getValue slopMapped
+            ()
+
+        AdaptiveSlop.Core.Posting.pump ()
+        let _ = AdaptiveSlop.Core.AVal.getValue slopMapped
+        ()
+
+    [<Benchmark>]
+    member this.FSharpDataAdaptive() =
+        let tasks =
+            Array.init this.ThreadCount (fun threadId ->
+                Task.Run(fun () ->
+                    for i in 1 .. this.IterationsPerThread do
+                        transact (fun () -> fdaInput.Value <- threadId * 10000 + i)
+
+                        let _ = AVal.force fdaMapped
+                        ()))
+
+        Task.WaitAll(tasks)
+
+// =============================================================================
 // Entry Point
 // =============================================================================
 
