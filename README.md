@@ -110,17 +110,27 @@ Posting rules:
 ### Adaptive collections
 
 Sets and maps propagate **element-level deltas** (added/removed) instead of recomputing
-wholesale:
+wholesale. Writes are journaled (zero allocation); nodes process pending deltas on read:
 
 ```fsharp
 let items = CSet.ofSeq [1; 2; 3]
 let doubled  = ASet.map (fun x -> x * 2) (CSet.value items)
 let filtered = ASet.filter (fun x -> x > 2) (CSet.value items)
 items.Add(4)    // downstream nodes process one element, not the whole set
-
-let scores = CMap.ofSeq [("Alice", 95)]
-scores.AddOrUpdate("Bob", 87)
 ```
+
+- `ASet.getValue` / `AMap.getValue` return a **transient view** of the internal state:
+  valid only until the next write on the owner thread. Computations consume it; do not
+  retain or mutate it.
+- `ASet.force` / `AMap.force` materialize an immutable `FrozenSet`/`FrozenDictionary`
+  checkpoint. This is the only collection operation that allocates, and the only result
+  safe to retain: the library never touches a forced value again.
+- `ASet.toSet` / `AMap.toMap` (and `CSet.toSet` / `CMap.toMap`) materialize the F#
+  `Set`/`Map` counterparts for sorted iteration and F# interop.
+- Derived collections register with their dependencies lazily (first read) and are
+  `IDisposable`; disposal stops all delta processing. Reading a disposed node throws.
+- The collection interfaces do not require `: comparison` (hash-based internally); the
+  F#-interop helpers re-impose it at their boundary.
 
 ## API Reference
 
@@ -128,8 +138,8 @@ scores.AddOrUpdate("Bob", 87)
 |--------|-----------|
 | `AVal` | `constant`, `map`, `map2`, `map3`, `map4`, `mapN`, `reduce`, `sum`, `bind`, `observe`, `getValue` (+ `Task`/`ValueTask` variants) |
 | `CVal` | `create`, `value`, `set`, `post` |
-| `CSet` / `CMap` | `empty`, `ofSeq`, `add` / `addOrUpdate`, `remove`, `set`, `value` |
-| `ASet` / `AMap` | `map`, `filter` (+ `union` for sets) |
+| `CSet` / `CMap` | `empty`, `ofSeq`, `add` / `addOrUpdate`, `remove`, `set`, `value`, `force`, `toSet` / `toMap` |
+| `ASet` / `AMap` | `map`, `filter` (+ `union` for sets), `getValue`, `force`, `toSet` / `toMap` |
 | `Transaction` | `run` |
 | `Posting` | `pump` |
 
