@@ -362,7 +362,6 @@ type internal PostRing(capacity: int) =
 /// an access from a foreign thread throws.
 /// </remarks>
 type internal GraphContext() =
-    let mutable evaluationId = 0L
     let mutable evaluationDepth = 0
     // Incremented on every applied write. Invalidates per-evaluation dirty caches
     // when a write lands in the middle of an evaluation.
@@ -391,7 +390,6 @@ type internal GraphContext() =
     /// The context of the ambient (default) graph.
     static member internal Default = defaultContext
 
-    member internal _.EvaluationId = evaluationId
     member internal _.WriteGeneration = writeGeneration
 
     /// Claim the graph for the current operation. Throws in debug builds when
@@ -429,10 +427,6 @@ type internal GraphContext() =
 
     member internal this.EnterEvaluation() =
         this.ClaimOwner()
-
-        if evaluationDepth = 0 then
-            evaluationId <- evaluationId + 1L
-
         evaluationDepth <- evaluationDepth + 1
 
     member internal this.ExitEvaluation() =
@@ -539,7 +533,6 @@ type internal GraphContext() =
             sink.Deliver()
 
 module internal AdaptiveRuntime =
-    let internal getEvaluationId () = GraphContext.Default.EvaluationId
     let internal getWriteGeneration () = GraphContext.Default.WriteGeneration
 
     let internal enterEvaluation () = GraphContext.Default.EnterEvaluation()
@@ -672,18 +665,21 @@ and AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
     let mutable depCount = 0
     let edges = ParentEdges()
     let mutable dirtyState = DirtyState.MaybeDirty
-    // Per-evaluation dirty cache to avoid O(depth^2) in deep chains
-    let mutable lastCheckedEvalId = 0L
+    // Write-generation-keyed dirty cache: the verdict of the last version check
+    // (or recompute) stays valid until the next applied write moves the global
+    // generation. Repeated reads at the same generation are O(1) per node.
     let mutable lastCheckedWriteGen = -1L
     let mutable dirtyCache = true
 
-    /// Check if dirty, using per-evaluation cache to avoid redundant deep traversals
+    /// Check if dirty, using a write-generation-keyed cache: the verdict of the
+    /// last check at this generation is still valid, because any write that could
+    /// affect this node moves the generation (scalar writes via MarkFrom,
+    /// collection writes via sink delivery + MarkFrom).
     member private this.IsDirty() =
-        let evalId = AdaptiveRuntime.getEvaluationId ()
         let writeGen = AdaptiveRuntime.getWriteGeneration ()
 
-        if lastCheckedEvalId = evalId && lastCheckedWriteGen = writeGen then
-            // Already checked in this evaluation, return cached result
+        if lastCheckedWriteGen = writeGen then
+            // Already checked at this write generation: return cached result
             dirtyCache
         else
             // Compute dirty status and cache it
@@ -730,7 +726,6 @@ and AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
 
                     d
 
-            lastCheckedEvalId <- evalId
             lastCheckedWriteGen <- writeGen
             dirtyCache <- dirty
             dirty
@@ -763,6 +758,10 @@ and AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
 
     member private this.Recompute() =
         let observed = edges.Count > 0
+        // Generation at which the recompute starts. A write from user code in the
+        // middle of the compute moves the generation; the computed value would be
+        // stale, so the node stays Dirty and recomputes on the next read.
+        let checkedGen = AdaptiveRuntime.getWriteGeneration ()
 
         let struct (newValue, newDeps, newVersions, newStart, newLen) =
             AdaptiveRuntime.collect compute
@@ -807,8 +806,19 @@ and AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
 
         hasValue <- true
         version <- version + 1L
-        dirtyState <- if observed then DirtyState.Clean else DirtyState.MaybeDirty
-        // Update cache: we just recomputed, so we're not dirty anymore for this evaluation
+
+        dirtyState <-
+            if AdaptiveRuntime.getWriteGeneration () <> checkedGen then
+                // A write landed mid-compute: the value may be stale, keep Dirty.
+                DirtyState.Dirty
+            elif observed then
+                DirtyState.Clean
+            else
+                DirtyState.MaybeDirty
+
+        // The recompute is valid as of checkedGen: key the cache there so later
+        // reads at the same generation skip the version check.
+        lastCheckedWriteGen <- checkedGen
         dirtyCache <- false
 
     interface IAdaptiveValue<'T> with
@@ -836,9 +846,10 @@ and AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
         member this.MarkDirty() =
             if dirtyState <> DirtyState.Dirty then
                 dirtyState <- DirtyState.Dirty
-                // Invalidate the per-evaluation dirty cache: a mark can arrive in the
-                // middle of an evaluation (a write from user code inside a compute).
-                lastCheckedEvalId <- -1L
+                // Invalidate the dirty cache: a mark can arrive in the middle of an
+                // evaluation (a write from user code inside a compute). The mark is
+                // precise; the cache would otherwise hide it.
+                lastCheckedWriteGen <- -1L
                 let ctx = GraphContext.Default
 
                 for i in 0 .. edges.Count - 1 do
@@ -985,15 +996,25 @@ and MapNNode<'T, 'U>(deps: IAdaptiveValue<'T>[], [<InlineIfLambda>] compute: 'T[
     let depSlots = Array.create deps.Length -1
     let edges = ParentEdges()
     let mutable dirtyState = DirtyState.MaybeDirty
+    // Write-generation-keyed dirty cache: the last verdict stays valid until the
+    // next applied write moves the global generation.
+    let mutable lastCheckedWriteGen = -1L
+    let mutable dirtyCache = true
 
     member private this.IsDirty() =
-        if not hasValue then
+        let writeGen = AdaptiveRuntime.getWriteGeneration ()
+
+        if lastCheckedWriteGen = writeGen then
+            dirtyCache
+        elif not hasValue then
             true
         elif dirtyState = DirtyState.Dirty then
             // Marked by a dependency change.
             true
         elif dirtyState = DirtyState.Clean && edges.Count > 0 then
             // Observed and not marked: one flag check, no version reads.
+            dirtyCache <- false
+            lastCheckedWriteGen <- writeGen
             false
         else
             // Unobserved, or links can be stale: version check.
@@ -1006,9 +1027,15 @@ and MapNNode<'T, 'U>(deps: IAdaptiveValue<'T>[], [<InlineIfLambda>] compute: 'T[
 
                 i <- i + 1
 
+            lastCheckedWriteGen <- writeGen
+            dirtyCache <- dirty
             dirty
 
     member private this.Recompute() =
+        // Generation at which the recompute starts; a write mid-compute would make
+        // the computed value stale, so the node stays Dirty.
+        let checkedGen = AdaptiveRuntime.getWriteGeneration ()
+
         for i in 0 .. deps.Length - 1 do
             values.[i] <- deps.[i].GetValue()
             depVersions.[i] <- (deps.[i] :> IAdaptiveObject).Version
@@ -1018,10 +1045,15 @@ and MapNNode<'T, 'U>(deps: IAdaptiveValue<'T>[], [<InlineIfLambda>] compute: 'T[
         version <- version + 1L
 
         dirtyState <-
-            if edges.Count > 0 then
+            if AdaptiveRuntime.getWriteGeneration () <> checkedGen then
+                DirtyState.Dirty
+            elif edges.Count > 0 then
                 DirtyState.Clean
             else
                 DirtyState.MaybeDirty
+
+        lastCheckedWriteGen <- checkedGen
+        dirtyCache <- false
 
     /// Registration cascade: this node gained its first parent.
     member private this.RegisterWithDeps() =
@@ -1130,15 +1162,25 @@ and ReduceNode<'T>(deps: IAdaptiveValue<'T>[], init: 'T, [<InlineIfLambda>] redu
     let depSlots = Array.create deps.Length -1
     let edges = ParentEdges()
     let mutable dirtyState = DirtyState.MaybeDirty
+    // Write-generation-keyed dirty cache: the last verdict stays valid until the
+    // next applied write moves the global generation.
+    let mutable lastCheckedWriteGen = -1L
+    let mutable dirtyCache = true
 
     member private this.IsDirty() =
-        if not hasValue then
+        let writeGen = AdaptiveRuntime.getWriteGeneration ()
+
+        if lastCheckedWriteGen = writeGen then
+            dirtyCache
+        elif not hasValue then
             true
         elif dirtyState = DirtyState.Dirty then
             // Marked by a dependency change.
             true
         elif dirtyState = DirtyState.Clean && edges.Count > 0 then
             // Observed and not marked: one flag check, no version reads.
+            dirtyCache <- false
+            lastCheckedWriteGen <- writeGen
             false
         else
             // Unobserved, or links can be stale: version check.
@@ -1151,9 +1193,15 @@ and ReduceNode<'T>(deps: IAdaptiveValue<'T>[], init: 'T, [<InlineIfLambda>] redu
 
                 i <- i + 1
 
+            lastCheckedWriteGen <- writeGen
+            dirtyCache <- dirty
             dirty
 
     member private this.Recompute() =
+        // Generation at which the recompute starts; a write mid-compute would make
+        // the computed value stale, so the node stays Dirty.
+        let checkedGen = AdaptiveRuntime.getWriteGeneration ()
+
         let mutable acc = init
 
         for i in 0 .. deps.Length - 1 do

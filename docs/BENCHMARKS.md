@@ -507,3 +507,63 @@ Ratio 1.00 = the AdaptiveSlop row itself (baseline row per group).
 | **AdaptiveSlop**       | **500**   | **100**        | **3,898.88 μs** | **1,063.281 μs** | **58.282 μs** |  **1.00** |    **0.02** |      **-** |         **-** |          **NA** |
 | FSharpDataAdaptive | 500   | 100        | 5,721.17 μs |   506.619 μs | 27.770 μs |  1.47 |    0.02 |      - |   47200 B |          NA |
 
+
+---
+
+## 2026-08-04 — WriteGen dirty cache + Kipo physics shape
+
+- Commit: (pending — writeGen cache + Polling removed + KipoPhysicsBenchmarks added)
+- Machine: WSL2 (Ubuntu), .NET 8.0, x64 RyuJIT
+- Job: ShortRun (IterationCount=3, LaunchCount=1, WarmupCount=3)
+
+### What changed
+
+- Scalar nodes (AdaptiveNode, MapNNode, ReduceNode) cache the dirty verdict keyed by
+  the global write generation: repeated reads at the same generation are O(1) per node.
+  The per-evaluation (evalId) cache was removed; the generation key subsumes it.
+- Recompute keys the cache to the generation at which it started; a write from user
+  code mid-compute keeps the node Dirty (fixes a latent mid-compute-mark staleness hole).
+- `PollingBenchmarks` (map2 aggregation tree, 1 write + N reads) was removed: the shape
+  follows FDA's synthetic stress pattern, not real usage. `DeepWideBenchmarks` stays as
+  the documented unobserved-tree corner (unchanged: write+read per iteration still walks
+  the subtree — the generation key does not help a fresh-generation first read).
+- `KipoPhysicsBenchmarks` added: a faithful clone of Pomo.Core `Projections.fs`
+  `PhysicsCache` — per frame the sim advances every entity position, the render side
+  materializes (variant 1: force per frame — the current Kipo shape) or reads the graph
+  directly (variant 2: derived positions/rotations nodes + transient views + the spatial
+  grid rebuild — the graph-as-cache extension).
+
+### KipoPhysicsBenchmarks (50 frames per op)
+
+Variant 1 — force per frame (current Kipo shape):
+
+| Method | Entities | Mean | Ratio vs FDA | Allocated | Alloc ratio |
+|---|---|---|---|---|---|
+| AdaptiveSlop | 250 | 2.758 ms | 1.00 | 5,501.97 KB | 1.000 |
+| FSharpDataAdaptive | 250 | 9.257 ms | 3.36 | 14,115.15 KB | 2.565 |
+| AdaptiveSlop | 1000 | 11.109 ms | 1.00 | 23,783.71 KB | 1.000 |
+| FSharpDataAdaptive | 1000 | 41.402 ms | 3.73 | 62,581.01 KB | 2.631 |
+
+Variant 2 — graph direct (derived nodes + transient views):
+
+| Method | Entities | Mean | Ratio vs FDA | Allocated | Alloc ratio |
+|---|---|---|---|---|---|
+| AdaptiveSlop_GraphDirect | 250 | 1.066 ms | 1.00 | 22.66 KB* | 0.004 |
+| FSharpDataAdaptive_GraphDirect | 250 | 80.963 ms | 76.0 | 97,674.31 KB | 17.753 |
+| AdaptiveSlop_GraphDirect | 1000 | 4.016 ms | 1.00 | 22.66 KB* | 0.001 |
+| FSharpDataAdaptive_GraphDirect | 1000 | 592.519 ms | 147.5 | 433,005.78 KB | 18.206 |
+
+* The BD `Allocated` column for the graph-direct variant is a short-job artifact
+(contradicts its own frame-1 cost). Direct counter
+(`GC.GetAllocatedBytesForCurrentThread`) per steady-state frame: library = 24 B
+(writes 0 B + derived drain constant), user-code snapshot dictionaries ≈ 62 KB at 250
+entities (identical in both libraries — the graph does not allocate it).
+
+### Notes
+
+- The 1.22 MB/frame FDA allocation at 1000 entities (variant 1) is the burden that made
+  Kipo abandon adaptive maps for positions. AdaptiveSlop cuts it to ~38% and runs the
+  frame 3.7× faster; the graph-direct variant removes the library allocation entirely
+  (24 B/frame) and is 147× faster than FDA's per-element adaptive blocks.
+- The spatial grid stays a per-frame user-code rebuild in both variants; a
+  delta-maintained grouped node is Phase 7 work.

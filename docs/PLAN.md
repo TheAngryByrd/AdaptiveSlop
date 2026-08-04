@@ -175,6 +175,23 @@ through the recursive `.Version` getters: measured 16,363 version checks per wri
 version check is the only signal, and the walk is inherent to the write-free-on-unobserved
 design.
 
+**Write-generation-keyed dirty cache (implemented 2026-08-04).** Every node caches the
+verdict of its last version check (or recompute) keyed by the global write generation.
+The generation increments unconditionally on every applied write (`MarkFrom`, which every
+scalar and collection write path reaches), so a cache hit is sound until the next write:
+repeated reads at the same generation are O(1) per node. This makes the 60 Hz write /
+120 Hz read polling shape cheap for the reads after the first one per generation. It does
+NOT fix DeepWide (write + read per iteration): every read is the first read at a fresh
+generation and the O(subtree) walk remains — that corner still requires observation or
+eager marking.
+
+A recompute keys its cache to the generation at which it started; a write from user code
+in the middle of a compute moves the generation, so the node stays `Dirty` and recomputes
+on the next read (this also fixes a latent staleness hole: the recompute no longer clobbers
+a mid-compute mark). `MapNNode` and `ReduceNode` carry the same cache. The per-evaluation
+cache (evalId key) was removed; it only helped diamond shapes, and the generation key
+subsumes it.
+
 ### 6.4 Registration cascade
 
 - When a node gains its first parent, it registers itself with its dependencies. The
