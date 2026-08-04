@@ -5,8 +5,9 @@ information necessary for the implementation. It has no external references.
 
 ## Status
 
-- Done: Phase 0, Phase 1, Phase 2, Phase 3, Phase 4 (2026-08-03), Phase 5 (2026-08-04).
-- Next: Phase 6 (collections lifecycle).
+- Done: Phase 0, Phase 1, Phase 2, Phase 3, Phase 4 (2026-08-03), Phase 5 (2026-08-04),
+  Phase 6 (2026-08-04, journals/drain model).
+- Next: Phase 7 (hardening + collection API parity).
 - Phase 6 design revised (2026-08-04): pull-lazy journals, `force` materialization
   returning `Frozen*`, collections moved to their own files with a shared inline
   `Collections` module.
@@ -456,11 +457,56 @@ deltas between them. The collections already produce deltas.
   - A regression test: `AMap.map` on top of `AMap.filter` receives updates.
   - The full suite is green in Debug and Release.
 
-### Phase 7 — Hardening
+### Phase 7 — Hardening and collection API parity
 
-- Benchmark against the Phase 0 baseline. Measure allocations with
-  `GC.GetAllocatedBytesForCurrentThread`.
-- Make the allocation assertions permanent tests.
+Scope: harden the Phase 6 core, complete incremental computation on collections, and
+reach public API parity with FSharp.Data.Adaptive where the parity is sound. Game-shaped
+workloads (KipoPhysicsBenchmarks) are stress tests only; the library is general-purpose.
+
+Explicitly out of scope: grouped/spatial-grid nodes, AdaptiveSoA/AList, and the
+`mapA`/`chooseA`/`filterA` per-element-adaptive family (measured 147x slower than
+transient-view reads; parity "where possible" excludes them).
+
+#### 7.1 Collection observation
+
+- `ASet.observe` / `AMap.observe`: register a callback sink; the drain delivers
+  `(state view, delta)` to the callback. Deltas are effective (no-op writes are
+  elided at the source). Delivery happens after the batch or pump completes
+  (Section 6.5); no evaluation during marking.
+- The handle is `IObservation`; `Dispose` unregisters and starts the cascade.
+- Parity shape: FDA `AddCallback(action: State -> Delta -> unit)`
+  (EvaluationCallbackExtensions.fs:103, 114).
+
+#### 7.2 Incremental reductions and derived checks
+
+- `ASet.count/countBy/contains/isEmpty/exists/forall/single/fold/reduce/reduceBy`,
+  `AMap.count/countBy/find/tryFind/isEmpty/exists/forall/single/fold/reduce`,
+  `toAVal` (collection state as an adaptive scalar: count, contains, isEmpty).
+- Reductions are delta-driven counters over the journal; a non-invertible reduction
+  falls back to a full recompute (the FDA `AdaptiveReduction.sub` fallback protocol).
+- Every option-returning operation has a voption counterpart (`V` suffix, per FDA:
+  `tryFindV`, `findV`, `chooseV`, `choose2V`, `intersectV`, `ofSeqV`, ...).
+
+#### 7.3 Collection algebra
+
+- Two-source delta nodes: `ASet.unionMany/difference/intersect/xor`,
+  `AMap.union/unionWith/intersect/intersectWith/choose2` (+ `choose2V`).
+- Projections and construction: `AMap.ofASet/toASet/toASetValues`,
+  `AMap.mapSet`, `ASet.ofAVal`/`AMap.ofAVal`, `ofArray/ofList/ofHashSet/ofHashMap`,
+  `ofReader`, `constant`, `single`, `custom`.
+
+#### 7.4 Dynamic dependencies
+
+- `ASet.bind`/`AMap.bind` and `collect`: per-element adaptive mapping with ref-counted
+  contribution tracking (the `CountingHashSet` role). Recompute re-reads all
+  dependencies; old dynamic edges are removed eagerly (Pitfall 1).
+
+#### 7.5 Hardening
+
+- Permanent tests: N-element delta delivery (write plus drain) allocates 0 bytes;
+  O(changed) drain (one write touches one element); no-op elision (equal-value
+  `AddOrUpdate` does not mark).
+- Benchmark the full suite against the Phase 0 baseline and the 2026-08-04 row.
 - Only if the data demands it: re-add specialized small-arity nodes, output-equality
   predicates, or marking-stack tuning.
 
