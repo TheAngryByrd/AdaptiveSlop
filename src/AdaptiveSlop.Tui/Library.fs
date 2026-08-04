@@ -1146,10 +1146,8 @@ module InputWidgets =
                     let displayValue =
                         if String.IsNullOrEmpty(value) && not isFocused then
                             state.Placeholder
-                        else if
-                            // Insert cursor character at position when focused
-                            isFocused && cursor <= value.Length
-                        then
+                        // Insert cursor character at position when focused
+                        else if isFocused && cursor <= value.Length then
                             let before =
                                 if cursor > 0 then
                                     value.Substring(0, min cursor value.Length)
