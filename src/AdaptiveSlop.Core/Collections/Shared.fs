@@ -90,39 +90,61 @@ type internal DeltaBuffer<'T> =
 
     member this.IsEmpty = this.Count = 0
 
-/// <summary>A set delta: added and removed elements. Used for journals and outputs.</summary>
+/// <summary>
+/// A set delta: elements added and removed since the previous delivery.
+/// Passed to <see cref="ASet.observe"/> callbacks. The buffers are transient:
+/// valid only during the callback that received the delta.
+/// </summary>
 [<Struct>]
-type internal SetDelta<'T> =
-    val mutable Adds: DeltaBuffer<'T>
-    val mutable Rems: DeltaBuffer<'T>
+type SetDelta<'T> =
+    val mutable internal Adds: DeltaBuffer<'T>
+    val mutable internal Rems: DeltaBuffer<'T>
 
-    new(adds: DeltaBuffer<'T>, rems: DeltaBuffer<'T>) = { Adds = adds; Rems = rems }
+    internal new(adds: DeltaBuffer<'T>, rems: DeltaBuffer<'T>) = { Adds = adds; Rems = rems }
 
-    static member Create() =
+    static member internal Create() =
         SetDelta(DeltaBuffer.Create(), DeltaBuffer.Create())
 
+    /// <summary>Gets whether this delta contains no operations.</summary>
     member this.IsEmpty = this.Adds.IsEmpty && this.Rems.IsEmpty
 
-    member this.Clear() =
+    member internal this.Clear() =
         this.Adds.Count <- 0
         this.Rems.Count <- 0
 
-/// <summary>A map delta: upserted entries and removed keys. Used for journals and outputs.</summary>
+    /// <summary>The elements added. Transient: valid during the callback only.</summary>
+    member this.Added = this.Adds.Items.AsMemory(0, this.Adds.Count)
+
+    /// <summary>The elements removed. Transient: valid during the callback only.</summary>
+    member this.Removed = this.Rems.Items.AsMemory(0, this.Rems.Count)
+
+/// <summary>
+/// A map delta: upserted entries and removed keys since the previous delivery.
+/// Passed to <see cref="AMap.observe"/> callbacks. The buffers are transient:
+/// valid only during the callback that received the delta.
+/// </summary>
 [<Struct>]
-type internal MapDelta<'K, 'V> =
-    val mutable Sets: DeltaBuffer<struct ('K * 'V)>
-    val mutable Rems: DeltaBuffer<'K>
+type MapDelta<'K, 'V> =
+    val mutable internal Sets: DeltaBuffer<struct ('K * 'V)>
+    val mutable internal Rems: DeltaBuffer<'K>
 
-    new(sets: DeltaBuffer<struct ('K * 'V)>, rems: DeltaBuffer<'K>) = { Sets = sets; Rems = rems }
+    internal new(sets: DeltaBuffer<struct ('K * 'V)>, rems: DeltaBuffer<'K>) = { Sets = sets; Rems = rems }
 
-    static member Create() =
+    static member internal Create() =
         MapDelta(DeltaBuffer.Create(), DeltaBuffer.Create())
 
+    /// <summary>Gets whether this delta contains no operations.</summary>
     member this.IsEmpty = this.Sets.IsEmpty && this.Rems.IsEmpty
 
-    member this.Clear() =
+    member internal this.Clear() =
         this.Sets.Count <- 0
         this.Rems.Count <- 0
+
+    /// <summary>The entries set (added or updated). Transient: valid during the callback only.</summary>
+    member this.SetEntries = this.Sets.Items.AsMemory(0, this.Sets.Count)
+
+    /// <summary>The keys removed. Transient: valid during the callback only.</summary>
+    member this.RemovedKeys = this.Rems.Items.AsMemory(0, this.Rems.Count)
 
 /// <summary>
 /// Registered consumers of a collection node. Passed by value to the push

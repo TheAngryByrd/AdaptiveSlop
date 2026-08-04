@@ -1712,3 +1712,227 @@ let ``derived chain processes nothing when never read`` () =
 
     let _ = ASet.toSet mapped
     Assert.Equal(100, processed)
+
+// =============================================================================
+// Phase 7 — Collection observation
+// =============================================================================
+
+[<Fact>]
+let ``ASet observe delivers net deltas with the current view`` () =
+    let source = CSet.empty<int>
+    let views = ResizeArray<Set<int>>()
+    let adds = ResizeArray<Set<int>>()
+    let rems = ResizeArray<Set<int>>()
+
+    use obs =
+        ASet.observe
+            (fun view delta ->
+                views.Add(Set.ofSeq view)
+                adds.Add(Set.ofArray (delta.Added.ToArray()))
+                rems.Add(Set.ofArray (delta.Removed.ToArray())))
+            (CSet.value source)
+
+    CSet.add 1 source
+    CSet.add 2 source
+    CSet.remove 1 source
+    CSet.add 3 source
+
+    Assert.Equal<Set<int>>(
+        [ Set.ofList [ 1 ]; Set.ofList [ 1; 2 ]; Set.ofList [ 2 ]; Set.ofList [ 2; 3 ] ],
+        List.ofSeq views
+    )
+
+    Assert.Equal<Set<int>>([ Set.ofList [ 1 ]; Set.ofList [ 2 ]; Set.empty; Set.ofList [ 3 ] ], List.ofSeq adds)
+
+    Assert.Equal<Set<int>>([ Set.empty; Set.empty; Set.ofList [ 1 ]; Set.empty ], List.ofSeq rems)
+
+[<Fact>]
+let ``AMap observe delivers set entries and removed keys`` () =
+    let source = CMap.empty<string, int>
+    let seen = ResizeArray<Set<string * int> * Set<string> * int>()
+
+    use obs =
+        AMap.observe
+            (fun view delta ->
+                let sets =
+                    delta.SetEntries.ToArray()
+                    |> Array.map (fun struct (k, v) -> k, v)
+                    |> Set.ofArray
+
+                let rems = delta.RemovedKeys.ToArray() |> Set.ofArray
+                seen.Add(sets, rems, view.Count))
+            (CMap.value source)
+
+    CMap.addOrUpdate "a" 1 source
+    CMap.addOrUpdate "a" 2 source
+    CMap.remove "a" source
+    CMap.addOrUpdate "b" 7 source
+
+    Assert.Equal<Set<string * int> * Set<string> * int>(
+        [ Set.ofList [ "a", 1 ], Set.empty, 1
+          Set.ofList [ "a", 2 ], Set.empty, 1
+          Set.empty, Set.ofList [ "a" ], 0
+          Set.ofList [ "b", 7 ], Set.empty, 1 ],
+        List.ofSeq seen
+    )
+
+[<Fact>]
+let ``collection observe ignores no-op writes`` () =
+    let mapSource = CMap.empty<string, int>
+    let mutable mapCount = 0
+
+    use obsMap =
+        AMap.observe (fun _ _ -> mapCount <- mapCount + 1) (CMap.value mapSource)
+
+    CMap.addOrUpdate "a" 1 mapSource
+    CMap.addOrUpdate "a" 1 mapSource // same value: elided at the source
+    CMap.remove "b" mapSource // absent: elided at the source
+    Assert.Equal(1, mapCount)
+
+    let setSource = CSet.empty<int>
+    let mutable setCount = 0
+
+    use obsSet =
+        ASet.observe (fun _ _ -> setCount <- setCount + 1) (CSet.value setSource)
+
+    CSet.add 1 setSource
+    CSet.add 1 setSource // already present: elided
+    CSet.remove 2 setSource // absent: elided
+    Assert.Equal(1, setCount)
+
+[<Fact>]
+let ``collection observe skips a transaction that nets to nothing`` () =
+    let source = CSet.empty<int>
+    let mutable count = 0
+
+    use obs = ASet.observe (fun _ _ -> count <- count + 1) (CSet.value source)
+
+    Transaction.run (fun () ->
+        CSet.add 1 source
+        CSet.remove 1 source)
+
+    Assert.Equal(0, count)
+
+    Transaction.run (fun () -> CSet.add 1 source)
+    Assert.Equal(1, count)
+
+[<Fact>]
+let ``collection observe works on derived nodes`` () =
+    let source = CMap.empty<int, int>
+    let mapped = AMap.map (fun k v -> v * 10) (CMap.value source)
+    let seen = ResizeArray<Set<int * int> * Set<int> * int>()
+
+    use obs =
+        AMap.observe
+            (fun view delta ->
+                let sets =
+                    delta.SetEntries.ToArray()
+                    |> Array.map (fun struct (k, v) -> k, v)
+                    |> Set.ofArray
+
+                let rems = delta.RemovedKeys.ToArray() |> Set.ofArray
+                seen.Add(sets, rems, view.Count))
+            mapped
+
+    // Nothing else reads the derived node: the observation's own delivery
+    // drains it.
+    CMap.addOrUpdate 1 5 source
+    CMap.addOrUpdate 2 6 source
+    CMap.remove 1 source
+
+    Assert.Equal<Set<int * int> * Set<int> * int>(
+        [ Set.ofList [ 1, 50 ], Set.empty, 1
+          Set.ofList [ 2, 60 ], Set.empty, 2
+          Set.empty, Set.ofList [ 1 ], 1 ],
+        List.ofSeq seen
+    )
+
+[<Fact>]
+let ``collection observe stays silent when a derived filter drops the change`` () =
+    let source = CMap.empty<int, int>
+    let filtered = AMap.filter (fun _ v -> v > 10) (CMap.value source)
+    let mutable count = 0
+
+    use obs = AMap.observe (fun _ _ -> count <- count + 1) filtered
+
+    CMap.addOrUpdate 1 5 source // filtered out: no output delta
+    CMap.addOrUpdate 2 20 source
+    Assert.Equal(1, count)
+
+[<Fact>]
+let ``collection observe does not fire on attach`` () =
+    let source = CSet.ofSeq [ 1; 2; 3 ]
+    let mutable count = 0
+
+    use obs = ASet.observe (fun _ _ -> count <- count + 1) (CSet.value source)
+
+    Assert.Equal(0, count)
+    CSet.add 4 source
+    Assert.Equal(1, count)
+
+[<Fact>]
+let ``collection observe supports reentrant writes and disposes cleanly`` () =
+    let source = CSet.empty<int>
+    let mutable count = 0
+    let mutable reentrant = false
+
+    use obs =
+        ASet.observe
+            (fun view _ ->
+                count <- count + 1
+
+                if not reentrant && view.Count = 1 then
+                    reentrant <- true
+                    CSet.add 2 source)
+            (CSet.value source)
+
+    CSet.add 1 source
+    Assert.Equal(2, count) // the reentrant write was delivered too
+
+    obs.Dispose()
+    CSet.add 3 source
+    Assert.Equal(2, count) // no delivery after dispose
+    Assert.False(obs.IsActive)
+
+[<Fact>]
+let ``collection observe delivers steady-state with zero allocation`` () =
+    let source = CSet.empty<int>
+    let mutable count = 0
+
+    use obs = ASet.observe (fun _ _ -> count <- count + 1) (CSet.value source)
+
+    // Warm-up: grow the source, its flush buffer, and the observer scratch to
+    // steady-state sizes, and run one delivery per write.
+    for i in 1..50 do
+        CSet.add i source
+
+    for i in 1..50 do
+        CSet.remove i source
+
+    // Steady state: 150 effective writes (adds for keys 1..50, then remove+add
+    // pairs that hit present keys). The set stays at 50 elements: no growth.
+    let before = GC.GetAllocatedBytesForCurrentThread()
+
+    for i in 1..100 do
+        let k = (i % 50) + 1
+        CSet.remove k source
+        CSet.add k source
+
+    let allocated = GC.GetAllocatedBytesForCurrentThread() - before
+    Assert.Equal(250, count)
+    Assert.Equal(0L, allocated)
+
+[<Fact>]
+let ``sequential transactions each apply their collection writes`` () =
+    // Regression: CommitJournal never reset flushEnqueued, so the flush of a
+    // second sequential transaction was never re-enqueued and its writes were
+    // silently lost (exposed by the observation tests).
+    let setSource = CSet.empty<int>
+    Transaction.run (fun () -> CSet.add 1 setSource)
+    Transaction.run (fun () -> CSet.add 2 setSource)
+    Assert.Equal(2, (ASet.force (CSet.value setSource)).Count)
+
+    let mapSource = CMap.empty<string, int>
+    Transaction.run (fun () -> CMap.addOrUpdate "a" 1 mapSource)
+    Transaction.run (fun () -> CMap.addOrUpdate "b" 2 mapSource)
+    Assert.Equal(2, (AMap.force (CMap.value mapSource)).Count)

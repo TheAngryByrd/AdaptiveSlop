@@ -31,6 +31,33 @@ module ASet =
         UnionSetNode<'T>(left, right)
 
     /// <summary>
+    /// Registers a callback that receives the current view and the net delta
+    /// after every batch that changes the set. The callback runs on the owner
+    /// thread after the write, transaction, or pump completes. The view and
+    /// the delta are transient: valid only during the callback. Disposing the
+    /// returned observation stops delivery.
+    /// </summary>
+    /// <remarks>
+    /// Parity: FDA <c>AddCallback(state, delta)</c> on collection readers.
+    /// Deltas are net per element: adding and removing the same element within
+    /// one batch cancels. The callback never fires for writes that do not
+    /// change the set. Works on sources and derived sets alike.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// let items = CSet.empty&lt;int&gt;
+    /// use obs = ASet.observe (fun view delta -&gt;
+    ///     printfn "added: %A removed: %A count: %d" delta.Added delta.Removed view.Count)
+    ///     (CSet.value items)
+    /// CSet.add 1 items   // prints "added: [1] removed: [] count: 1"
+    /// </code>
+    /// </example>
+    let observe (callback: IReadOnlySet<'T> -> SetDelta<'T> -> unit) (set: IAdaptiveSet<'T>) : IObservation =
+        let node = ObserveSetNode<'T>(set, callback)
+        node.Attach()
+        node :> IObservation
+
+    /// <summary>
     /// Returns a transient view of the current state. Valid only until the next
     /// write on the owner thread; do not retain or mutate it. Use
     /// <see cref="force"/> to materialize a snapshot that is safe to retain.
@@ -94,6 +121,37 @@ module AMap =
         (mapValue: IAdaptiveMap<'K, 'V>)
         : IAdaptiveMap<'K, 'V> =
         FilterMapNode<'K, 'V>(mapValue, predicate)
+
+    /// <summary>
+    /// Registers a callback that receives the current view and the net delta
+    /// after every batch that changes the map. The callback runs on the owner
+    /// thread after the write, transaction, or pump completes. The view and
+    /// the delta are transient: valid only during the callback. Disposing the
+    /// returned observation stops delivery.
+    /// </summary>
+    /// <remarks>
+    /// Parity: FDA <c>AddCallback(state, delta)</c> on collection readers.
+    /// Deltas are net per key: setting and removing the same key within one
+    /// batch cancels; a key set twice in one batch delivers the last value.
+    /// The callback never fires for writes that do not change the map. Works
+    /// on sources and derived maps alike.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// let scores = CMap.empty&lt;string, int&gt;
+    /// use obs = AMap.observe (fun view delta -&gt;
+    ///     printfn "set: %A removed: %A count: %d" delta.SetEntries delta.RemovedKeys view.Count)
+    ///     (CMap.value scores)
+    /// CMap.addOrUpdate "ada" 10 scores   // prints "set: [("ada", 10)] removed: [] count: 1"
+    /// </code>
+    /// </example>
+    let observe
+        (callback: IReadOnlyDictionary<'K, 'V> -> MapDelta<'K, 'V> -> unit)
+        (mapValue: IAdaptiveMap<'K, 'V>)
+        : IObservation =
+        let node = ObserveMapNode<'K, 'V>(mapValue, callback)
+        node.Attach()
+        node :> IObservation
 
     /// <summary>
     /// Returns a transient view of the current state. Valid only until the next

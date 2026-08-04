@@ -86,6 +86,10 @@ type ChangeableSet<'T>(initial: seq<'T>) =
             this.PushAndMark()
 
     member private this.CommitJournal() =
+        // The current batch's flush is already enqueued (we are running from
+        // it); resetting now lets reentrant writes during the flush re-enqueue.
+        flushEnqueued <- false
+
         if journalCount > 0 then
             // Replay in write order; the scratch sets hold the net delta.
             scratchAdds.Clear()
@@ -304,6 +308,10 @@ type ChangeableMap<'K, 'V when 'K: equality>(initial: seq<'K * 'V>) =
             this.PushAndMark()
 
     member private this.CommitJournal() =
+        // The current batch's flush is already enqueued (we are running from
+        // it); resetting now lets reentrant writes during the flush re-enqueue.
+        flushEnqueued <- false
+
         if journalCount > 0 then
             // Replay in write order; the scratch state holds the net delta.
             scratchSets.Clear()
