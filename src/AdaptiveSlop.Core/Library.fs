@@ -4,6 +4,7 @@ open System
 open System.Buffers
 open System.Collections.Generic
 open System.Diagnostics
+open System.Threading
 open System.Threading.Tasks
 
 /// <summary>
@@ -297,6 +298,85 @@ type internal ParentEdges() =
             count <- 0
 
 /// <summary>
+/// Internal. Source of a posted change: applies the pending posted value.
+/// </summary>
+type internal IPostSource =
+    abstract member ApplyPosted: unit -> unit
+
+/// <summary>
+/// Internal. A slot of the bounded post ring. Carries a sequence number for
+/// synchronization between producers and the consumer.
+/// </summary>
+type internal PostSlot() =
+    [<DefaultValue>]
+    val mutable Seq: int
+
+    [<DefaultValue>]
+    val mutable Item: obj
+
+/// <summary>
+/// Internal. Bounded multi-producer, single-consumer ring buffer for cross-thread
+/// posts. Preallocated. Each slot carries a sequence number; producers and the
+/// consumer synchronize through it. The only Interlocked/Volatile use in the core
+/// is here, inside the explicit handoff structure (PLAN.md §7.3).
+/// </summary>
+type internal PostRing(capacity: int) =
+    let mask = capacity - 1
+    let slots = Array.init capacity (fun _ -> PostSlot())
+
+    do
+        for i in 0 .. capacity - 1 do
+            slots[i].Seq <- i
+
+    // Producer claim position. The consumer position belongs to the owner thread.
+    let mutable head = 0L
+    let mutable tail = 0L
+
+    /// Enqueue one item. Spins until a slot is free. Called by foreign threads.
+    member this.Enqueue(item: obj) =
+        let mutable h = Volatile.Read(&head)
+        let mutable enqueued = false
+
+        while not enqueued do
+            let idx = int (h &&& int64 mask)
+            let slot = slots[idx]
+            let seq = Volatile.Read(&slot.Seq)
+
+            if int h = seq then
+                if Interlocked.CompareExchange(&head, h + 1L, h) = h then
+                    slot.Item <- item
+                    Volatile.Write(&slot.Seq, seq + 1)
+                    enqueued <- true
+            elif seq < int h then
+                // The ring is full: the slot has not been consumed yet. Wait.
+                Thread.SpinWait(8)
+                h <- Volatile.Read(&head)
+            else
+                // Claimed by another producer; retry at the new head.
+                h <- Volatile.Read(&head)
+
+    /// Dequeue one item, or none when empty. Called by the owner thread only.
+    /// Returns a struct voption: no allocation.
+    member this.TryDequeue() : obj voption =
+        let t = Volatile.Read(&tail)
+        let idx = int (t &&& int64 mask)
+        let slot = slots[idx]
+        let seq = Volatile.Read(&slot.Seq)
+
+        if seq = int t + 1 then
+            let item = slot.Item
+            slot.Item <- null
+            Volatile.Write(&slot.Seq, int (t + int64 capacity))
+            Volatile.Write(&tail, t + 1L)
+            ValueSome item
+        else
+            ValueNone
+
+    /// True when the queue is definitely empty. A post that lands after this check
+    /// is simply applied by a later pump.
+    member _.IsEmpty = Volatile.Read(&tail) = Volatile.Read(&head)
+
+/// <summary>
 /// Internal. Holds all mutable runtime state of one adaptive graph.
 /// </summary>
 /// <remarks>
@@ -310,6 +390,8 @@ type internal GraphContext() =
     // Incremented on every applied write. Invalidates per-evaluation dirty caches
     // when a write lands in the middle of an evaluation.
     let mutable writeGeneration = 0L
+    // Bounded ring for cross-thread posts; drained by Pump on the owner thread.
+    let postRing = PostRing(1024)
     let collector = DependencyCollector()
     let mutable collectorActive = false
     let txBuffer = TransactionBuffer()
@@ -422,6 +504,40 @@ type internal GraphContext() =
         notifications[notifyCount] <- sink
         notifyCount <- notifyCount + 1
 
+    member internal _.PostRing = postRing
+
+    /// Apply all posted changes on the owner thread. One application per source per
+    /// window: duplicate posts collapse to the last value. Notifications are
+    /// delivered after the drain, like after a transaction. When a transaction is
+    /// already active, posts apply immediately and notifications defer to its commit.
+    member internal this.Pump() =
+        this.ClaimOwner()
+
+        try
+            if not postRing.IsEmpty then
+                if this.TxActive then
+                    this.DrainPosts()
+                else
+                    // Apply the drain in one batch, then deliver notifications once.
+                    this.TxActive <- true
+
+                    try
+                        this.DrainPosts()
+                    finally
+                        this.TxActive <- false
+
+                    this.DeliverNotifications()
+        finally
+            this.ReleaseOwner()
+
+    /// Drain the ring, applying each pending posted value. Owner thread only.
+    member private this.DrainPosts() =
+        let mutable item = postRing.TryDequeue()
+
+        while item.IsSome do
+            (unbox<IPostSource> item.Value).ApplyPosted()
+            item <- postRing.TryDequeue()
+
     /// Deliver every queued notification. Notifications queued during delivery
     /// are delivered in the same drain.
     member internal _.DeliverNotifications() =
@@ -463,6 +579,38 @@ module internal AdaptiveRuntime =
         finally
             if collector.PopFrame() = 0 then
                 ctx.CollectorActive <- false
+
+/// <summary>
+/// Applies changes posted from foreign threads.
+/// </summary>
+/// <remarks>
+/// <para>
+/// A graph is confined to one owner thread: all reads and writes happen there.
+/// Foreign threads may only call <c>Post</c> on changeable values. The owner thread
+/// calls <c>Posting.pump()</c> once per frame or batch to apply the pending posts.
+/// </para>
+/// <para>
+/// Pending posts are applied in one batch: every posted source is applied at most
+/// once per pump, with the last posted value winning. The source equality check
+/// still applies, so posting an equal value does not mark. <c>pump</c> is cheap when
+/// the queue is empty and allocates nothing.
+/// </para>
+/// </remarks>
+/// <example>
+/// <code>
+/// // worker thread
+/// cval.Post(health - 1)
+/// // owner thread, once per frame
+/// Posting.pump()
+/// </code>
+/// </example>
+module Posting =
+    /// <summary>Applies all pending posted changes on the owner thread.</summary>
+    /// <remarks>
+    /// Must be called on the owner thread. Posts from foreign threads that are not
+    /// yet in the queue stay pending until a later pump.
+    /// </remarks>
+    let pump () = GraphContext.Default.Pump()
 
 module Transaction =
     /// <summary>
@@ -709,6 +857,10 @@ and ChangeableValue<'T>(initial: 'T) =
     // Pending slot for writes inside a transaction. Last write wins.
     let mutable hasPending = false
     let mutable pendingValue = Unchecked.defaultof<'T>
+    // Posting: pending value written by a foreign thread, applied at Pump.
+    // 0 = not queued, 1 = queued. Interlocked-managed.
+    let mutable posted = 0
+    let mutable postedValue = Unchecked.defaultof<'T>
 
     member internal this.Apply(newValue: 'T) =
         let ctx = GraphContext.Default
@@ -732,6 +884,41 @@ and ChangeableValue<'T>(initial: 'T) =
     member internal _.AbortPending() =
         hasPending <- false
         pendingValue <- Unchecked.defaultof<'T>
+
+    /// <summary>
+    /// Posts a new value from any thread. The value is applied by <c>Posting.pump()</c>
+    /// on the owner thread. Several posts to this source between two pumps collapse
+    /// to the last value. The source equality check applies at application, so
+    /// posting an equal value does not mark. Allocates nothing.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Post is the only operation a foreign thread may call on a graph. It never
+    /// touches graph state: it writes the typed pending field and, if the source is
+    /// not queued yet, pushes the source onto the bounded post ring. If the ring is
+    /// full, Post waits until the owner drains it.
+    /// </para>
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// // worker thread
+    /// health.Post(healthValue - 1)
+    /// // owner thread, once per frame
+    /// Posting.pump()
+    /// </code>
+    /// </example>
+    member this.Post(newValue: 'T) =
+        postedValue <- newValue
+
+        if Interlocked.CompareExchange(&posted, 1, 0) = 0 then
+            GraphContext.Default.PostRing.Enqueue(this :> obj)
+
+    /// Apply the pending posted value on the owner thread (called from Pump).
+    member internal this.ApplyPostedValue() =
+        // Clear the queued flag before reading: a post that lands after the clear
+        // re-enqueues, so its value cannot be lost.
+        Interlocked.Exchange(&posted, 0) |> ignore
+        this.Apply(postedValue)
 
     member this.Set(newValue: 'T) =
         let ctx = GraphContext.Default
@@ -766,6 +953,9 @@ and ChangeableValue<'T>(initial: 'T) =
     interface ICommit with
         member this.Commit() = this.ApplyPending()
         member this.Abort() = this.AbortPending()
+
+    interface IPostSource with
+        member this.ApplyPosted() = this.ApplyPostedValue()
 
 and MapNNode<'T, 'U>(deps: IAdaptiveValue<'T>[], [<InlineIfLambda>] compute: 'T[] -> 'U) =
     let mutable version = 0L
@@ -2010,5 +2200,19 @@ module CVal =
     let inline create (value: 'T) = ChangeableValue value
 
     let inline set (value: 'T) (cval: ChangeableValue<'T>) = cval.Set value
+
+    /// <summary>
+    /// Posts a new value from any thread. The value is applied by <c>Posting.pump()</c>
+    /// on the owner thread. See <see cref="ChangeableValue&lt;'T&gt;.Post"/>.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// // worker thread
+    /// CVal.post (health - 1) health
+    /// // owner thread, once per frame
+    /// Posting.pump()
+    /// </code>
+    /// </example>
+    let inline post (value: 'T) (cval: ChangeableValue<'T>) = cval.Post value
 
     let inline value (cval: ChangeableValue<'T>) : IAdaptiveValue<'T> = cval

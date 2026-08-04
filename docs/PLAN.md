@@ -5,8 +5,8 @@ information necessary for the implementation. It has no external references.
 
 ## Status
 
-- Done: Phase 0, Phase 1, Phase 2, Phase 3, Phase 4 (2026-08-03).
-- Next: Phase 5 (cross-thread posting).
+- Done: Phase 0, Phase 1, Phase 2, Phase 3, Phase 4 (2026-08-03), Phase 5 (2026-08-04).
+- Next: Phase 6 (collections lifecycle).
 
 ## 1. Targets
 

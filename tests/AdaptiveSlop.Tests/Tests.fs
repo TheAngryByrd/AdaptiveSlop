@@ -3,6 +3,7 @@ module AdaptiveSlop.Tests
 #nowarn "893"
 
 open System
+open System.Threading
 open System.Threading.Tasks
 open global.Xunit
 open AdaptiveSlop.Core
@@ -1400,3 +1401,123 @@ let ``mapN recompute allocates zero bytes`` () =
 
     let allocated = GC.GetAllocatedBytesForCurrentThread() - before
     Assert.Equal(0L, allocated)
+
+// =============================================================================
+// Phase 5 — Cross-thread posting
+// =============================================================================
+
+[<Fact>]
+let ``Post defers application until pump`` () =
+    let a = CVal.create 1
+    let m = AVal.map (fun v -> v * 10) (CVal.value a)
+
+    a.Post(5)
+    Assert.Equal(10, AVal.getValue m) // not applied yet
+    Posting.pump ()
+    Assert.Equal(50, AVal.getValue m)
+
+[<Fact>]
+let ``Posts from a foreign thread apply at pump on the owner thread`` () =
+    let a = CVal.create 0
+    let mutable seen: int list = []
+    use _obs = AVal.observe (fun v -> seen <- v :: seen) (CVal.value a)
+
+    let producer =
+        Task.Run(fun () ->
+            for i in 1..100 do
+                a.Post(i))
+
+    producer.Wait()
+    // Nothing applied yet: the graph was not touched from the foreign thread.
+    Assert.Equal(0, AVal.getValue (CVal.value a))
+    Posting.pump ()
+    Assert.Equal(100, AVal.getValue (CVal.value a))
+    // One window, one application: one notification with the last value.
+    Assert.Equal<int list>([ 100 ], seen)
+
+[<Fact>]
+let ``Posts from several threads collapse to one application per window`` () =
+    let a = CVal.create 0
+    let mutable recomputeCount = 0
+
+    let m =
+        AVal.map
+            (fun v ->
+                recomputeCount <- recomputeCount + 1
+                v)
+            (CVal.value a)
+
+    Assert.Equal(0, AVal.getValue m) // initial: 1 recompute
+    Assert.Equal(1, recomputeCount)
+
+    let producers =
+        [ for _ in 1..4 ->
+              Task.Run(fun () ->
+                  for i in 1..250 do
+                      a.Post(i)) ]
+
+    Task.WaitAll(Array.ofList producers)
+    Posting.pump ()
+    // All 1000 posts collapsed into one application of the last posted value.
+    Assert.Equal(250, AVal.getValue (CVal.value a))
+    Assert.Equal(250, AVal.getValue m) // lazy: this read triggers the recompute
+    Assert.Equal(2, recomputeCount)
+    // An empty pump must not recompute anything.
+    Posting.pump ()
+    Assert.Equal(2, recomputeCount)
+
+[<Fact>]
+let ``Posting an equal value does not mark`` () =
+    let a = CVal.create 5
+    let mutable count = 0
+    use _obs = AVal.observe (fun _ -> count <- count + 1) (CVal.value a)
+
+    a.Post(5)
+    Posting.pump ()
+    Assert.Equal(0, count)
+
+[<Fact>]
+let ``Post and pump allocate zero bytes`` () =
+    let a = CVal.create 0
+    let m = AVal.map (fun v -> v + 1) (CVal.value a)
+    AVal.getValue m |> ignore // warm up
+
+    let before = GC.GetAllocatedBytesForCurrentThread()
+
+    for i in 1..1000 do
+        a.Post(i)
+        Posting.pump ()
+        AVal.getValue m |> ignore
+
+    let allocated = GC.GetAllocatedBytesForCurrentThread() - before
+    Assert.Equal(0L, allocated)
+
+[<Fact>]
+let ``Stress: posts interleaved with pumps and reads stay consistent`` () =
+    let a = CVal.create 0
+    let m = AVal.map (fun v -> v + 1) (CVal.value a)
+    let rng = Random(1)
+
+    let producer =
+        Task.Run(fun () ->
+            for _ in 1..5000 do
+                a.Post(rng.Next(1000)))
+
+    // Pump and read while the producer runs.
+    let mutable ok = true
+
+    while not producer.IsCompleted do
+        Posting.pump ()
+        let v = AVal.getValue m
+
+        if v < 1 || v > 1000 then
+            ok <- false
+
+        Thread.Yield() |> ignore
+
+    producer.Wait()
+    Posting.pump ()
+    let final = AVal.getValue (CVal.value a)
+    Assert.True(ok, "read an out-of-range value")
+    Assert.InRange(final, 0, 999)
+    Assert.Equal(final + 1, AVal.getValue m)
