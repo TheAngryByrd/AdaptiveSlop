@@ -305,6 +305,60 @@ module ASet =
     let inline countBy ([<InlineIfLambda>] predicate: 'T -> bool) (set: aset<'T>) : aval<int> =
         new SetReduceNode<'T, bool, int, int>(set, predicate, AdaptiveReduction.countPositive)
 
+    // =========================================================================
+    // The *A reductions (docs/2026-08-05-MAPA-DESIGN.md §10, v2): composition
+    // over mapA + the existing reduction nodes. No new node types. FDA
+    // argument order: reduction, mapping, set.
+    // =========================================================================
+
+    /// <summary>
+    /// Adaptively reduces the set after mapping every element to an adaptive
+    /// value (FDA <c>ASet.reduceByA</c> parity). The mapped values must be
+    /// equality-comparable (the mapA node's constraint). Composition: the
+    /// mapping produces distinct pairs <c>struct (x, v)</c>, so duplicate
+    /// mapped values keep their multiplicity (a plain mapA would deduplicate
+    /// them); the reduction projects the value side.
+    /// </summary>
+    let inline reduceByA
+        (reduction: AdaptiveReduction<'U, 's, 'v>)
+        ([<InlineIfLambda>] mapping: 'T -> aval<'U>)
+        (set: aset<'T>)
+        : aval<'v> =
+        set
+        |> mapA (fun x -> AVal.map (fun v -> struct (x, v)) (mapping x))
+        |> reduceBy reduction (fun struct (_, v) -> v)
+
+    /// <summary>
+    /// Adaptively counts the elements whose predicate aval holds <c>true</c>
+    /// (FDA <c>ASet.countByA</c> parity). Composition: filterA + count
+    /// (element-preserving, unlike a bool-mapped reduce).
+    /// </summary>
+    let inline countByA ([<InlineIfLambda>] predicate: 'T -> aval<bool>) (set: aset<'T>) : aval<int> =
+        set |> filterA predicate |> count
+
+    /// <summary>Adaptively tests if any element's predicate aval holds <c>true</c> (FDA <c>ASet.existsA</c> parity).</summary>
+    let inline existsA ([<InlineIfLambda>] predicate: 'T -> aval<bool>) (set: aset<'T>) : aval<bool> =
+        set |> countByA predicate |> AVal.map (fun c -> c <> 0)
+
+    /// <summary>Adaptively tests if every element's predicate aval holds <c>true</c> (FDA <c>ASet.forallA</c> parity).</summary>
+    let inline forallA ([<InlineIfLambda>] predicate: 'T -> aval<bool>) (set: aset<'T>) : aval<bool> =
+        set |> filterA (fun x -> AVal.map not (predicate x)) |> count |> AVal.map (fun c -> c = 0)
+
+    /// <summary>Adaptively sums the avals mapped from the elements (FDA <c>ASet.sumByA</c> parity).</summary>
+    let inline sumByA ([<InlineIfLambda>] mapping: 'T -> aval<'U>) (set: aset<'T>) : aval<'U> =
+        reduceByA (AdaptiveReduction.sum ()) mapping set
+
+    /// <summary>
+    /// Adaptively averages the avals mapped from the elements (FDA
+    /// <c>ASet.averageByA</c> parity; needs a numeric type with
+    /// <c>DivideByInt</c>, e.g. <c>float</c>).
+    /// </summary>
+    let inline averageByA ([<InlineIfLambda>] mapping: 'T -> aval<'U>) (set: aset<'T>) : aval<'U> =
+        AVal.map2
+            (fun total count -> LanguagePrimitives.DivideByInt total count)
+            (reduceByA (AdaptiveReduction.sum ()) mapping set)
+            (count set)
+
     /// <summary>Adaptively sums the elements.</summary>
     let inline sum (set: aset<'T>) : aval<'T> = reduce (AdaptiveReduction.sum ()) set
 
@@ -904,6 +958,39 @@ module AList =
     /// </summary>
     let inline filterA ([<InlineIfLambda>] predicate: 'T -> aval<bool>) (list: alist<'T>) : alist<'T> =
         new ElementListNode<'T, 'T>(list, fun _ x -> AVal.map (fun b -> if b then ValueSome x else ValueNone) (predicate x))
+
+    /// <summary>
+    /// Adaptively maps every element of the list to an adaptive value, passing
+    /// the input position to the mapping (FDA <c>AList.mapiA</c> parity;
+    /// FDA passes an <c>Index</c>, we pass the <c>int</c> position).
+    /// </summary>
+    let inline mapiA ([<InlineIfLambda>] mapping: int -> 'T -> aval<'U>) (list: alist<'T>) : alist<'U> =
+        new ElementListNode<'T, 'U>(list, fun i x -> AVal.map ValueSome (mapping i x))
+
+    /// <summary>
+    /// Adaptively maps every element of the list to an adaptive value, keeping
+    /// only the elements whose aval holds <c>Some</c>, passing the input
+    /// position to the mapping (FDA <c>AList.chooseiA</c> parity).
+    /// </summary>
+    let inline chooseiA
+        ([<InlineIfLambda>] mapping: int -> 'T -> aval<'U option>)
+        (list: alist<'T>)
+        : alist<'U> =
+        new ElementListNode<'T, 'U>(list, fun i x -> AVal.map Option.toValueOption (mapping i x))
+
+    /// <summary>
+    /// Adaptively keeps the elements whose predicate aval holds <c>true</c>,
+    /// passing the input position to the predicate (FDA <c>AList.filteriA</c>
+    /// parity).
+    /// </summary>
+    let inline filteriA
+        ([<InlineIfLambda>] predicate: int -> 'T -> aval<bool>)
+        (list: alist<'T>)
+        : alist<'T> =
+        new ElementListNode<'T, 'T>(
+            list,
+            fun i x -> AVal.map (fun b -> if b then ValueSome x else ValueNone) (predicate i x)
+        )
 
     /// <summary>The concatenation of two lists (FDA <c>AList.append</c> parity).</summary>
     let inline append (left: alist<'T>) (right: alist<'T>) : alist<'T> = new AppendListNode<'T>(left, right)

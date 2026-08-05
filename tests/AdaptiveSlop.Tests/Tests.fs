@@ -398,6 +398,110 @@ let ``ASet mapA disposal unregisters every element aval edge`` () =
     Assert.Equal(0, aval2.EdgeCount)
 
 [<Fact>]
+let ``ASet countByA counts predicate-aval matches`` () =
+    let s = CSet.ofSeq [ 1; 2; 3; 4 ]
+    let flag = CVal.create true
+
+    let count =
+        s
+        |> ASet.countByA (fun v ->
+            flag
+            |> AVal.map (fun f -> f && v % 2 = 0))
+
+    Assert.Equal(2, AVal.getValue count) // 2,4
+    CVal.set false flag
+    Assert.Equal(0, AVal.getValue count)
+    s.Add 6
+    Assert.Equal(0, AVal.getValue count)
+    CVal.set true flag
+    Assert.Equal(3, AVal.getValue count) // 2,4,6
+    s.Remove 2
+    Assert.Equal(2, AVal.getValue count)
+
+[<Fact>]
+let ``ASet existsA and forallA follow predicate avals`` () =
+    let s = CSet.ofSeq [ 1; 2; 3 ]
+    let flag = CVal.create true
+
+    let exists =
+        s
+        |> ASet.existsA (fun v ->
+            flag
+            |> AVal.map (fun f -> f && v > 2))
+
+    let forall =
+        s
+        |> ASet.forallA (fun v ->
+            flag
+            |> AVal.map (fun f -> f && v > 2))
+
+    Assert.True(AVal.getValue exists) // 3 qualifies
+    Assert.False(AVal.getValue forall) // 1,2 do not
+    CVal.set false flag
+    Assert.False(AVal.getValue exists)
+    Assert.False(AVal.getValue forall)
+    CVal.set true flag
+    Assert.True(AVal.getValue exists)
+    Assert.False(AVal.getValue forall)
+
+[<Fact>]
+let ``ASet sumByA sums mapped avals`` () =
+    let s = CSet.ofSeq [ 1; 2; 3 ]
+    let k = CVal.create 10
+
+    let sum =
+        s
+        |> ASet.sumByA (fun v ->
+            k
+            |> AVal.map (fun k -> v * k))
+
+    Assert.Equal(60, AVal.getValue sum)
+    CVal.set 2 k
+    Assert.Equal(12, AVal.getValue sum)
+    s.Add 4
+    Assert.Equal(20, AVal.getValue sum)
+    s.Remove 3
+    Assert.Equal(14, AVal.getValue sum)
+
+[<Fact>]
+let ``ASet averageByA averages mapped avals`` () =
+    let s = CSet.ofSeq [ 1.0; 2.0; 3.0 ]
+    let k = CVal.create 2.0
+
+    let avg =
+        s
+        |> ASet.averageByA (fun v ->
+            k
+            |> AVal.map (fun k -> v * k))
+
+    Assert.Equal(4.0, AVal.getValue avg) // (2+4+6)/3
+    CVal.set 3.0 k
+    Assert.Equal(6.0, AVal.getValue avg) // (3+6+9)/3
+    s.Add 5.0
+    Assert.Equal(8.25, AVal.getValue avg) // (3+6+9+15)/4
+    s.Remove 1.0
+    Assert.Equal(10.0, AVal.getValue avg) // (6+9+15)/3
+
+[<Fact>]
+let ``ASet reduceByA folds with a custom reduction`` () =
+    let s = CSet.ofSeq [ 1; 3; 5 ]
+    let k = CVal.create 10
+
+    let min =
+        s
+        |> ASet.reduceByA (AdaptiveReduction.tryMin ()) (fun v ->
+            k
+            |> AVal.map (fun k -> v + k))
+
+    Assert.Equal(ValueSome 11, AVal.getValue min)
+    CVal.set 100 k
+    Assert.Equal(ValueSome 101, AVal.getValue min)
+    s.Add 200
+    Assert.Equal(ValueSome 101, AVal.getValue min)
+    s.Remove 1
+    Assert.Equal(ValueSome 103, AVal.getValue min)
+
+[<Fact>]
 let ``AMap map and filter`` () =
     let source = CMap.ofSeq [ 1, 10; 2, 20; 3, 30 ]
     let mapped = AMap.map (fun _ v -> v + 1) (CMap.value source)
@@ -3802,6 +3906,89 @@ let ``AList mapA disposal unregisters every element aval edge`` () =
     (result :> IDisposable).Dispose()
     Assert.Equal(0, aval1.EdgeCount)
     Assert.Equal(0, aval2.EdgeCount)
+
+[<Fact>]
+let ``AList mapiA passes the position at mapping time`` () =
+    let l = CList.ofList [ 10; 20; 30 ]
+
+    let result =
+        l
+        |> AList.mapiA (fun i _ -> AVal.constant i)
+
+    Assert.Equal<int list>([ 0; 1; 2 ], AList.toList result)
+
+    CList.insertAt 0 5 l
+    // The new element maps at position 0; shifted elements keep their aval
+    // (the mapping does not re-run for shifted elements, docs/2026-08-05-
+    // MAPA-DESIGN.md §4: FDA's stable-Index equivalent).
+    Assert.Equal<int list>([ 0; 0; 1; 2 ], AList.toList result)
+
+    CList.removeAt 2 l // removes 20 (mapped 1); 30 keeps its mapped 2
+    Assert.Equal<int list>([ 0; 0; 2 ], AList.toList result)
+
+    CList.append 6 l // the new element maps at position 3
+    Assert.Equal<int list>([ 0; 0; 2; 3 ], AList.toList result)
+
+    CList.updateAt 1 99 l // the updated element re-maps at position 1
+    Assert.Equal<int list>([ 0; 1; 2; 3 ], AList.toList result)
+
+[<Fact>]
+let ``AList mapiA inner change (mapping depends on another adaptive set)`` () =
+    let map = CList.ofList [ 1; 2; 3; 4; 5 ]
+    let keys = CSet.ofSeq [ 0; 2; 4 ]
+
+    let res =
+        map
+        |> AList.mapiA (fun k v -> keys |> ASet.contains k |> AVal.map (function true -> v | false -> -1))
+
+    Assert.Equal<int list>([ 1; -1; 3; -1; 5 ], AList.toList res)
+
+    CList.set [ 2; 4; 6; 8; 10 ] map
+    Assert.Equal<int list>([ 2; -1; 6; -1; 10 ], AList.toList res)
+
+    CSet.set (Set.ofList [ 0; 2; 3; 4 ]) keys
+    Assert.Equal<int list>([ 2; -1; 6; 8; 10 ], AList.toList res)
+
+[<Fact>]
+let ``AList filteriA flips by position`` () =
+    let map = CList.ofList [ 1; 2; 3; 4; 5 ]
+    let keys = CSet.ofSeq [ 0; 2; 4 ]
+
+    let res =
+        map
+        |> AList.filteriA (fun k _ -> keys |> ASet.contains k)
+
+    Assert.Equal<int list>([ 1; 3; 5 ], AList.toList res)
+
+    CList.set [ 2; 4; 6; 8; 10 ] map
+    Assert.Equal<int list>([ 2; 6; 10 ], AList.toList res)
+
+    CSet.set (Set.ofList [ 0; 2; 3; 4 ]) keys
+    Assert.Equal<int list>([ 2; 6; 8; 10 ], AList.toList res)
+
+[<Fact>]
+let ``AList chooseiA survival flips by position`` () =
+    let l = CList.ofList [ 1; 2; 3 ]
+    let keepEven = CVal.create true
+
+    let result =
+        l
+        |> AList.chooseiA (fun i v ->
+            keepEven
+            |> AVal.map (fun k ->
+                if k && i % 2 = 1 then Some(v * 10)
+                else None))
+
+    Assert.Equal<int list>([ 20 ], AList.toList result)
+
+    CVal.set false keepEven
+    Assert.Equal<int list>([], AList.toList result)
+
+    CList.append 4 l
+    Assert.Equal<int list>([], AList.toList result)
+
+    CVal.set true keepEven
+    Assert.Equal<int list>([ 20; 40 ], AList.toList result)
 
 [<Fact>]
 let ``AList filter and choose update semantics`` () =
