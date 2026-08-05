@@ -11,22 +11,25 @@ open System.Collections.Frozen
 // IMapSinkRegistry interface on every node type, so derived maps compose freely.
 // =============================================================================
 
-/// <summary>An adaptive map over a fixed, immutable value.</summary>
-type ConstantMap<'K, 'V when 'K: equality>(value: FrozenDictionary<'K, 'V>) =
+/// <summary>An adaptive map over a fixed, immutable value. The value is computed once, at first read.</summary>
+type ConstantMap<'K, 'V when 'K: equality>(create: unit -> FrozenDictionary<'K, 'V>) =
+    let value = lazy create ()
+
     interface IAdaptiveMap<'K, 'V> with
         member this.GetValue() =
             AdaptiveRuntime.addDependency (this :> IAdaptiveObject) 0L
-            value :> IReadOnlyDictionary<'K, 'V>
+            value.Value :> IReadOnlyDictionary<'K, 'V>
 
         member _.Version = 0L
 
     interface IDisposable with
         member _.Dispose() = ()
 
-/// <summary>Maps every entry of a map.</summary>
-type MapMapNode<'K, 'V, 'U when 'K: equality>(source: IAdaptiveMap<'K, 'V>, [<InlineIfLambda>] mapping: 'K -> 'V -> 'U)
-    =
-    let mapOpt = fun k v -> ValueSome(mapping k v)
+/// <summary>
+/// Maps every entry of a map (or chooses, when the mapping returns
+/// <c>ValueNone</c> to drop an entry).
+/// </summary>
+type MapMapNode<'K, 'V, 'U when 'K: equality>(source: IAdaptiveMap<'K, 'V>, mapping: 'K -> 'V -> 'U voption) =
     let mutable state = MapNodeState<'K, 'V, 'U>.Create(1)
     let mutable initialized = false
     let mutable disposed = false
@@ -44,8 +47,18 @@ type MapMapNode<'K, 'V, 'U when 'K: equality>(source: IAdaptiveMap<'K, 'V>, [<In
     member private this.EnsureInitialized() =
         if not initialized then
             initialized <- true
+            // Snapshot first, register between, then run the mapping over the
+            // snapshot (see MapSetNode.EnsureInitialized in SetNodes.fs): the
+            // mapping is user code that may write to the source, and the write
+            // must land in our journal. A dirty source draining during the
+            // snapshot read pushes to nobody: no double-apply.
+            let snapshot = Dictionary<'K, 'V>()
+
+            for KeyValue(k, v) in source.GetValue() do
+                snapshot[k] <- v
+
             this.Register()
-            Collections.loadMap mapOpt source &state
+            Collections.loadMap mapping snapshot &state
             state.DepVersions[0] <- source.Version
 
     interface IMapDeltaSink<'K, 'V> with
@@ -71,7 +84,7 @@ type MapMapNode<'K, 'V, 'U when 'K: equality>(source: IAdaptiveMap<'K, 'V>, [<In
                     state.DepVersions[0] <- source.Version
 
                 if not state.Journal.IsEmpty then
-                    Collections.drainMapPush mapOpt &state
+                    Collections.drainMapPush mapping &state
 
                 AdaptiveRuntime.addDependency (this :> IAdaptiveObject) state.Version
                 state.Data :> IReadOnlyDictionary<'K, 'U>
@@ -119,8 +132,14 @@ type FilterMapNode<'K, 'V when 'K: equality>
     member private this.EnsureInitialized() =
         if not initialized then
             initialized <- true
+            // Snapshot first, register between (see MapMapNode.EnsureInitialized).
+            let snapshot = Dictionary<'K, 'V>()
+
+            for KeyValue(k, v) in source.GetValue() do
+                snapshot[k] <- v
+
             this.Register()
-            Collections.loadMap mapOpt source &state
+            Collections.loadMap mapOpt snapshot &state
             state.DepVersions[0] <- source.Version
 
     interface IMapDeltaSink<'K, 'V> with
@@ -160,6 +179,1084 @@ type FilterMapNode<'K, 'V when 'K: equality>
             if not disposed then
                 disposed <- true
                 this.Unregister()
+                Collections.clearSinks &state.Sinks
+
+    interface IMapSinkRegistry with
+        member this.AddMapSink(sink) = Collections.addSink &state.Sinks sink
+
+        member this.RemoveMapSink(sink) =
+            Collections.removeSink &state.Sinks sink
+
+    interface IEdgeTarget with
+        member _.EdgeCount = state.Edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
+
+/// <summary>
+/// Merges two maps with a mapping over both side values (voptions). The
+/// mapping decides the semantics: choose2, intersect(With), union(With) are
+/// all this node with different mappings (FDA models them all on
+/// Choose2VReader). The mapping is called only when at least one side has a
+/// value; the sides' current values are tracked per key.
+/// </summary>
+type Choose2MapNode<'K, 'V1, 'V2, 'V3 when 'K: equality>
+    (left: IAdaptiveMap<'K, 'V1>, right: IAdaptiveMap<'K, 'V2>, mapping: 'K -> 'V1 voption -> 'V2 voption -> 'V3 voption)
+    =
+    let deps: IAdaptiveObject[] =
+        [| left :> IAdaptiveObject; right :> IAdaptiveObject |]
+
+    let mutable state = Collections.Choose2State<'K, 'V1, 'V2, 'V3>.Create(2)
+    let mutable leftSink: obj = null
+    let mutable rightSink: obj = null
+    let mutable initialized = false
+    let mutable disposed = false
+
+    member private this.Register() =
+        leftSink <- box (Collections.SideMapSink<'K, 'V1>(this, 0))
+
+        rightSink <- box (Collections.SideMapSink<'K, 'V2>(this, 1))
+
+        match box left with
+        | :? IMapSinkRegistry as r -> r.AddMapSink(leftSink)
+        | _ -> ()
+
+        match box right with
+        | :? IMapSinkRegistry as r -> r.AddMapSink(rightSink)
+        | _ -> ()
+
+    member private this.Unregister() =
+        match box left with
+        | :? IMapSinkRegistry as r -> r.RemoveMapSink(leftSink)
+        | _ -> ()
+
+        match box right with
+        | :? IMapSinkRegistry as r -> r.RemoveMapSink(rightSink)
+        | _ -> ()
+
+    member private this.OnLeftDeltas(sets: struct ('K * 'V1)[], setCnt: int, rems: 'K[], remCnt: int) =
+        if not disposed then
+            Collections.journalAppendMap &state.JournalL sets setCnt rems remCnt
+            state.Version <- state.Version + 1L
+            GraphContext.Default.MarkFrom(state.Edges)
+
+    member private this.OnRightDeltas(sets: struct ('K * 'V2)[], setCnt: int, rems: 'K[], remCnt: int) =
+        if not disposed then
+            Collections.journalAppendMap &state.JournalR sets setCnt rems remCnt
+            state.Version <- state.Version + 1L
+            GraphContext.Default.MarkFrom(state.Edges)
+
+    interface Collections.ISideMapSinkTarget with
+        member this.OnSideDeltas(side: int, sets: obj, setCnt: int, rems: obj, remCnt: int) =
+            if not disposed then
+                if side = 0 then
+                    Collections.journalAppendMap &state.JournalL (unbox sets) setCnt (unbox rems) remCnt
+                else
+                    Collections.journalAppendMap &state.JournalR (unbox sets) setCnt (unbox rems) remCnt
+
+                state.Version <- state.Version + 1L
+                GraphContext.Default.MarkFrom(state.Edges)
+
+    member private this.EnsureInitialized() =
+        if not initialized then
+            initialized <- true
+            // Snapshot first, register between (see MapMapNode.EnsureInitialized).
+            let leftSnapshot = Dictionary<'K, 'V1>()
+
+            for KeyValue(k, v) in left.GetValue() do
+                leftSnapshot[k] <- v
+
+            let rightSnapshot = Dictionary<'K, 'V2>()
+
+            for KeyValue(k, v) in right.GetValue() do
+                rightSnapshot[k] <- v
+
+            this.Register()
+            Collections.loadChoose2 mapping leftSnapshot rightSnapshot &state
+            state.DepVersions[0] <- left.Version
+            state.DepVersions[1] <- right.Version
+
+    interface IAdaptiveMap<'K, 'V3> with
+        member this.GetValue() =
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
+
+            try
+                if disposed then
+                    invalidOp "This adaptive map has been disposed."
+
+                this.EnsureInitialized()
+
+                for j in 0..1 do
+                    if deps[j].Version <> state.DepVersions[j] then
+                        if j = 0 then
+                            left.GetValue() |> ignore
+                        else
+                            right.GetValue() |> ignore
+
+                        state.DepVersions[j] <- deps[j].Version
+
+                if not state.JournalL.IsEmpty || not state.JournalR.IsEmpty then
+                    Collections.drainChoose2Push mapping &state
+
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) state.Version
+                state.Out :> IReadOnlyDictionary<'K, 'V3>
+            finally
+                ctx.ReleaseOwner()
+
+        member _.Version = state.Version
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                this.Unregister()
+                Collections.clearSinks &state.Sinks
+
+    interface IMapSinkRegistry with
+        member this.AddMapSink(sink) = Collections.addSink &state.Sinks sink
+
+        member this.RemoveMapSink(sink) =
+            Collections.removeSink &state.Sinks sink
+
+    interface IEdgeTarget with
+        member _.EdgeCount = state.Edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
+
+/// <summary>Internal. State of a set-to-map node (one value per key).</summary>
+[<Struct>]
+type internal SetToMapState<'K, 'V, 'T when 'K: equality> =
+    val mutable Version: int64
+    val mutable Edges: ParentEdges
+    val mutable Sinks: SinkList
+    val mutable DepVersions: int64[]
+    val mutable Data: Dictionary<'K, 'V>
+    val mutable Journal: SetDelta<'T>
+    val mutable Out: MapDelta<'K, 'V>
+
+    new
+        (
+            version: int64,
+            edges: ParentEdges,
+            sinks: SinkList,
+            depVersions: int64[],
+            data: Dictionary<'K, 'V>,
+            journal: SetDelta<'T>,
+            out: MapDelta<'K, 'V>
+        ) =
+        { Version = version
+          Edges = edges
+          Sinks = sinks
+          DepVersions = depVersions
+          Data = data
+          Journal = journal
+          Out = out }
+
+    static member Create(depCount: int) =
+        SetToMapState(
+            0L,
+            ParentEdges(),
+            SinkList.Create(),
+            Array.zeroCreate depCount,
+            Dictionary<'K, 'V>(),
+            SetDelta.Create(),
+            MapDelta.Create()
+        )
+
+/// <summary>
+/// A map from a set: every element maps to an entry. When multiple elements
+/// map to one key, the last value wins (<c>ofASetIgnoreDuplicates</c>); a
+/// removal of an entry whose value is not the current one is a no-op (gated).
+/// <c>mapSet</c> uses an unconditional removal (a set key appears once).
+/// </summary>
+type SetToMapNode<'K, 'V, 'T when 'K: equality>(source: IAdaptiveSet<'T>, toEntry: 'T -> 'K * 'V, gated: bool) =
+    let mutable state = SetToMapState<'K, 'V, 'T>.Create(1)
+    let mutable initialized = false
+    let mutable disposed = false
+
+    member private this.Register() =
+        match box source with
+        | :? ISetSinkRegistry as r -> r.AddSetSink(box (this :> ISetDeltaSink<'T>))
+        | _ -> ()
+
+    member private this.Unregister() =
+        match box source with
+        | :? ISetSinkRegistry as r -> r.RemoveSetSink(box (this :> ISetDeltaSink<'T>))
+        | _ -> ()
+
+    member private this.EnsureInitialized() =
+        if not initialized then
+            initialized <- true
+            // Snapshot first, register between (see MapMapNode.EnsureInitialized).
+            let snapshot = HashSet<'T>(source.GetValue())
+            this.Register()
+
+            for item in snapshot do
+                let (k, v) = toEntry item
+                state.Data[k] <- v
+
+            state.DepVersions[0] <- source.Version
+
+    interface ISetDeltaSink<'T> with
+        member this.OnDeltas(adds: 'T[], addCnt: int, rems: 'T[], remCnt: int) =
+            if not disposed then
+                Collections.journalAppendSet &state.Journal adds addCnt rems remCnt
+                state.Version <- state.Version + 1L
+                GraphContext.Default.MarkFrom(state.Edges)
+
+    interface IAdaptiveMap<'K, 'V> with
+        member this.GetValue() =
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
+
+            try
+                if disposed then
+                    invalidOp "This adaptive map has been disposed."
+
+                this.EnsureInitialized()
+
+                if source.Version <> state.DepVersions[0] then
+                    source.GetValue() |> ignore
+                    state.DepVersions[0] <- source.Version
+
+                if not state.Journal.IsEmpty then
+                    let ctx2 = GraphContext.Default
+                    let wasActive = ctx2.TxActive
+                    ctx2.TxActive <- true
+
+                    try
+                        let rems = state.Journal.Rems
+                        let adds = state.Journal.Adds
+                        let remStart = rems.Count
+                        let addStart = adds.Count
+                        let mutable changed = false
+                        let mutable i = 0
+
+                        while i < remStart do
+                            let item = rems.Items[i]
+                            let (k, v) = toEntry item
+                            let mutable old = Unchecked.defaultof<'V>
+
+                            if
+                                state.Data.TryGetValue(k, &old)
+                                && ((not gated) || EqualityComparer<'V>.Default.Equals(old, v))
+                            then
+                                state.Data.Remove k |> ignore
+                                state.Out.Rems <- Collections.bufferAppend state.Out.Rems k
+                                changed <- true
+
+                            i <- i + 1
+
+                        i <- 0
+
+                        while i < addStart do
+                            let item = adds.Items[i]
+                            let (k, v) = toEntry item
+                            let mutable old = Unchecked.defaultof<'V>
+
+                            if state.Data.TryGetValue(k, &old) && EqualityComparer<'V>.Default.Equals(old, v) then
+                                ()
+                            else
+                                state.Data[k] <- v
+                                state.Out.Sets <- Collections.bufferAppend state.Out.Sets (struct (k, v))
+                                changed <- true
+
+                            i <- i + 1
+
+                        let remLive = state.Journal.Rems.Count
+
+                        if remLive > remStart then
+                            Array.Copy(
+                                state.Journal.Rems.Items,
+                                remStart,
+                                state.Journal.Rems.Items,
+                                0,
+                                remLive - remStart
+                            )
+
+                            state.Journal.Rems.Count <- remLive - remStart
+                        else
+                            state.Journal.Rems.Count <- 0
+
+                        let addLive = state.Journal.Adds.Count
+
+                        if addLive > addStart then
+                            Array.Copy(
+                                state.Journal.Adds.Items,
+                                addStart,
+                                state.Journal.Adds.Items,
+                                0,
+                                addLive - addStart
+                            )
+
+                            state.Journal.Adds.Count <- addLive - addStart
+                        else
+                            state.Journal.Adds.Count <- 0
+
+                        if changed then
+                            Collections.pushMapDelta state.Sinks state.Out
+                            state.Out.Clear()
+                    finally
+                        ctx2.TxActive <- wasActive
+
+                    if not wasActive then
+                        ctx2.DeliverNotifications()
+
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) state.Version
+                state.Data :> IReadOnlyDictionary<'K, 'V>
+            finally
+                ctx.ReleaseOwner()
+
+        member _.Version = state.Version
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                this.Unregister()
+                Collections.clearSinks &state.Sinks
+
+    interface IMapSinkRegistry with
+        member this.AddMapSink(sink) = Collections.addSink &state.Sinks sink
+
+        member this.RemoveMapSink(sink) =
+            Collections.removeSink &state.Sinks sink
+
+    interface IEdgeTarget with
+        member _.EdgeCount = state.Edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
+
+/// <summary>Internal. State of a keep-all set-to-map node (per-key value sets).</summary>
+[<Struct>]
+type internal SetToMapKeepAllState<'K, 'V, 'T when 'K: equality> =
+    val mutable Version: int64
+    val mutable Edges: ParentEdges
+    val mutable Sinks: SinkList
+    val mutable DepVersions: int64[]
+    val mutable Data: Dictionary<'K, HashSet<'V>>
+    val mutable Journal: SetDelta<'T>
+    val mutable Out: MapDelta<'K, HashSet<'V>>
+
+    new
+        (
+            version: int64,
+            edges: ParentEdges,
+            sinks: SinkList,
+            depVersions: int64[],
+            data: Dictionary<'K, HashSet<'V>>,
+            journal: SetDelta<'T>,
+            out: MapDelta<'K, HashSet<'V>>
+        ) =
+        { Version = version
+          Edges = edges
+          Sinks = sinks
+          DepVersions = depVersions
+          Data = data
+          Journal = journal
+          Out = out }
+
+    static member Create(depCount: int) =
+        SetToMapKeepAllState(
+            0L,
+            ParentEdges(),
+            SinkList.Create(),
+            Array.zeroCreate depCount,
+            Dictionary<'K, HashSet<'V>>(),
+            SetDelta.Create(),
+            MapDelta.Create()
+        )
+
+/// <summary>
+/// A map from a set of entries: every key keeps ALL its values in a HashSet
+/// (<c>ofASet</c>/<c>ofASetMapped</c> FDA parity). A changed value set emits a
+/// fresh HashSet in the delta (reference identity: downstream nodes compare
+/// stored values by equality).
+/// </summary>
+type SetToMapKeepAllNode<'K, 'V, 'T when 'K: equality>(source: IAdaptiveSet<'T>, toEntry: 'T -> 'K * 'V) =
+    let mutable state = SetToMapKeepAllState<'K, 'V, 'T>.Create(1)
+    let mutable initialized = false
+    let mutable disposed = false
+
+    member private this.Register() =
+        match box source with
+        | :? ISetSinkRegistry as r -> r.AddSetSink(box (this :> ISetDeltaSink<'T>))
+        | _ -> ()
+
+    member private this.Unregister() =
+        match box source with
+        | :? ISetSinkRegistry as r -> r.RemoveSetSink(box (this :> ISetDeltaSink<'T>))
+        | _ -> ()
+
+    member private this.EnsureInitialized() =
+        if not initialized then
+            initialized <- true
+            // Snapshot first, register between (see MapMapNode.EnsureInitialized).
+            let snapshot = HashSet<'T>(source.GetValue())
+            this.Register()
+
+            for item in snapshot do
+                let (k, v) = toEntry item
+                let mutable set = Unchecked.defaultof<HashSet<'V>>
+
+                if state.Data.TryGetValue(k, &set) then
+                    set.Add v |> ignore
+                else
+                    let fresh = HashSet<'V>()
+                    fresh.Add v |> ignore
+                    state.Data[k] <- fresh
+
+            state.DepVersions[0] <- source.Version
+
+    interface ISetDeltaSink<'T> with
+        member this.OnDeltas(adds: 'T[], addCnt: int, rems: 'T[], remCnt: int) =
+            if not disposed then
+                Collections.journalAppendSet &state.Journal adds addCnt rems remCnt
+                state.Version <- state.Version + 1L
+                GraphContext.Default.MarkFrom(state.Edges)
+
+    interface IAdaptiveMap<'K, HashSet<'V>> with
+        member this.GetValue() =
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
+
+            try
+                if disposed then
+                    invalidOp "This adaptive map has been disposed."
+
+                this.EnsureInitialized()
+
+                if source.Version <> state.DepVersions[0] then
+                    source.GetValue() |> ignore
+                    state.DepVersions[0] <- source.Version
+
+                if not state.Journal.IsEmpty then
+                    let ctx2 = GraphContext.Default
+                    let wasActive = ctx2.TxActive
+                    ctx2.TxActive <- true
+
+                    try
+                        let rems = state.Journal.Rems
+                        let adds = state.Journal.Adds
+                        let remStart = rems.Count
+                        let addStart = adds.Count
+                        let mutable changed = false
+                        let mutable i = 0
+
+                        while i < remStart do
+                            let item = rems.Items[i]
+                            let (k, v) = toEntry item
+                            let mutable set = Unchecked.defaultof<HashSet<'V>>
+
+                            if state.Data.TryGetValue(k, &set) && set.Remove v then
+                                if set.Count = 0 then
+                                    state.Data.Remove k |> ignore
+                                    state.Out.Rems <- Collections.bufferAppend state.Out.Rems k
+                                else
+                                    // The value set changed: emit a fresh set.
+                                    state.Out.Sets <-
+                                        Collections.bufferAppend state.Out.Sets (struct (k, HashSet<'V>(set)))
+
+                                changed <- true
+
+                            i <- i + 1
+
+                        i <- 0
+
+                        while i < addStart do
+                            let item = adds.Items[i]
+                            let (k, v) = toEntry item
+                            let mutable set = Unchecked.defaultof<HashSet<'V>>
+
+                            if state.Data.TryGetValue(k, &set) then
+                                if set.Add v then
+                                    state.Out.Sets <-
+                                        Collections.bufferAppend state.Out.Sets (struct (k, HashSet<'V>(set)))
+
+                                    changed <- true
+                            else
+                                let fresh = HashSet<'V>()
+                                fresh.Add v |> ignore
+                                state.Data[k] <- fresh
+                                state.Out.Sets <- Collections.bufferAppend state.Out.Sets (struct (k, fresh))
+                                changed <- true
+
+                            i <- i + 1
+
+                        let remLive = state.Journal.Rems.Count
+
+                        if remLive > remStart then
+                            Array.Copy(
+                                state.Journal.Rems.Items,
+                                remStart,
+                                state.Journal.Rems.Items,
+                                0,
+                                remLive - remStart
+                            )
+
+                            state.Journal.Rems.Count <- remLive - remStart
+                        else
+                            state.Journal.Rems.Count <- 0
+
+                        let addLive = state.Journal.Adds.Count
+
+                        if addLive > addStart then
+                            Array.Copy(
+                                state.Journal.Adds.Items,
+                                addStart,
+                                state.Journal.Adds.Items,
+                                0,
+                                addLive - addStart
+                            )
+
+                            state.Journal.Adds.Count <- addLive - addStart
+                        else
+                            state.Journal.Adds.Count <- 0
+
+                        if changed then
+                            Collections.pushMapDelta state.Sinks state.Out
+                            state.Out.Clear()
+                    finally
+                        ctx2.TxActive <- wasActive
+
+                    if not wasActive then
+                        ctx2.DeliverNotifications()
+
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) state.Version
+                state.Data :> IReadOnlyDictionary<'K, HashSet<'V>>
+            finally
+                ctx.ReleaseOwner()
+
+        member _.Version = state.Version
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                this.Unregister()
+                Collections.clearSinks &state.Sinks
+
+    interface IMapSinkRegistry with
+        member this.AddMapSink(sink) = Collections.addSink &state.Sinks sink
+
+        member this.RemoveMapSink(sink) =
+            Collections.removeSink &state.Sinks sink
+
+    interface IEdgeTarget with
+        member _.EdgeCount = state.Edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
+
+/// <summary>Internal. State of a map-to-set node (keys or distinct values).</summary>
+[<Struct>]
+type internal MapToSetState<'K, 'V, 'T when 'K: equality and 'T: equality> =
+    val mutable Version: int64
+    val mutable Edges: ParentEdges
+    val mutable Sinks: SinkList
+    val mutable DepVersions: int64[]
+    val mutable Mirror: Dictionary<'K, 'T>
+    val mutable Out: RefCountedSet<'T>
+    val mutable Journal: MapDelta<'K, 'V>
+    val mutable OutDelta: SetDelta<'T>
+
+    new
+        (
+            version: int64,
+            edges: ParentEdges,
+            sinks: SinkList,
+            depVersions: int64[],
+            mirror: Dictionary<'K, 'T>,
+            out: RefCountedSet<'T>,
+            journal: MapDelta<'K, 'V>,
+            outDelta: SetDelta<'T>
+        ) =
+        { Version = version
+          Edges = edges
+          Sinks = sinks
+          DepVersions = depVersions
+          Mirror = mirror
+          Out = out
+          Journal = journal
+          OutDelta = outDelta }
+
+    static member Create(depCount: int) =
+        MapToSetState(
+            0L,
+            ParentEdges(),
+            SinkList.Create(),
+            Array.zeroCreate depCount,
+            Dictionary<'K, 'T>(),
+            RefCountedSet.Create(),
+            MapDelta.Create(),
+            SetDelta.Create()
+        )
+
+/// <summary>
+/// A set from a map: every entry contributes the selected value (the key for
+/// <c>toASet</c>, the value for <c>toASetValues</c>). Equal selections share
+/// one reference count: an entry removal drops the output element only when
+/// the last contributing entry disappears.
+/// </summary>
+type MapToSetNode<'K, 'V, 'T when 'K: equality and 'T: equality>(source: IAdaptiveMap<'K, 'V>, select: 'K -> 'V -> 'T) =
+    let mutable state = MapToSetState<'K, 'V, 'T>.Create(1)
+    let mutable initialized = false
+    let mutable disposed = false
+
+    member private this.Register() =
+        match box source with
+        | :? IMapSinkRegistry as r -> r.AddMapSink(box (this :> IMapDeltaSink<'K, 'V>))
+        | _ -> ()
+
+    member private this.Unregister() =
+        match box source with
+        | :? IMapSinkRegistry as r -> r.RemoveMapSink(box (this :> IMapDeltaSink<'K, 'V>))
+        | _ -> ()
+
+    member private this.EnsureInitialized() =
+        if not initialized then
+            initialized <- true
+            // Snapshot first, register between (see MapMapNode.EnsureInitialized).
+            let snapshot = Dictionary<'K, 'V>()
+
+            for KeyValue(k, v) in source.GetValue() do
+                snapshot[k] <- v
+
+            this.Register()
+
+            for KeyValue(k, v) in snapshot do
+                let t = select k v
+                state.Mirror[k] <- t
+                let struct (out2, _) = Collections.refAdd state.Out t
+                state.Out <- out2
+
+            state.DepVersions[0] <- source.Version
+
+    interface IMapDeltaSink<'K, 'V> with
+        member this.OnDeltas(sets: struct ('K * 'V)[], setCnt: int, rems: 'K[], remCnt: int) =
+            if not disposed then
+                Collections.journalAppendMap &state.Journal sets setCnt rems remCnt
+                state.Version <- state.Version + 1L
+                GraphContext.Default.MarkFrom(state.Edges)
+
+    interface IAdaptiveSet<'T> with
+        member this.GetValue() =
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
+
+            try
+                if disposed then
+                    invalidOp "This adaptive set has been disposed."
+
+                this.EnsureInitialized()
+
+                if source.Version <> state.DepVersions[0] then
+                    source.GetValue() |> ignore
+                    state.DepVersions[0] <- source.Version
+
+                if not state.Journal.IsEmpty then
+                    let ctx2 = GraphContext.Default
+                    let wasActive = ctx2.TxActive
+                    ctx2.TxActive <- true
+
+                    try
+                        let rems = state.Journal.Rems
+                        let sets = state.Journal.Sets
+                        let remStart = rems.Count
+                        let setStart = sets.Count
+                        let mutable changed = false
+                        let mutable i = 0
+
+                        while i < remStart do
+                            let k = rems.Items[i]
+                            let mutable t = Unchecked.defaultof<'T>
+
+                            if state.Mirror.TryGetValue(k, &t) then
+                                state.Mirror.Remove k |> ignore
+                                let struct (out2, removed) = Collections.refRemove state.Out t
+                                state.Out <- out2
+
+                                if removed then
+                                    state.OutDelta.Rems <- Collections.bufferAppend state.OutDelta.Rems t
+                                    changed <- true
+
+                            i <- i + 1
+
+                        i <- 0
+
+                        while i < setStart do
+                            let struct (k, v) = sets.Items[i]
+                            let t = select k v
+                            let mutable old = Unchecked.defaultof<'T>
+
+                            if state.Mirror.TryGetValue(k, &old) && EqualityComparer<'T>.Default.Equals(old, t) then
+                                ()
+                            else
+                                if state.Mirror.TryGetValue(k, &old) then
+                                    let struct (out2, removed) = Collections.refRemove state.Out old
+                                    state.Out <- out2
+
+                                    if removed then
+                                        state.OutDelta.Rems <- Collections.bufferAppend state.OutDelta.Rems old
+                                        changed <- true
+
+                                state.Mirror[k] <- t
+                                let struct (out2, added) = Collections.refAdd state.Out t
+                                state.Out <- out2
+
+                                if added then
+                                    state.OutDelta.Adds <- Collections.bufferAppend state.OutDelta.Adds t
+                                    changed <- true
+
+                            i <- i + 1
+
+                        let remLive = state.Journal.Rems.Count
+
+                        if remLive > remStart then
+                            Array.Copy(
+                                state.Journal.Rems.Items,
+                                remStart,
+                                state.Journal.Rems.Items,
+                                0,
+                                remLive - remStart
+                            )
+
+                            state.Journal.Rems.Count <- remLive - remStart
+                        else
+                            state.Journal.Rems.Count <- 0
+
+                        let setLive = state.Journal.Sets.Count
+
+                        if setLive > setStart then
+                            Array.Copy(
+                                state.Journal.Sets.Items,
+                                setStart,
+                                state.Journal.Sets.Items,
+                                0,
+                                setLive - setStart
+                            )
+
+                            state.Journal.Sets.Count <- setLive - setStart
+                        else
+                            state.Journal.Sets.Count <- 0
+
+                        if changed then
+                            Collections.pushSetDelta state.Sinks state.OutDelta
+                            state.OutDelta.Clear()
+                    finally
+                        ctx2.TxActive <- wasActive
+
+                    if not wasActive then
+                        ctx2.DeliverNotifications()
+
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) state.Version
+                state.Out.Data :> IReadOnlySet<'T>
+            finally
+                ctx.ReleaseOwner()
+
+        member _.Version = state.Version
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                this.Unregister()
+                Collections.clearSinks &state.Sinks
+
+    interface ISetSinkRegistry with
+        member this.AddSetSink(sink) = Collections.addSink &state.Sinks sink
+
+        member this.RemoveSetSink(sink) =
+            Collections.removeSink &state.Sinks sink
+
+    interface IEdgeTarget with
+        member _.EdgeCount = state.Edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
+
+/// <summary>
+/// An adaptive map over an adaptive value of a sequence of entries. Every
+/// change of the value replaces the whole state and emits the diff as the
+/// delta (the rebuild boundary, like <see cref="OfAvalSetNode"/>).
+/// </summary>
+type OfAvalMapNode<'K, 'V, 'S when 'K: equality and 'S :> seq<'K * 'V>>(value: IAdaptiveValue<'S>) =
+    let mutable state = MapNodeState<'K, 'V, 'V>.Create(1)
+    let mutable edgeInValue = -1
+    let mutable initialized = false
+    let mutable disposed = false
+
+    member private this.EnsureInitialized() =
+        if not initialized then
+            initialized <- true
+
+            match value with
+            | :? IEdgeTarget as t -> edgeInValue <- t.AddEdge(this :> IAdaptiveNode, -1)
+            | _ -> ()
+
+            // Initial load: materialize the value and build the state.
+            let next = Dictionary<'K, 'V>()
+
+            for (k, v) in value.GetValue() do
+                next[k] <- v
+
+            Collections.rebuildMapDiff next &state |> ignore
+            state.DepVersions[0] <- value.Version
+
+    interface IAdaptiveNode with
+        member this.MarkDirty() =
+            GraphContext.Default.MarkFrom(state.Edges)
+
+        member _.SetDepSlot(depIndex: int, parentIndex: int) =
+            if depIndex = -1 then
+                edgeInValue <- parentIndex
+
+        member _.OnFirstParent() = ()
+        member _.OnLastParent() = ()
+
+    interface IAdaptiveMap<'K, 'V> with
+        member this.GetValue() =
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
+
+            try
+                if disposed then
+                    invalidOp "This adaptive map has been disposed."
+
+                this.EnsureInitialized()
+
+                if value.Version <> state.DepVersions[0] then
+                    // The value may yield a transient seq: materialize it.
+                    let next = Dictionary<'K, 'V>()
+
+                    for (k, v) in value.GetValue() do
+                        next[k] <- v
+
+                    if Collections.rebuildMapDiff next &state then
+                        Collections.pushAndMarkMap state.Out state.Sinks state.Edges
+                        state.Out.Clear()
+
+                    state.DepVersions[0] <- value.Version
+
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) state.Version
+                state.Data :> IReadOnlyDictionary<'K, 'V>
+            finally
+                ctx.ReleaseOwner()
+
+        member _.Version = state.Version
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+
+                match value with
+                | :? IEdgeTarget as t -> t.RemoveEdgeAt(edgeInValue)
+                | _ -> ()
+
+                Collections.clearSinks &state.Sinks
+
+    interface IMapSinkRegistry with
+        member this.AddMapSink(sink) = Collections.addSink &state.Sinks sink
+
+        member this.RemoveMapSink(sink) =
+            Collections.removeSink &state.Sinks sink
+
+    interface IEdgeTarget with
+        member _.EdgeCount = state.Edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
+
+/// <summary>
+/// An adaptive map whose content is driven by a compute function (FDA
+/// <c>AMap.custom</c> parity, pull model like <see cref="CustomSetNode"/>).
+/// The compute receives the current view and a delta builder and appends the
+/// operations that describe the change since the previous call.
+/// </summary>
+type CustomMapNode<'K, 'V when 'K: equality>(compute: IReadOnlyDictionary<'K, 'V> -> MapDeltaBuilder<'K, 'V> -> unit) =
+    let mutable state = MapNodeState<'K, 'V, 'V>.Create(0)
+    let writer = MapDeltaBuilder<'K, 'V>()
+    let mutable disposed = false
+
+    member private this.Poll() =
+        if not disposed then
+            writer.Clear()
+            compute (state.Data :> IReadOnlyDictionary<'K, 'V>) writer
+
+            if not writer.IsEmpty then
+                let sets = writer.Sets
+                let rems = writer.Rems
+
+                for i in 0 .. sets.Count - 1 do
+                    let struct (k, v) = sets.Items[i]
+                    state.Data[k] <- v
+
+                for i in 0 .. rems.Count - 1 do
+                    state.Data.Remove rems.Items[i] |> ignore
+
+                state.Version <- state.Version + 1L
+                Collections.pushAndMarkMap (writer.Snapshot()) state.Sinks state.Edges
+                writer.Clear()
+
+    interface IAdaptiveMap<'K, 'V> with
+        member this.GetValue() =
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
+
+            try
+                if disposed then
+                    invalidOp "This adaptive map has been disposed."
+
+                this.Poll()
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) state.Version
+                state.Data :> IReadOnlyDictionary<'K, 'V>
+            finally
+                ctx.ReleaseOwner()
+
+        member this.Version =
+            this.Poll()
+            state.Version
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                Collections.clearSinks &state.Sinks
+
+    interface IMapSinkRegistry with
+        member this.AddMapSink(sink) = Collections.addSink &state.Sinks sink
+
+        member this.RemoveMapSink(sink) =
+            Collections.removeSink &state.Sinks sink
+
+    interface IEdgeTarget with
+        member _.EdgeCount = state.Edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
+
+/// <summary>
+/// An adaptive map bound to a scalar value (<c>AMap.bind</c>, PLAN.md Section
+/// 7.4): <c>mapping value</c> selects the inner map; when the value changes, the
+/// whole inner map is swapped (old content removed, new content added) and the
+/// old inner sink is unregistered eagerly (FDA <c>BindReader</c> semantics;
+/// ANALYSIS-FDA.md Pitfall 1). The inner map's own changes flow through a
+/// journal. Registration is lazy (first read); disposal unregisters everything.
+/// </summary>
+type BindMapNode<'K, 'V, 'T when 'K: equality>(value: IAdaptiveValue<'T>, mapping: 'T -> IAdaptiveMap<'K, 'V>) =
+    let mutable state = Collections.BindMapState<'K, 'V>.Create(1)
+    let mutable inner: IAdaptiveMap<'K, 'V> = Unchecked.defaultof<IAdaptiveMap<'K, 'V>>
+    let mutable hasInner = false
+    let mutable innerVersion = 0L
+    let mutable edgeInValue = -1
+    let mutable current: 'T = Unchecked.defaultof<'T>
+    let mutable initialized = false
+    let mutable disposed = false
+
+    member private this.UnregisterInner() =
+        if hasInner then
+            match box inner with
+            | :? IMapSinkRegistry as r -> r.RemoveMapSink(box this)
+            | _ -> ()
+
+            hasInner <- false
+
+    member private this.LoadInner() =
+        // Read first, register after: the view is complete, and the sink sees
+        // only deltas that follow this point in time.
+        let view = inner.GetValue()
+
+        for KeyValue(k, v) in view do
+            state.Data[k] <- v
+
+        match box inner with
+        | :? IMapSinkRegistry as r -> r.AddMapSink(box this)
+        | _ -> ()
+
+        hasInner <- true
+        innerVersion <- inner.Version
+
+    member private this.SwapTo(next: 'T) =
+        // Eager edge removal (Pitfall 1): the old inner must not deliver after
+        // the swap. Its pending journal is dropped with the content.
+        this.UnregisterInner()
+        state.Data.Clear()
+        inner <- mapping next
+        current <- next
+        this.LoadInner()
+        state.Journal.Clear()
+        state.Version <- state.Version + 1L
+
+    member private this.EnsureInitialized() =
+        if not initialized then
+            initialized <- true
+
+            match value with
+            | :? IEdgeTarget as t -> edgeInValue <- t.AddEdge(this :> IAdaptiveNode, -1)
+            | _ -> ()
+
+            current <- value.GetValue()
+            inner <- mapping current
+            this.LoadInner()
+            state.DepVersions[0] <- value.Version
+
+    interface IAdaptiveNode with
+        member this.MarkDirty() =
+            GraphContext.Default.MarkFrom(state.Edges)
+
+        member _.SetDepSlot(depIndex: int, parentIndex: int) =
+            if depIndex = -1 then
+                edgeInValue <- parentIndex
+
+        member _.OnFirstParent() = ()
+        member _.OnLastParent() = ()
+
+    interface IMapDeltaSink<'K, 'V> with
+        member this.OnDeltas(sets: struct ('K * 'V)[], setCnt: int, rems: 'K[], remCnt: int) =
+            if not disposed then
+                Collections.journalAppendMap &state.Journal sets setCnt rems remCnt
+                state.Version <- state.Version + 1L
+                GraphContext.Default.MarkFrom(state.Edges)
+
+    interface IAdaptiveMap<'K, 'V> with
+        member this.GetValue() =
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
+
+            try
+                if disposed then
+                    invalidOp "This adaptive map has been disposed."
+
+                this.EnsureInitialized()
+
+                if value.Version <> state.DepVersions[0] then
+                    let next = value.GetValue()
+                    state.DepVersions[0] <- value.Version
+
+                    if not (EqualityComparer<'T>.Default.Equals(current, next)) then
+                        this.SwapTo(next)
+
+                if inner.Version <> innerVersion then
+                    inner.GetValue() |> ignore
+                    innerVersion <- inner.Version
+
+                if not state.Journal.IsEmpty then
+                    Collections.drainBindMapPush &state
+
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) state.Version
+                state.Data :> IReadOnlyDictionary<'K, 'V>
+            finally
+                ctx.ReleaseOwner()
+
+        member _.Version = state.Version
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                this.UnregisterInner()
+
+                match value with
+                | :? IEdgeTarget as t -> t.RemoveEdgeAt(edgeInValue)
+                | _ -> ()
+
                 Collections.clearSinks &state.Sinks
 
     interface IMapSinkRegistry with

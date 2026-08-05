@@ -1936,3 +1936,1157 @@ let ``sequential transactions each apply their collection writes`` () =
     Transaction.run (fun () -> CMap.addOrUpdate "a" 1 mapSource)
     Transaction.run (fun () -> CMap.addOrUpdate "b" 2 mapSource)
     Assert.Equal(2, (AMap.force (CMap.value mapSource)).Count)
+
+// =============================================================================
+// Phase 7.2 — Incremental reductions and derived checks
+// =============================================================================
+
+[<Fact>]
+let ``ASet count isEmpty contains track the state`` () =
+    let source = CSet.empty<int>
+    let count = ASet.count (CSet.value source)
+    let isEmpty = ASet.isEmpty (CSet.value source)
+    let hasFive = ASet.contains 5 (CSet.value source)
+
+    Assert.Equal(0, AVal.getValue count)
+    Assert.True(AVal.getValue isEmpty)
+    Assert.False(AVal.getValue hasFive)
+
+    CSet.add 5 source
+    Assert.Equal(1, AVal.getValue count)
+    Assert.False(AVal.getValue isEmpty)
+    Assert.True(AVal.getValue hasFive)
+
+    CSet.add 7 source
+    CSet.remove 5 source
+    Assert.Equal(1, AVal.getValue count)
+    Assert.False(AVal.getValue hasFive)
+    Assert.True(AVal.getValue (ASet.contains 7 (CSet.value source)))
+
+[<Fact>]
+let ``ASet exists forall countBy are delta-driven`` () =
+    let source = CSet.empty<int>
+    let existsEven = ASet.exists (fun v -> v % 2 = 0) (CSet.value source)
+    let forallEven = ASet.forall (fun v -> v % 2 = 0) (CSet.value source)
+    let evenCount = ASet.countBy (fun v -> v % 2 = 0) (CSet.value source)
+
+    Assert.False(AVal.getValue existsEven)
+    Assert.True(AVal.getValue forallEven)
+    Assert.Equal(0, AVal.getValue evenCount)
+
+    CSet.add 2 source
+    Assert.True(AVal.getValue existsEven)
+    Assert.True(AVal.getValue forallEven)
+    Assert.Equal(1, AVal.getValue evenCount)
+
+    CSet.add 3 source
+    Assert.True(AVal.getValue existsEven)
+    Assert.False(AVal.getValue forallEven)
+    Assert.Equal(1, AVal.getValue evenCount)
+
+    CSet.add 4 source
+    CSet.remove 2 source
+    Assert.True(AVal.getValue existsEven)
+    Assert.Equal(1, AVal.getValue evenCount)
+
+    CSet.remove 4 source
+    Assert.False(AVal.getValue existsEven)
+    Assert.False(AVal.getValue forallEven)
+    Assert.Equal(0, AVal.getValue evenCount)
+
+[<Fact>]
+let ``ASet fold recomputes on removals`` () =
+    let source = CSet.empty<int>
+    let folded = ASet.fold (+) 0 (CSet.value source)
+
+    CSet.add 10 source
+    CSet.add 20 source
+    Assert.Equal(30, AVal.getValue folded)
+
+    // fold has no inverse: the removal triggers a full recompute.
+    CSet.remove 10 source
+    Assert.Equal(20, AVal.getValue folded)
+
+[<Fact>]
+let ``ASet foldGroup inverts removals`` () =
+    let source = CSet.empty<int>
+    let folded = ASet.foldGroup (+) (-) 0 (CSet.value source)
+
+    CSet.add 10 source
+    CSet.add 20 source
+    Assert.Equal(30, AVal.getValue folded)
+
+    CSet.remove 10 source
+    Assert.Equal(20, AVal.getValue folded)
+
+    CSet.add 5 source
+    CSet.add 15 source
+    CSet.remove 20 source
+    Assert.Equal(20, AVal.getValue folded)
+
+[<Fact>]
+let ``ASet sum sumBy tryMin tryMax`` () =
+    let source = CSet.empty<int>
+    let total = ASet.sum (CSet.value source)
+    let totalBy = ASet.sumBy (fun v -> v * 2) (CSet.value source)
+    let min = ASet.tryMin (CSet.value source)
+    let max = ASet.tryMax (CSet.value source)
+
+    Assert.Equal(ValueNone, AVal.getValue min)
+    CSet.add 3 source
+    CSet.add 1 source
+    CSet.add 5 source
+    Assert.Equal(9, AVal.getValue total)
+    Assert.Equal(18, AVal.getValue totalBy)
+    Assert.Equal(ValueSome 1, AVal.getValue min)
+    Assert.Equal(ValueSome 5, AVal.getValue max)
+    CSet.remove 5 source
+    Assert.Equal(4, AVal.getValue total)
+    Assert.Equal(ValueSome 3, AVal.getValue max)
+
+[<Fact>]
+let ``ASet reduceBy with a mapping`` () =
+    let source = CSet.empty<string>
+    // Count the strings longer than one character, via reduceBy.
+    // The pipe resolves the element type before the lambda is checked (F#
+    // checks InlineIfLambda arguments eagerly; the subject-last order makes
+    // member access work).
+    let longCount =
+        CSet.value source
+        |> ASet.reduceBy AdaptiveReduction.countPositive (fun s -> s.Length > 1)
+
+    Assert.Equal(0, AVal.getValue longCount)
+    CSet.add "a" source
+    CSet.add "bb" source
+    CSet.add "ccc" source
+    Assert.Equal(2, AVal.getValue longCount)
+    CSet.remove "bb" source
+    Assert.Equal(1, AVal.getValue longCount)
+
+[<Fact>]
+let ``AMap tryFind find track entries`` () =
+    let source = CMap.empty<string, int>
+    let lookup = AMap.tryFind "a" (CMap.value source)
+
+    Assert.Equal(ValueNone, AVal.getValue lookup)
+
+    CMap.addOrUpdate "a" 1 source
+    Assert.Equal(ValueSome 1, AVal.getValue lookup)
+
+    CMap.addOrUpdate "a" 2 source
+    Assert.Equal(ValueSome 2, AVal.getValue lookup)
+
+    CMap.remove "a" source
+    Assert.Equal(ValueNone, AVal.getValue lookup)
+
+    CMap.addOrUpdate "a" 9 source
+    let findValue = AMap.find "a" (CMap.value source)
+    Assert.Equal(9, AVal.getValue findValue)
+
+    Assert.Throws<System.Collections.Generic.KeyNotFoundException>(fun () ->
+        AVal.getValue (AMap.find "missing" (CMap.value source)) |> ignore)
+
+[<Fact>]
+let ``AMap reduce updates subtract the old value`` () =
+    let source = CMap.empty<string, int>
+    let total = AMap.reduce (AdaptiveReduction.sum ()) (CMap.value source)
+
+    CMap.addOrUpdate "a" 10 source
+    CMap.addOrUpdate "b" 20 source
+    Assert.Equal(30, AVal.getValue total)
+
+    // Update: the old value must be subtracted before the new one is added.
+    CMap.addOrUpdate "a" 15 source
+    Assert.Equal(35, AVal.getValue total)
+
+    CMap.remove "b" source
+    Assert.Equal(15, AVal.getValue total)
+
+[<Fact>]
+let ``AMap fold recomputes on removals`` () =
+    let source = CMap.empty<int, int>
+    let folded = AMap.fold (fun s k v -> s + k * v) 0 (CMap.value source)
+
+    CMap.addOrUpdate 2 3 source
+    CMap.addOrUpdate 4 5 source
+    Assert.Equal(26, AVal.getValue folded)
+
+    CMap.remove 2 source
+    Assert.Equal(20, AVal.getValue folded)
+
+[<Fact>]
+let ``AMap foldGroup inverts removals`` () =
+    let source = CMap.empty<int, int>
+
+    let folded =
+        AMap.foldGroup (fun s k v -> s + k * v) (fun s k v -> s - k * v) 0 (CMap.value source)
+
+    CMap.addOrUpdate 2 3 source
+    CMap.addOrUpdate 4 5 source
+    Assert.Equal(26, AVal.getValue folded)
+
+    CMap.remove 2 source
+    Assert.Equal(20, AVal.getValue folded)
+
+    CMap.addOrUpdate 4 1 source // update: subtract old (20), add new (4)
+    Assert.Equal(4, AVal.getValue folded)
+
+[<Fact>]
+let ``AMap exists forall countBy`` () =
+    let source = CMap.empty<int, int>
+    let hasBig = AMap.exists (fun _ v -> v > 100) (CMap.value source)
+    let allBig = AMap.forall (fun _ v -> v > 100) (CMap.value source)
+    let bigCount = AMap.countBy (fun _ v -> v > 100) (CMap.value source)
+
+    Assert.False(AVal.getValue hasBig)
+    Assert.True(AVal.getValue allBig)
+    Assert.Equal(0, AVal.getValue bigCount)
+
+    CMap.addOrUpdate 1 50 source
+    Assert.False(AVal.getValue hasBig)
+    Assert.False(AVal.getValue allBig)
+    Assert.Equal(0, AVal.getValue bigCount)
+
+    CMap.addOrUpdate 2 200 source
+    Assert.True(AVal.getValue hasBig)
+    Assert.Equal(1, AVal.getValue bigCount)
+
+    CMap.addOrUpdate 2 5 source // update flips the group
+    Assert.False(AVal.getValue hasBig)
+    Assert.Equal(0, AVal.getValue bigCount)
+
+[<Fact>]
+let ``toAVal materializes stable snapshots`` () =
+    let source = CSet.empty<int>
+    let snap = ASet.toAVal (CSet.value source)
+    CSet.add 1 source
+    CSet.add 2 source
+
+    let first = AVal.getValue snap
+    Assert.Equal(2, first.Count)
+    Assert.True(first.Contains 1)
+
+    CSet.add 3 source
+    Assert.Equal(3, (AVal.getValue snap).Count)
+    // The earlier snapshot is untouched by later writes.
+    Assert.Equal(2, first.Count)
+
+    let mapSource = CMap.empty<string, int>
+    let mapSnap = AMap.toAVal (CMap.value mapSource)
+    CMap.addOrUpdate "x" 1 mapSource
+    Assert.Equal(1, (AVal.getValue mapSnap).Count)
+
+[<Fact>]
+let ``single builds constant singletons`` () =
+    let set = ASet.single 42
+    Assert.Equal(1, (ASet.force set).Count)
+    Assert.True((ASet.force set).Contains 42)
+
+    let mapValue = AMap.single "k" 7
+    Assert.Equal(7, (AMap.force mapValue)["k"])
+
+[<Fact>]
+let ``reductions compose with observation`` () =
+    let source = CSet.empty<int>
+    let count = ASet.count (CSet.value source)
+    let seen = ResizeArray<int>()
+
+    use obs = AVal.observe (fun v -> seen.Add v) count
+
+    CSet.add 1 source
+    CSet.add 2 source
+    CSet.remove 1 source
+    Assert.Equal<int list>([ 1; 2; 1 ], List.ofSeq seen)
+
+[<Fact>]
+let ``reduction over a derived set receives deltas`` () =
+    let source = CSet.empty<int>
+    let doubled = ASet.map (fun v -> v * 2) (CSet.value source)
+    let total = ASet.sum doubled
+
+    CSet.add 1 source
+    CSet.add 3 source
+    Assert.Equal(8, AVal.getValue total)
+
+    CSet.remove 1 source
+    Assert.Equal(6, AVal.getValue total)
+
+[<Fact>]
+let ``reduction matches a reference model under random churn`` () =
+    let source = CSet.empty<int>
+    let folded = ASet.foldGroup (+) (-) 0 (CSet.value source)
+    let evenCount = ASet.countBy (fun v -> v % 2 = 0) (CSet.value source)
+    let mutable model = Set.empty<int>
+    let rng = Random(11)
+
+    for _ in 1..500 do
+        let v = rng.Next(100)
+
+        if rng.NextDouble() < 0.6 then
+            CSet.add v source
+            model <- model.Add v
+        else
+            CSet.remove v source
+            model <- model.Remove v
+
+        Assert.Equal(Set.fold (+) 0 model, AVal.getValue folded)
+        Assert.Equal(Set.count (Set.filter (fun x -> x % 2 = 0) model), AVal.getValue evenCount)
+
+[<Fact>]
+let ``reduce node steady-state drain allocates zero`` () =
+    let source = CSet.empty<int>
+    let total = ASet.foldGroup (+) (-) 0 (CSet.value source)
+
+    for i in 1..50 do
+        CSet.add i source
+
+    for i in 1..25 do
+        CSet.remove i source
+
+    // Warm up the first read: the initial load enumerates the view once
+    // (one-time cost, like every node's initial load).
+    AVal.getValue total |> ignore
+
+    let before = GC.GetAllocatedBytesForCurrentThread()
+
+    for i in 1..100 do
+        CSet.remove ((i % 25) + 26) source
+        CSet.add ((i % 25) + 26) source
+
+        if AVal.getValue total <> 950 then
+            failwith "sum drifted"
+
+    let allocated = GC.GetAllocatedBytesForCurrentThread() - before
+    Assert.Equal(950, AVal.getValue total)
+    Assert.Equal(0L, allocated)
+
+// =============================================================================
+// Phase 7.3 — collection algebra
+// =============================================================================
+
+[<Fact>]
+let ``ASet difference/intersect/xor match a reference model under random churn`` () =
+    let left = CSet.empty<int>
+    let right = CSet.empty<int>
+    let diff = ASet.difference (CSet.value left) (CSet.value right)
+    let inter = ASet.intersect (CSet.value left) (CSet.value right)
+    let xored = ASet.xor (CSet.value left) (CSet.value right)
+
+    for i in 1..30 do
+        CSet.add i left
+        CSet.add (i + 20) right
+
+    let rng = Random 1234
+
+    for _ in 1..500 do
+        let target = if rng.NextDouble() < 0.5 then left else right
+        let v = rng.Next(1, 60)
+
+        if rng.NextDouble() < 0.5 then
+            CSet.add v target
+        else
+            CSet.remove v target
+
+        let l = Set.ofSeq (ASet.force (CSet.value left))
+        let r = Set.ofSeq (ASet.force (CSet.value right))
+        Assert.Equal<Set<int>>(Set.difference l r, Set.ofSeq (ASet.force diff))
+        Assert.Equal<Set<int>>(Set.intersect l r, Set.ofSeq (ASet.force inter))
+        Assert.Equal<Set<int>>(Set.union (Set.difference l r) (Set.difference r l), Set.ofSeq (ASet.force xored))
+
+    // A write that changes nothing (removing an absent element) must not mark.
+    // The nodes' journals stay empty; the versions do not advance.
+    let v0 = diff.Version
+    CSet.remove 1000 left
+    Assert.Equal(v0, diff.Version)
+
+[<Fact>]
+let ``ASet unionMany folds a static sequence of sets`` () =
+    let a = CSet.ofSeq [ 1; 2 ]
+    let b = CSet.ofSeq [ 2; 3 ]
+    let c = CSet.ofSeq [ 4 ]
+    let all = ASet.unionMany [ CSet.value a; CSet.value b; CSet.value c ]
+    Assert.Equal<Set<_>>(Set.ofList [ 1; 2; 3; 4 ], Set.ofSeq (ASet.force all))
+
+    CSet.add 5 a
+    Assert.Equal<Set<_>>(Set.ofList [ 1; 2; 3; 4; 5 ], Set.ofSeq (ASet.force all))
+    CSet.remove 2 b // 2 is still contributed by a
+    Assert.Equal<Set<_>>(Set.ofList [ 1; 2; 3; 4; 5 ], Set.ofSeq (ASet.force all))
+    CSet.remove 2 a
+    Assert.Equal<Set<_>>(Set.ofList [ 1; 3; 4; 5 ], Set.ofSeq (ASet.force all))
+
+    let empty = ASet.unionMany []
+    Assert.True(Set.empty = Set.ofSeq (ASet.force empty))
+
+[<Fact>]
+let ``ASet choose keeps only mapped values`` () =
+    let source = CSet.ofSeq [ 1; 2; 3; 4 ]
+
+    let chosen =
+        ASet.choose (fun x -> if x % 2 = 0 then ValueSome(x * 10) else ValueNone) (CSet.value source)
+
+    Assert.Equal<Set<_>>(Set.ofList [ 20; 40 ], Set.ofSeq (ASet.force chosen))
+
+    CSet.add 6 source
+    CSet.add 7 source
+    Assert.Equal<Set<_>>(Set.ofList [ 20; 40; 60 ], Set.ofSeq (ASet.force chosen))
+    CSet.remove 2 source
+    Assert.Equal<Set<_>>(Set.ofList [ 40; 60 ], Set.ofSeq (ASet.force chosen))
+
+[<Fact>]
+let ``ASet ofAVal rebuilds on every value change`` () =
+    let v = CVal.create [| 1; 2; 3 |]
+    let set = ASet.ofAVal (CVal.value v)
+    Assert.Equal<Set<_>>(Set.ofList [ 1; 2; 3 ], Set.ofSeq (ASet.force set))
+
+    CVal.set [| 3; 4 |] v
+    Assert.Equal<Set<_>>(Set.ofList [ 3; 4 ], Set.ofSeq (ASet.force set))
+
+    CVal.set [| 3; 4 |] v // same content: elided, no mark
+    let v0 = set.Version
+    CVal.set [| 3; 4 |] v
+    Assert.Equal(v0, set.Version)
+
+    CVal.set [||] v
+    Assert.Equal<Set<int>>(Set.empty, Set.ofSeq (ASet.force set))
+
+[<Fact>]
+let ``ASet ofReader and custom are poll-driven`` () =
+    let mutable state = HashSet([ 1; 2 ])
+    let read = ASet.ofReader (fun () -> HashSet(state))
+    Assert.Equal<Set<_>>(Set.ofList [ 1; 2 ], Set.ofSeq (ASet.force read))
+
+    state.Add 3 |> ignore
+    state.Remove 1 |> ignore
+    Assert.Equal<Set<_>>(Set.ofList [ 2; 3 ], Set.ofSeq (ASet.force read))
+
+    let mutable customState = HashSet([ 10 ])
+    let mutable pending = ResizeArray<SetDelta<int>>()
+
+    let custom =
+        ASet.custom (fun view delta ->
+            if pending.Count > 0 then
+                let d = pending[0]
+                pending.RemoveAt 0
+
+                for a in d.Added.ToArray() do
+                    delta.Add a
+
+                for r in d.Removed.ToArray() do
+                    delta.Remove r
+
+            ())
+
+    Assert.Equal<Set<_>>(Set.empty, Set.ofSeq (ASet.force custom))
+    let mutable d = SetDelta<int>()
+    d.Add 42
+    pending.Add d
+    Assert.Equal<Set<_>>(Set.ofList [ 42 ], Set.ofSeq (ASet.force custom))
+
+[<Fact>]
+let ``ASet constant and delay evaluate once, lazily`` () =
+    let mutable calls = 0
+
+    let c =
+        ASet.constant (fun () ->
+            calls <- calls + 1
+            HashSet([ 1; 2 ]))
+
+    Assert.Equal(0, calls)
+    Assert.Equal<Set<_>>(Set.ofList [ 1; 2 ], Set.ofSeq (ASet.force c))
+    Assert.Equal<Set<_>>(Set.ofList [ 1; 2 ], Set.ofSeq (ASet.force c))
+    Assert.Equal(1, calls)
+
+    let d = ASet.delay (fun () -> HashSet([ 7 ]))
+    Assert.Equal<Set<_>>(Set.ofList [ 7 ], Set.ofSeq (ASet.force d))
+
+[<Fact>]
+let ``AMap union is right-biased and unionWith resolves`` () =
+    let a = CMap.empty<string, int>
+    let b = CMap.empty<string, int>
+    let u = AMap.union (CMap.value a) (CMap.value b)
+    let uw = AMap.unionWith (fun _ l r -> l + r) (CMap.value a) (CMap.value b)
+
+    CMap.addOrUpdate "x" 1 a
+    CMap.addOrUpdate "y" 2 a
+    CMap.addOrUpdate "x" 10 b
+    CMap.addOrUpdate "z" 3 b
+
+    // FDA parity: union prefers the RIGHT value on collisions.
+    Assert.Equal<Map<string, int>>(
+        Map.ofList [ "x", 10; "y", 2; "z", 3 ],
+        Map.ofSeq (seq { for KeyValue(k, v) in AMap.force u -> k, v })
+    )
+
+    Assert.Equal<Map<string, int>>(
+        Map.ofList [ "x", 11; "y", 2; "z", 3 ],
+        Map.ofSeq (seq { for KeyValue(k, v) in AMap.force uw -> k, v })
+    )
+
+    // Updating the non-winning side of a conflict does not change the output.
+    CMap.addOrUpdate "x" 5 a
+
+    Assert.Equal<Map<string, int>>(
+        Map.ofList [ "x", 10; "y", 2; "z", 3 ],
+        Map.ofSeq (seq { for KeyValue(k, v) in AMap.force u -> k, v })
+    )
+
+    CMap.remove "x" b // now the left value surfaces
+
+    Assert.Equal<Map<_, _>>(
+        Map.ofList [ "x", 5; "y", 2; "z", 3 ],
+        Map.ofSeq (seq { for KeyValue(k, v) in AMap.force u -> k, v })
+    )
+
+[<Fact>]
+let ``AMap intersect pairs values and intersectWith combines`` () =
+    let a = CMap.empty<string, int>
+    let b = CMap.empty<string, int>
+    let i = AMap.intersect (CMap.value a) (CMap.value b)
+    let iw = AMap.intersectWith (fun _ l r -> l * r) (CMap.value a) (CMap.value b)
+
+    CMap.addOrUpdate "x" 3 a
+    CMap.addOrUpdate "y" 5 a
+    CMap.addOrUpdate "x" 4 b
+    CMap.addOrUpdate "z" 6 b
+
+    Assert.Equal<Map<string, int * int>>(
+        Map.ofList [ "x", (3, 4) ],
+        Map.ofSeq (seq { for KeyValue(k, struct (l, r)) in AMap.force i -> k, (l, r) })
+    )
+
+    Assert.Equal<Map<_, _>>(Map.ofList [ "x", 12 ], Map.ofSeq (seq { for KeyValue(k, v) in AMap.force iw -> k, v }))
+
+    CMap.addOrUpdate "y" 5 b
+    Assert.Equal(2, AMap.count i |> AVal.getValue)
+    CMap.remove "x" a
+    Assert.Equal<Map<_, _>>(Map.ofList [ "y", 25 ], Map.ofSeq (seq { for KeyValue(k, v) in AMap.force iw -> k, v }))
+
+[<Fact>]
+let ``AMap choose2 matches a reference model under random churn`` () =
+    let a = CMap.empty<int, int>
+    let b = CMap.empty<int, int>
+
+    // The mapping: union of both sides; on conflict the right value wins.
+    let m =
+        AMap.choose2
+            (fun _ l r ->
+                match l, r with
+                | ValueSome lv, ValueSome rv -> ValueSome rv
+                | ValueSome lv, ValueNone -> ValueSome lv
+                | ValueNone, ValueSome rv -> ValueSome rv
+                | ValueNone, ValueNone -> ValueNone)
+            (CMap.value a)
+            (CMap.value b)
+
+    let rng = Random 99
+
+    for _ in 1..400 do
+        let target = if rng.NextDouble() < 0.5 then a else b
+        let k = rng.Next(1, 25)
+        let v = rng.Next(1, 100)
+
+        if rng.NextDouble() < 0.6 then
+            CMap.addOrUpdate k v target
+        else
+            CMap.remove k target
+
+        let ma = Map.ofSeq (seq { for KeyValue(k, v) in CMap.force a -> k, v })
+        let mb = Map.ofSeq (seq { for KeyValue(k, v) in CMap.force b -> k, v })
+
+        let expected = Map.fold (fun acc k v -> Map.add k v acc) ma mb
+
+        let actual = Map.ofSeq (seq { for KeyValue(k, v) in AMap.force m -> k, v })
+        Assert.Equal<Map<int, int>>(expected, actual)
+
+    // The mapping is not called when both sides are absent (FDA parity):
+    // a removal of a key that has no value on either side must not crash even
+    // for a mapping that pattern-matches only Some/Some.
+    let strict =
+        AMap.choose2
+            (fun _ l r ->
+                match l, r with
+                | ValueSome lv, ValueSome rv -> ValueSome(struct (lv, rv))
+                | ValueSome _, ValueNone
+                | ValueNone, ValueSome _ -> ValueNone
+                | ValueNone, ValueNone -> failwith "mapping called with no side value")
+            (CMap.value a)
+            (CMap.value b)
+
+    // A removal of a key with no value on either side must not call the mapping
+    // (FDA parity), and keys present on one side only are dropped without error.
+    CMap.remove 1000 a
+
+    let expectedStrict =
+        Set.intersect
+            (Set.ofSeq (seq { for KeyValue(k, _) in CMap.force a -> k }))
+            (Set.ofSeq (seq { for KeyValue(k, _) in CMap.force b -> k }))
+        |> Set.count
+
+    Assert.Equal(expectedStrict, AMap.count strict |> AVal.getValue)
+
+[<Fact>]
+let ``AMap ofASet keeps all values per key; IgnoreDuplicates keeps the last`` () =
+    let source = CSet.empty<int * string>
+    let all = AMap.ofASet (CSet.value source)
+    let last = AMap.ofASetIgnoreDuplicates (CSet.value source)
+
+    CSet.add (1, "a") source
+    CSet.add (1, "b") source
+    CSet.add (2, "c") source
+
+    Assert.Equal<Map<int, Set<string>>>(
+        Map.ofList [ 1, Set.ofList [ "a"; "b" ]; 2, Set.ofList [ "c" ] ],
+        Map.ofSeq (seq { for KeyValue(k, v) in AMap.force all -> k, Set.ofSeq v })
+    )
+
+    Assert.Equal<Map<_, _>>(
+        Map.ofList [ 1, "b"; 2, "c" ],
+        Map.ofSeq (seq { for KeyValue(k, v) in AMap.force last -> k, v })
+    )
+
+    CSet.remove (1, "a") source
+
+    Assert.Equal<Map<int, Set<string>>>(
+        Map.ofList [ 1, Set.ofList [ "b" ]; 2, Set.ofList [ "c" ] ],
+        Map.ofSeq (seq { for KeyValue(k, v) in AMap.force all -> k, Set.ofSeq v })
+    )
+
+    CSet.remove (1, "b") source
+    Assert.Equal<Map<_, _>>(Map.ofList [ 2, "c" ], Map.ofSeq (seq { for KeyValue(k, v) in AMap.force last -> k, v }))
+
+    // ofASetMapped: deriving the key from the values.
+    let mapped =
+        AMap.ofASetMapped (fun (s: string) -> s.Length) (CSet.value (CSet.ofSeq [ "ab"; "cd"; "e" ]))
+
+    Assert.Equal<Map<int, Set<string>>>(
+        Map.ofList [ 2, Set.ofList [ "ab"; "cd" ]; 1, Set.ofList [ "e" ] ],
+        Map.ofSeq (seq { for KeyValue(k, v) in AMap.force mapped -> k, Set.ofSeq v })
+    )
+
+[<Fact>]
+let ``AMap mapSet, toASet and toASetValues`` () =
+    let source = CSet.ofSeq [ 1; 2; 3 ]
+    let ms = AMap.mapSet (fun k -> k * 10) (CSet.value source)
+
+    Assert.Equal<Map<_, _>>(
+        Map.ofList [ 1, 10; 2, 20; 3, 30 ],
+        Map.ofSeq (seq { for KeyValue(k, v) in AMap.force ms -> k, v })
+    )
+
+    let m = CMap.empty<string, int>
+    let keys = AMap.toASet (CMap.value m)
+    let values = AMap.toASetValues (CMap.value m)
+
+    CMap.addOrUpdate "a" 1 m
+    CMap.addOrUpdate "b" 1 m
+    CMap.addOrUpdate "c" 2 m
+
+    Assert.Equal<Set<_>>(Set.ofList [ "a"; "b"; "c" ], Set.ofSeq (ASet.force keys))
+    Assert.Equal<Set<_>>(Set.ofList [ 1; 2 ], Set.ofSeq (ASet.force values))
+
+    // Distinct values share one reference: removing one contributor keeps the value.
+    CMap.remove "a" m
+    Assert.Equal<Set<_>>(Set.ofList [ 1; 2 ], Set.ofSeq (ASet.force values))
+    CMap.remove "b" m
+    Assert.Equal<Set<_>>(Set.ofList [ 2 ], Set.ofSeq (ASet.force values))
+
+[<Fact>]
+let ``AMap ofAVal rebuilds on every value change`` () =
+    let v = CVal.create [ "a", 1; "b", 2 ]
+    let m = AMap.ofAVal (CVal.value v)
+
+    Assert.Equal<Map<_, _>>(
+        Map.ofList [ "a", 1; "b", 2 ],
+        Map.ofSeq (seq { for KeyValue(k, v) in AMap.force m -> k, v })
+    )
+
+    CVal.set [ "b", 3; "c", 4 ] v
+
+    Assert.Equal<Map<_, _>>(
+        Map.ofList [ "b", 3; "c", 4 ],
+        Map.ofSeq (seq { for KeyValue(k, v) in AMap.force m -> k, v })
+    )
+
+[<Fact>]
+let ``AMap custom drives content from a compute`` () =
+    let mutable pending = ResizeArray<MapDelta<string, int>>()
+
+    let m =
+        AMap.custom (fun view delta ->
+            if pending.Count > 0 then
+                let d = pending[0]
+                pending.RemoveAt 0
+
+                for struct (k, v) in d.SetEntries.ToArray() do
+                    delta.Set(k, v)
+
+                for k in d.RemovedKeys.ToArray() do
+                    delta.Remove k
+
+            ())
+
+    Assert.Equal(0, AMap.count m |> AVal.getValue)
+    let mutable d = MapDelta<string, int>()
+    d.Set("x", 1)
+    pending.Add d
+    Assert.Equal<Map<_, _>>(Map.ofList [ "x", 1 ], Map.ofSeq (seq { for KeyValue(k, v) in AMap.force m -> k, v }))
+
+[<Fact>]
+let ``observation through two-source nodes delivers correct deltas`` () =
+    let left = CSet.empty<int>
+    let right = CSet.empty<int>
+    let inter = ASet.intersect (CSet.value left) (CSet.value right)
+    let mutable events = ResizeArray<Set<int>>()
+
+    use obs =
+        ASet.observe
+            (fun view delta ->
+                let mutable s = Set.ofSeq view
+
+                for r in delta.Removed.ToArray() do
+                    s <- s.Remove r
+
+                for a in delta.Added.ToArray() do
+                    s <- s.Add a
+
+                events.Add s)
+            inter
+
+    CSet.add 1 left
+    CSet.add 1 right
+    CSet.add 2 left
+    CSet.add 3 right
+    CSet.remove 1 right
+    CSet.remove 1 left
+
+    // The events reconstruct the view state after each batch.
+    // add 1 left: not in the intersection yet -> no event.
+    // add 1 right: 1 joins the intersection -> [1].
+    // add 2 left / add 3 right: no intersection change -> no event.
+    // remove 1 right: the intersection empties -> [].
+    // remove 1 left: no intersection change -> no event.
+    Assert.Equal<Set<int> list>([ Set.ofList [ 1 ]; Set.empty ], List.ofSeq events)
+
+    // Two-source map node through an observer.
+    let a = CMap.empty<string, int>
+    let b = CMap.empty<string, int>
+    let iw = AMap.intersectWith (fun _ l r -> l + r) (CMap.value a) (CMap.value b)
+    let mutable last = Map.empty
+
+    use obs2 =
+        AMap.observe
+            (fun view delta ->
+                let mutable s = Map.empty
+
+                for KeyValue(k, v) in view do
+                    s <- Map.add k v s
+
+                last <- s)
+            iw
+
+    CMap.addOrUpdate "x" 1 a
+    CMap.addOrUpdate "x" 2 b
+    Assert.Equal<Map<_, _>>(Map.ofList [ "x", 3 ], last)
+    CMap.addOrUpdate "x" 5 a
+    Assert.Equal<Map<_, _>>(Map.ofList [ "x", 7 ], last)
+
+[<Fact>]
+let ``dirty derived source at first read does not double-apply`` () =
+    // A two-source node whose derived source is dirty (pending journal) at the
+    // first read: the initial load drains the source, which pushes the delta
+    // into the node's journal. If the journal is then applied on top of the
+    // loaded view, the refcount double-counts and a later removal leaves a
+    // phantom in the output.
+    let src = CSet.empty<int>
+    let a = ASet.map (fun x -> x * 10) (CSet.value src)
+    let b = CSet.ofSeq [ 100 ]
+    let u = ASet.union a (CSet.value b)
+
+    // a is registered with src but unread by u; a is dirty when u is first
+    // read.
+    ASet.toSet a |> ignore
+    CSet.add 1 src
+
+    Assert.Equal<Set<int>>(Set.ofList [ 10; 100 ], ASet.toSet u)
+
+    // The double-apply would leave a phantom refcount: removing 10 from a's
+    // source would fail to remove 10 from the union.
+    CSet.remove 1 src
+    Assert.Equal<Set<int>>(Set.ofList [ 100 ], ASet.toSet u)
+
+    // Map node over a dirty derived source (MapMapNode).
+    let msrc = CMap.empty<int, int>
+    let ma = AMap.map (fun k v -> k, v * 10) (CMap.value msrc)
+    let mm = AMap.map (fun _ (_, v) -> v) ma
+
+    (ma :> IAdaptiveMap<_, _>).GetValue() |> ignore
+    CMap.addOrUpdate 2 20 msrc
+    Assert.Equal<Map<int, int>>(Map.ofList [ 2, 200 ], AMap.toMap mm)
+    CMap.remove 2 msrc
+    Assert.Equal<Map<int, int>>(Map.empty, AMap.toMap mm)
+
+    // Reduction over a dirty derived source (ASet.count).
+    let rsrc = CSet.empty<int>
+    let ra = ASet.map (fun x -> x * 10) (CSet.value rsrc)
+    let rc = ASet.count ra
+
+    AVal.getValue rc |> ignore
+    CSet.add 3 rsrc
+    Assert.Equal(1, AVal.getValue rc)
+    CSet.remove 3 rsrc
+    Assert.Equal(0, AVal.getValue rc)
+
+[<Fact>]
+let ``two-source node drains allocate zero in steady state`` () =
+    let left = CSet.empty<int>
+    let right = CSet.empty<int>
+    let inter = ASet.intersect (CSet.value left) (CSet.value right)
+    let u = ASet.unionMany [ CSet.value left; CSet.value right ]
+    let interCount = ASet.count inter
+    let unionCount = ASet.count u
+
+    for i in 1..50 do
+        CSet.add i left
+        CSet.add i right
+
+    // Warm up: the initial load enumerates both source views once.
+    AVal.getValue interCount |> ignore
+    AVal.getValue unionCount |> ignore
+
+    let before = GC.GetAllocatedBytesForCurrentThread()
+
+    for i in 1..100 do
+        CSet.remove ((i % 25) + 26) left
+        CSet.add ((i % 25) + 26) left
+        CSet.remove ((i % 25) + 26) right
+        CSet.add ((i % 25) + 26) right
+
+        if AVal.getValue interCount <> 50 then
+            failwith "intersect drifted"
+
+        if AVal.getValue unionCount <> 50 then
+            failwith "union drifted"
+
+    let allocated = GC.GetAllocatedBytesForCurrentThread() - before
+    Assert.Equal(0L, allocated)
+
+[<Fact>]
+let ``choose2 node drains allocate zero in steady state`` () =
+    let a = CMap.empty<int, int>
+    let b = CMap.empty<int, int>
+
+    let u = AMap.unionWith (fun _ l r -> l + r) (CMap.value a) (CMap.value b)
+    let unionCount = AMap.count u
+
+    for i in 1..50 do
+        CMap.addOrUpdate i i a
+        CMap.addOrUpdate i (i * 2) b
+
+    AVal.getValue unionCount |> ignore
+
+    let before = GC.GetAllocatedBytesForCurrentThread()
+
+    for i in 1..100 do
+        let k = (i % 25) + 26
+        CMap.remove k a
+        CMap.addOrUpdate k i a
+        CMap.remove k b
+        CMap.addOrUpdate k (i * 2) b
+
+        if u.GetValue().Count <> 50 then
+            failwith "union drifted"
+
+
+    let allocated = GC.GetAllocatedBytesForCurrentThread() - before
+    Assert.Equal(0L, allocated)
+
+// =============================================================================
+// PLAN.md Section 7.4 — dynamic dependencies (collect / bind)
+// =============================================================================
+
+[<Fact>]
+let ``ASet.collect unions the inner sets and follows their changes`` () =
+    let src = CSet.empty<int>
+    let inner = CSet.empty<int>
+    let collected = ASet.collect (fun _ -> CSet.value inner) (CSet.value src)
+
+    CSet.add 1 src
+    CSet.add 2 src
+    CSet.add 3 inner
+    CSet.add 4 inner
+
+    // Two source elements map to the same inner set: 3 and 4 each get two
+    // references, the output still holds each element once.
+    Assert.Equal<Set<int>>(Set.ofList [ 3; 4 ], ASet.toSet collected)
+
+    // Inner changes propagate to the output.
+    CSet.add 5 inner
+    Assert.Equal<Set<int>>(Set.ofList [ 3; 4; 5 ], ASet.toSet collected)
+    CSet.remove 3 inner
+    Assert.Equal<Set<int>>(Set.ofList [ 4; 5 ], ASet.toSet collected)
+
+[<Fact>]
+let ``ASet.collect refcounts shared output elements`` () =
+    // Two distinct source elements map to two distinct inner sets that share
+    // an element. Removing one contribution keeps the element in the output.
+    let buckets = CSet.empty<int>
+    let odd = CSet.ofSeq [ 1; 3 ]
+    let even = CSet.ofSeq [ 2; 4 ]
+    let shared = CSet.ofSeq [ 9 ]
+
+    let collected =
+        ASet.collect
+            (fun b ->
+                match b with
+                | 1 -> CSet.value odd
+                | 2 -> CSet.value even
+                | _ -> CSet.value shared)
+            (CSet.value buckets)
+
+    CSet.add 1 buckets
+    CSet.add 2 buckets
+    CSet.add 3 buckets
+
+    // 1 -> odd {1,3}, 2 -> even {2,4}, 3 -> shared {9}
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2; 3; 4; 9 ], ASet.toSet collected)
+
+    // Remove bucket 1: odd's elements {1,3} leave (nobody else has them).
+    CSet.remove 1 buckets
+    Assert.Equal<Set<int>>(Set.ofList [ 2; 4; 9 ], ASet.toSet collected)
+
+    // Now bucket 2 also maps to shared: 9 has two references.
+    CSet.remove 2 buckets
+    Assert.Equal<Set<int>>(Set.ofList [ 9 ], ASet.toSet collected)
+
+    // Removing bucket 3 drops the last reference: 9 leaves.
+    CSet.remove 3 buckets
+    Assert.Equal(0, (ASet.force collected).Count)
+
+[<Fact>]
+let ``ASet.collect id is the dynamic unionMany`` () =
+    // The outer set is itself adaptive: inner sets enter and leave the union.
+    let outer = CSet.empty<AdaptiveSlop.Core.ChangeableSet<int>>
+    let a = CSet.ofSeq [ 1; 2 ]
+    let b = CSet.ofSeq [ 2; 3 ]
+
+    let u = ASet.collect (fun s -> CSet.value s) (CSet.value outer)
+    CSet.add a outer
+    CSet.add b outer
+
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2; 3 ], ASet.toSet u)
+
+    // The inner sets keep contributing while they are in the outer set.
+    CSet.add 4 a
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2; 3; 4 ], ASet.toSet u)
+
+    // Removing an inner set removes its (refcounted) contribution.
+    CSet.remove a outer
+    Assert.Equal<Set<int>>(Set.ofList [ 2; 3 ], ASet.toSet u)
+
+    // The removed inner set's later changes do not leak (eager unregister).
+    CSet.add 5 a
+    Assert.Equal<Set<int>>(Set.ofList [ 2; 3 ], ASet.toSet u)
+
+[<Fact>]
+let ``ASet.collect handles source churn and inner churn in one batch`` () =
+    let outer = CSet.empty<int>
+    let inner1 = CSet.ofSeq [ 1; 2 ]
+    let inner2 = CSet.ofSeq [ 3 ]
+
+    let u =
+        ASet.collect (fun x -> if x = 1 then CSet.value inner1 else CSet.value inner2) (CSet.value outer)
+
+    CSet.add 1 outer
+    CSet.add 2 outer
+    CSet.add 3 inner1
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2; 3 ], ASet.toSet u)
+
+    // One batch: drop element 1 (inner1 leaves), element 2 stays on inner2.
+    // inner2 gains 3 in the same batch.
+    Transaction.run (fun () ->
+        CSet.remove 1 outer
+        CSet.add 3 inner2)
+    |> ignore
+
+    Assert.Equal<Set<int>>(Set.ofList [ 3 ], ASet.toSet u)
+
+    // Re-add element 1: a fresh entry maps it again.
+    CSet.add 1 outer
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2; 3 ], ASet.toSet u)
+
+[<Fact>]
+let ``ASet.collect accepts poll inner sets (ofReader)`` () =
+    let mutable current = HashSet<int>()
+    current.Add 1 |> ignore
+    current.Add 2 |> ignore
+
+    let reader =
+        ASet.ofReader (fun () ->
+            let next = HashSet<int>(current)
+            next)
+
+    let src = CSet.ofSeq [ 10; 20 ]
+    let u = ASet.collect (fun _ -> reader) (CSet.value src)
+
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2 ], ASet.toSet u)
+
+    // The poll inner changes; the version check pulls it on the next read.
+    current.Remove 1 |> ignore
+    current.Add 3 |> ignore
+    Assert.Equal<Set<int>>(Set.ofList [ 2; 3 ], ASet.toSet u)
+
+    // Drop one source element: its contribution (with the fresh polled
+    // content) leaves, the other element still contributes.
+    CSet.remove 10 src
+    Assert.Equal<Set<int>>(Set.ofList [ 2; 3 ], ASet.toSet u)
+
+[<Fact>]
+let ``ASet.bind swaps the inner set and unregisters the old one eagerly`` () =
+    let selected = CVal.create 0
+    let buckets = [| CSet.ofSeq [ 1; 2 ]; CSet.ofSeq [ 3; 4 ] |]
+
+    let visible = ASet.bind (fun i -> CSet.value buckets[i]) (CVal.value selected)
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2 ], ASet.toSet visible)
+
+    // The bound inner set's changes propagate.
+    CSet.add 5 (buckets[0])
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2; 5 ], ASet.toSet visible)
+
+    // Swap: the old content leaves, the new content enters.
+    CVal.set 1 selected
+    Assert.Equal<Set<int>>(Set.ofList [ 3; 4 ], ASet.toSet visible)
+
+    // The old inner set is unregistered: its later changes do not leak.
+    CSet.add 6 (buckets[0])
+    CSet.remove 3 (buckets[1])
+    Assert.Equal<Set<int>>(Set.ofList [ 4 ], ASet.toSet visible)
+
+    // Swapping back re-reads the current content of bucket 0 (with 6).
+    CVal.set 0 selected
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2; 5; 6 ], ASet.toSet visible)
+
+[<Fact>]
+let ``AMap.bind swaps the inner map and unregisters the old one eagerly`` () =
+    let selected = CVal.create 0
+    let tables = [| CMap.ofSeq [ "a", 1; "b", 2 ]; CMap.ofSeq [ "c", 3 ] |]
+
+    let visible = AMap.bind (fun i -> CMap.value tables[i]) (CVal.value selected)
+    Assert.Equal<Map<string, int>>(Map.ofList [ "a", 1; "b", 2 ], AMap.toMap visible)
+
+    CMap.addOrUpdate "b" 20 tables[0]
+    Assert.Equal<Map<string, int>>(Map.ofList [ "a", 1; "b", 20 ], AMap.toMap visible)
+
+    CVal.set 1 selected
+    Assert.Equal<Map<string, int>>(Map.ofList [ "c", 3 ], AMap.toMap visible)
+
+    // Old inner unregistered: later changes do not leak.
+    CMap.addOrUpdate "b" 999 tables[0]
+    CMap.remove "c" tables[1]
+    Assert.Equal<Map<string, int>>(Map.empty, AMap.toMap visible)
+
+    CVal.set 0 selected
+    Assert.Equal<Map<string, int>>(Map.ofList [ "a", 1; "b", 999 ], AMap.toMap visible)
+
+[<Fact>]
+let ``collect and bind dispose cleanly`` () =
+    let source = CSet.ofSeq [ 1; 2 ]
+    let inner = CSet.ofSeq [ 10 ]
+    let collected = ASet.collect (fun _ -> CSet.value inner) (CSet.value source)
+
+    ASet.toSet collected |> ignore
+    let cs = source :> AdaptiveSlop.Core.ChangeableSet<int>
+    let ci = inner :> AdaptiveSlop.Core.ChangeableSet<int>
+    Assert.Equal(1, cs.SinkCount)
+    Assert.Equal(2, ci.SinkCount) // one sink per source element
+
+    (collected :> IDisposable).Dispose()
+    Assert.Equal(0, cs.SinkCount)
+    Assert.Equal(0, ci.SinkCount)
+
+    Assert.Throws<InvalidOperationException>(fun () -> ASet.toSet collected |> ignore)
+    |> ignore
+
+    // Writes after disposal process nothing.
+    CSet.add 3 source
+    CSet.add 11 inner
+    Assert.Equal(0, cs.SinkCount)
+    Assert.Equal(0, ci.SinkCount)
+
+    // Bind disposal unregisters the value edge and the inner sink.
+    let selected = CVal.create 0
+    let buckets = [| CSet.ofSeq [ 1 ]; CSet.ofSeq [ 2 ] |]
+    let bound = ASet.bind (fun i -> CSet.value buckets[i]) (CVal.value selected)
+    ASet.toSet bound |> ignore
+    Assert.Equal(1, (buckets[0] :> AdaptiveSlop.Core.ChangeableSet<int>).SinkCount)
+
+    (bound :> IDisposable).Dispose()
+    Assert.Equal(0, (buckets[0] :> AdaptiveSlop.Core.ChangeableSet<int>).SinkCount)
+
+    Assert.Throws<InvalidOperationException>(fun () -> ASet.toSet bound |> ignore)
+    |> ignore
+
+[<Fact>]
+let ``collect drain allocates zero in steady state`` () =
+    let outer = CSet.empty<int>
+    let inner1 = CSet.ofSeq [ 1; 2; 3 ]
+    let inner2 = CSet.ofSeq [ 4; 5 ]
+
+    let u =
+        ASet.collect (fun x -> if x % 2 = 0 then CSet.value inner1 else CSet.value inner2) (CSet.value outer)
+
+    for i in 1..20 do
+        CSet.add i outer
+
+    // Warm up: initial load + one full drain cycle grows all buffers.
+    u.GetValue().Count |> ignore
+
+    for i in 1..20 do
+        CSet.add (i + 100) outer
+
+    u.GetValue().Count |> ignore
+
+    let before = GC.GetAllocatedBytesForCurrentThread()
+
+    for i in 1..200 do
+        // Churn an element that is actually in inner1 (1..3): the output
+        // must stay {1..5} through every remove/add cycle.
+        CSet.remove ((i % 3) + 1) inner1
+        CSet.add ((i % 3) + 1) inner1
+
+        if u.GetValue().Count <> 5 then
+            failwith "collect drifted"
+
+    let allocated = GC.GetAllocatedBytesForCurrentThread() - before
+    Assert.Equal(0L, allocated)
+
+[<Fact>]
+let ``write during a drain is deferred to the next read`` () =
+    // The mapping runs during the drain; a write to a source of the same node
+    // appends to the journal mid-processing. The compaction markers keep the
+    // reentrant entries for the next read: nothing is lost, nothing double-applies.
+    let src = CSet.ofSeq [ 1; 2 ]
+    let mutable reentrant = false
+
+    let u =
+        ASet.map
+            (fun x ->
+                if x = 2 && not reentrant then
+                    reentrant <- true
+                    CSet.add 3 src
+
+                x * 10)
+            (CSet.value src)
+
+    // The reentrant write lands in the journal during the first read's load;
+    // the first drain applies it before that read returns (the write is part
+    // of the read's execution). Later reads see it exactly once.
+    Assert.Equal<Set<int>>(Set.ofList [ 10; 20; 30 ], ASet.toSet u)
+    Assert.Equal<Set<int>>(Set.ofList [ 10; 20; 30 ], ASet.toSet u)
+
+    // And the removal works: no phantom refcounts.
+    CSet.remove 3 src
+    Assert.Equal<Set<int>>(Set.ofList [ 10; 20 ], ASet.toSet u)
+
+// NOTE: reading a node from inside its own mapping is out of contract
+// (undefined in FDA as well). Writes during a drain are supported: they
+// land in the journal via the compaction markers and apply exactly once.
