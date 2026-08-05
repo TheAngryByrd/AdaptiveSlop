@@ -16,10 +16,38 @@ open System.Collections.Frozen
 /// <summary>Operations on adaptive sets.</summary>
 module ASet =
     /// <summary>An adaptive set over fixed, immutable items.</summary>
-    let inline ofSeq (items: seq<'T>) : IAdaptiveSet<'T> = ConstantSet(items.ToFrozenSet())
+    let inline ofSeq (items: seq<'T>) : IAdaptiveSet<'T> =
+        ConstantSet<'T>(fun () -> items.ToFrozenSet())
+
+    /// <summary>An adaptive set over a fixed array.</summary>
+    let inline ofArray (items: 'T[]) : IAdaptiveSet<'T> =
+        ConstantSet<'T>(fun () -> items.ToFrozenSet())
+
+    /// <summary>An adaptive set over a fixed list.</summary>
+    let inline ofList (items: 'T list) : IAdaptiveSet<'T> =
+        ConstantSet<'T>(fun () -> items.ToFrozenSet())
+
+    /// <summary>An adaptive set over a fixed HashSet.</summary>
+    let inline ofHashSet (items: HashSet<'T>) : IAdaptiveSet<'T> =
+        ConstantSet<'T>(fun () -> items.ToFrozenSet())
+
+    /// <summary>
+    /// An adaptive set whose content is fixed but computed lazily, once, at
+    /// first read. Enables self-referential definitions (FDA parity: the
+    /// create function runs at most once).
+    /// </summary>
+    let inline constant (create: unit -> HashSet<'T>) : IAdaptiveSet<'T> =
+        ConstantSet<'T>(fun () -> create().ToFrozenSet())
+
+    /// <summary>Alias of <see cref="constant"/> (FDA parity: delay is constant).</summary>
+    let inline delay (create: unit -> HashSet<'T>) : IAdaptiveSet<'T> = constant create
 
     /// <summary>Maps every element of the set.</summary>
     let inline map ([<InlineIfLambda>] f: 'T -> 'U) (set: IAdaptiveSet<'T>) : IAdaptiveSet<'U> =
+        MapSetNode<'T, 'U>(set, fun x -> ValueSome(f x))
+
+    /// <summary>Maps every element, keeping only the ones the mapping returns a value for.</summary>
+    let inline choose ([<InlineIfLambda>] f: 'T -> 'U voption) (set: IAdaptiveSet<'T>) : IAdaptiveSet<'U> =
         MapSetNode<'T, 'U>(set, f)
 
     /// <summary>Keeps the elements that satisfy the predicate.</summary>
@@ -29,6 +57,65 @@ module ASet =
     /// <summary>The union of two sets.</summary>
     let inline union (left: IAdaptiveSet<'T>) (right: IAdaptiveSet<'T>) : IAdaptiveSet<'T> =
         UnionSetNode<'T>(left, right)
+
+    /// <summary>
+    /// The union of all given sets. Deviation from FDA: FDA's
+    /// <c>unionMany</c> takes an adaptive set of sets (the dynamic form lands
+    /// with <c>bind</c>/<c>collect</c>, PLAN.md 7.4); this overload takes a
+    /// static sequence and folds <see cref="union"/>.
+    /// </summary>
+    let unionMany (sets: seq<IAdaptiveSet<'T>>) : IAdaptiveSet<'T> =
+        let mutable acc = Unchecked.defaultof<IAdaptiveSet<'T>>
+        let mutable first = true
+
+        for s in sets do
+            if first then
+                acc <- s
+                first <- false
+            else
+                acc <- UnionSetNode<'T>(acc, s)
+
+        if first then
+            ConstantSet<'T>(fun () -> FrozenSet<'T>.Empty)
+        else
+            acc
+
+    /// <summary>The elements of the left set that are not in the right set.</summary>
+    let inline difference (left: IAdaptiveSet<'T>) (right: IAdaptiveSet<'T>) : IAdaptiveSet<'T> =
+        TwoSourceSetNode<'T>(TwoSetOp.Difference, left, right)
+
+    /// <summary>The elements present in both sets.</summary>
+    let inline intersect (left: IAdaptiveSet<'T>) (right: IAdaptiveSet<'T>) : IAdaptiveSet<'T> =
+        TwoSourceSetNode<'T>(TwoSetOp.Intersect, left, right)
+
+    /// <summary>The symmetric difference: elements present in exactly one set.</summary>
+    let inline xor (left: IAdaptiveSet<'T>) (right: IAdaptiveSet<'T>) : IAdaptiveSet<'T> =
+        TwoSourceSetNode<'T>(TwoSetOp.Xor, left, right)
+
+    /// <summary>
+    /// An adaptive set over an adaptive value of a sequence. Every change of
+    /// the value replaces the whole state and emits the diff as the delta
+    /// (FDA <c>ASet.ofAVal</c> parity; the value carries no deltas).
+    /// </summary>
+    let inline ofAVal<'T, 'S when 'T: equality and 'S :> seq<'T>> (value: IAdaptiveValue<'S>) : IAdaptiveSet<'T> =
+        OfAvalSetNode<'T, 'S>(value)
+
+    /// <summary>
+    /// An adaptive set over an external reader function. The reader is called
+    /// on every read (poll); the node diffs the result against its state and
+    /// emits the diff as the delta. Pull-based: nothing marks this node, so
+    /// consumers must re-read it (FDA <c>ASet.ofReader</c> is pull-based too).
+    /// </summary>
+    let inline ofReader (reader: unit -> HashSet<'T>) : IAdaptiveSet<'T> = ReaderSetNode<'T>(reader)
+
+    /// <summary>
+    /// An adaptive set driven by a compute function (FDA <c>ASet.custom</c>
+    /// parity, pull model). The compute receives the current view and a delta
+    /// builder; it appends the operations that describe the change since the
+    /// previous call (for example, consuming its own event queue).
+    /// </summary>
+    let inline custom (compute: IReadOnlySet<'T> -> SetDeltaBuilder<'T> -> unit) : IAdaptiveSet<'T> =
+        CustomSetNode<'T>(compute)
 
     /// <summary>
     /// Registers a callback that receives the current view and the net delta
@@ -156,7 +243,7 @@ module ASet =
 
     /// <summary>A constant set with a single element.</summary>
     let single (value: 'T) : IAdaptiveSet<'T> =
-        new ConstantSet<'T>([ value ].ToFrozenSet())
+        ConstantSet<'T>(fun () -> [ value ].ToFrozenSet())
 
     /// <summary>
     /// Materializes the set as an adaptive value. Every change materializes a
@@ -214,15 +301,174 @@ module CSet =
 module AMap =
     /// <summary>An adaptive map over fixed, immutable entries.</summary>
     let inline ofSeq (items: seq<'K * 'V>) : IAdaptiveMap<'K, 'V> =
-        ConstantMap(
+        ConstantMap<'K, 'V>(fun () ->
             items
             |> Seq.map (fun (k, v) -> KeyValuePair(k, v))
-            |> FrozenDictionary.ToFrozenDictionary
-        )
+            |> FrozenDictionary.ToFrozenDictionary)
+
+    /// <summary>An adaptive map over a fixed array of entries.</summary>
+    let inline ofArray (items: ('K * 'V)[]) : IAdaptiveMap<'K, 'V> =
+        ConstantMap<'K, 'V>(fun () ->
+            items
+            |> Seq.map (fun (k, v) -> KeyValuePair(k, v))
+            |> FrozenDictionary.ToFrozenDictionary)
+
+    /// <summary>An adaptive map over a fixed list of entries.</summary>
+    let inline ofList (items: ('K * 'V) list) : IAdaptiveMap<'K, 'V> =
+        ConstantMap<'K, 'V>(fun () ->
+            items
+            |> Seq.map (fun (k, v) -> KeyValuePair(k, v))
+            |> FrozenDictionary.ToFrozenDictionary)
+
+    /// <summary>An adaptive map over a fixed F# <c>Map</c>.</summary>
+    let inline ofMap (items: Map<'K, 'V>) : IAdaptiveMap<'K, 'V> =
+        ConstantMap<'K, 'V>(fun () ->
+            items
+            |> Seq.map (fun (KeyValue(k, v)) -> KeyValuePair(k, v))
+            |> FrozenDictionary.ToFrozenDictionary)
 
     /// <summary>Maps every entry of the map.</summary>
     let inline map ([<InlineIfLambda>] f: 'K -> 'V -> 'U) (mapValue: IAdaptiveMap<'K, 'V>) : IAdaptiveMap<'K, 'U> =
+        MapMapNode<'K, 'V, 'U>(mapValue, fun k v -> ValueSome(f k v))
+
+    /// <summary>Maps every entry, keeping only the ones the mapping returns a value for.</summary>
+    let inline choose
+        ([<InlineIfLambda>] f: 'K -> 'V -> 'U voption)
+        (mapValue: IAdaptiveMap<'K, 'V>)
+        : IAdaptiveMap<'K, 'U> =
         MapMapNode<'K, 'V, 'U>(mapValue, f)
+
+    /// <summary>Unions both maps, resolving colliding keys with the given function.</summary>
+    let inline unionWith
+        ([<InlineIfLambda>] resolve: 'K -> 'V -> 'V -> 'V)
+        (left: IAdaptiveMap<'K, 'V>)
+        (right: IAdaptiveMap<'K, 'V>)
+        : IAdaptiveMap<'K, 'V> =
+        Choose2MapNode<'K, 'V, 'V, 'V>(
+            left,
+            right,
+            fun k lv rv ->
+                match lv, rv with
+                | ValueSome l, ValueSome r -> ValueSome(resolve k l r)
+                | ValueSome l, ValueNone -> ValueSome l
+                | ValueNone, ValueSome r -> ValueSome r
+                | ValueNone, ValueNone -> ValueNone
+        )
+
+    /// <summary>
+    /// Unions both maps, preferring the RIGHT value when keys collide
+    /// (FDA parity: <c>union a b = unionWith (fun _ _ r -> r) a b</c>).
+    /// </summary>
+    let inline union (left: IAdaptiveMap<'K, 'V>) (right: IAdaptiveMap<'K, 'V>) : IAdaptiveMap<'K, 'V> =
+        unionWith (fun _ _ r -> r) left right
+
+    /// <summary>
+    /// The keys present in both maps, with the values paired. Struct pair:
+    /// the voption-first convention collapses FDA's <c>intersect</c> (tuple)
+    /// and <c>intersectV</c> (struct) into the struct form.
+    /// </summary>
+    let inline intersect
+        (left: IAdaptiveMap<'K, 'V1>)
+        (right: IAdaptiveMap<'K, 'V2>)
+        : IAdaptiveMap<'K, struct ('V1 * 'V2)> =
+        Choose2MapNode<'K, 'V1, 'V2, struct ('V1 * 'V2)>(
+            left,
+            right,
+            fun k lv rv ->
+                match lv, rv with
+                | ValueSome l, ValueSome r -> ValueSome(struct (l, r))
+                | _ -> ValueNone
+        )
+
+    /// <summary>Intersects both maps, combining the paired values.</summary>
+    let inline intersectWith
+        ([<InlineIfLambda>] combine: 'K -> 'V1 -> 'V2 -> 'V3)
+        (left: IAdaptiveMap<'K, 'V1>)
+        (right: IAdaptiveMap<'K, 'V2>)
+        : IAdaptiveMap<'K, 'V3> =
+        Choose2MapNode<'K, 'V1, 'V2, 'V3>(
+            left,
+            right,
+            fun k lv rv ->
+                match lv, rv with
+                | ValueSome l, ValueSome r -> ValueSome(combine k l r)
+                | _ -> ValueNone
+        )
+
+    /// <summary>
+    /// Merges both maps with a mapping that receives the key and both side
+    /// values (voptions) and returns the output value (voption). The mapping
+    /// is called only when at least one side has a value (FDA parity); a key
+    /// with no value on either side is removed without a call. Voption-first:
+    /// this is FDA's <c>choose2V</c> (the option variant is not provided).
+    /// </summary>
+    let inline choose2
+        ([<InlineIfLambda>] mapping: 'K -> 'V1 voption -> 'V2 voption -> 'V3 voption)
+        (left: IAdaptiveMap<'K, 'V1>)
+        (right: IAdaptiveMap<'K, 'V2>)
+        : IAdaptiveMap<'K, 'V3> =
+        Choose2MapNode<'K, 'V1, 'V2, 'V3>(left, right, mapping)
+
+    /// <summary>
+    /// A map from a set of entries, keeping ALL values of a key in a HashSet
+    /// (FDA <c>ofASet</c> parity). A changed value set emits a fresh HashSet
+    /// in the delta (this node allocates by design).
+    /// </summary>
+    let inline ofASet (elements: IAdaptiveSet<'K * 'V>) : IAdaptiveMap<'K, HashSet<'V>> =
+        SetToMapKeepAllNode<'K, 'V, 'K * 'V>(elements, id)
+
+    /// <summary>
+    /// A map from a set of entries; duplicate keys keep the LAST value
+    /// (FDA <c>ofASetIgnoreDuplicates</c> parity: the constant path keeps the
+    /// last value, the delta path is arbitrary).
+    /// </summary>
+    let inline ofASetIgnoreDuplicates (elements: IAdaptiveSet<'K * 'V>) : IAdaptiveMap<'K, 'V> =
+        SetToMapNode<'K, 'V, 'K * 'V>(elements, (fun x -> x), true)
+
+    /// <summary>
+    /// A map from a set, deriving the key from every value and keeping ALL
+    /// values of a key in a HashSet (FDA <c>ofASetMapped</c> parity).
+    /// </summary>
+    let inline ofASetMapped (getKey: 'V -> 'K) (elements: IAdaptiveSet<'V>) : IAdaptiveMap<'K, HashSet<'V>> =
+        SetToMapKeepAllNode<'K, 'V, 'V>(elements, fun v -> (getKey v, v))
+
+    /// <summary>
+    /// A map from a set, deriving the key from every value; duplicate keys
+    /// keep the LAST value.
+    /// </summary>
+    let inline ofASetMappedIgnoreDuplicates (getKey: 'V -> 'K) (elements: IAdaptiveSet<'V>) : IAdaptiveMap<'K, 'V> =
+        SetToMapNode<'K, 'V, 'V>(elements, (fun v -> (getKey v, v)), true)
+
+    /// <summary>Maps the keys of a set to entries (FDA <c>mapSet</c> parity: the mapping runs per key).</summary>
+    let inline mapSet (mapping: 'K -> 'V) (set: IAdaptiveSet<'K>) : IAdaptiveMap<'K, 'V> =
+        SetToMapNode<'K, 'V, 'K>(set, (fun k -> (k, mapping k)), false)
+
+    /// <summary>An adaptive set of the map's keys (FDA <c>toASet</c> parity).</summary>
+    let inline toASet (mapValue: IAdaptiveMap<'K, 'V>) : IAdaptiveSet<'K> =
+        MapToSetNode<'K, 'V, 'K>(mapValue, fun k _ -> k)
+
+    /// <summary>An adaptive set of the map's distinct values (FDA <c>toASetValues</c> parity).</summary>
+    let inline toASetValues (mapValue: IAdaptiveMap<'K, 'V>) : IAdaptiveSet<'V> =
+        MapToSetNode<'K, 'V, 'V>(mapValue, fun _ v -> v)
+
+    /// <summary>
+    /// An adaptive map over an adaptive value of a sequence of entries. Every
+    /// change of the value replaces the whole state and emits the diff as the
+    /// delta (FDA <c>AMap.ofAVal</c> parity; the value carries no deltas).
+    /// </summary>
+    let inline ofAVal<'K, 'V, 'S when 'K: equality and 'S :> seq<'K * 'V>>
+        (value: IAdaptiveValue<'S>)
+        : IAdaptiveMap<'K, 'V> =
+        OfAvalMapNode<'K, 'V, 'S>(value)
+
+    /// <summary>
+    /// An adaptive map driven by a compute function (FDA <c>AMap.custom</c>
+    /// parity, pull model). The compute receives the current view and a delta
+    /// builder; it appends the operations that describe the change since the
+    /// previous call (for example, consuming its own event queue).
+    /// </summary>
+    let inline custom (compute: IReadOnlyDictionary<'K, 'V> -> MapDeltaBuilder<'K, 'V> -> unit) : IAdaptiveMap<'K, 'V> =
+        CustomMapNode<'K, 'V>(compute)
 
     /// <summary>Keeps the entries that satisfy the predicate.</summary>
     let inline filter
@@ -374,7 +620,7 @@ module AMap =
 
     /// <summary>A constant map with a single entry.</summary>
     let single (key: 'K) (value: 'V) : IAdaptiveMap<'K, 'V> =
-        ConstantMap([ KeyValuePair(key, value) ] |> FrozenDictionary.ToFrozenDictionary)
+        ConstantMap<'K, 'V>(fun () -> [ KeyValuePair(key, value) ] |> FrozenDictionary.ToFrozenDictionary)
 
     /// <summary>
     /// Materializes the map as an adaptive value. Every change materializes a
