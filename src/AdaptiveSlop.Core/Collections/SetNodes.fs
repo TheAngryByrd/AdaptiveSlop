@@ -59,8 +59,13 @@ type MapSetNode<'T, 'U when 'U: equality>(source: IAdaptiveSet<'T>, mapping: 'T 
     member private this.EnsureInitialized() =
         if not initialized then
             initialized <- true
-            this.Register()
+            // Read first, register after: the view is complete, and the sink
+            // sees only deltas that follow. A dirty source draining during the
+            // load would otherwise push its delta into the journal, and the
+            // subsequent drain would double-apply it (measured phantom
+            // refcount; see the "dirty derived source at first read" test).
             Collections.loadRefSet mapping source &state
+            this.Register()
             state.DepVersions[0] <- source.Version
 
     interface ISetDeltaSink<'T> with
@@ -133,8 +138,9 @@ type FilterSetNode<'T when 'T: equality>(source: IAdaptiveSet<'T>, [<InlineIfLam
     member private this.EnsureInitialized() =
         if not initialized then
             initialized <- true
-            this.Register()
+            // Read first, register after (see MapSetNode.EnsureInitialized).
             Collections.loadPlainSet mapOpt source &state
+            this.Register()
             state.DepVersions[0] <- source.Version
 
     interface ISetDeltaSink<'T> with
@@ -207,10 +213,11 @@ type UnionSetNode<'T when 'T: equality>(left: IAdaptiveSet<'T>, right: IAdaptive
     member private this.EnsureInitialized() =
         if not initialized then
             initialized <- true
-            this.RegisterSide left
-            this.RegisterSide right
+            // Read first, register after (see MapSetNode.EnsureInitialized).
             Collections.loadRefSet Id.identityV left &state
             Collections.loadRefSet Id.identityV right &state
+            this.RegisterSide left
+            this.RegisterSide right
             state.DepVersions[0] <- left.Version
             state.DepVersions[1] <- right.Version
 
@@ -304,8 +311,9 @@ type TwoSourceSetNode<'T when 'T: equality>(op: TwoSetOp, left: IAdaptiveSet<'T>
     member private this.EnsureInitialized() =
         if not initialized then
             initialized <- true
-            this.Register()
+            // Read first, register after (see MapSetNode.EnsureInitialized).
             Collections.loadTwoSet op left right &state
+            this.Register()
             state.DepVersions[0] <- left.Version
             state.DepVersions[1] <- right.Version
 
@@ -565,6 +573,295 @@ type CustomSetNode<'T when 'T: equality>(compute: IReadOnlySet<'T> -> SetDeltaBu
         member this.Dispose() =
             if not disposed then
                 disposed <- true
+                Collections.clearSinks &state.Sinks
+
+    interface ISetSinkRegistry with
+        member this.AddSetSink(sink) = Collections.addSink &state.Sinks sink
+
+        member this.RemoveSetSink(sink) =
+            Collections.removeSink &state.Sinks sink
+
+    interface IEdgeTarget with
+        member _.EdgeCount = state.Edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
+
+/// <summary>
+/// An adaptive set that unions one inner adaptive set per source element
+/// (<c>ASet.collect</c>, PLAN.md Section 7.4). The output is the refcounted
+/// union of all contributions (the CountingHashSet role): an output element
+/// disappears only when the last contributing inner set drops it. A removed
+/// source element unregisters its inner sink eagerly (ANALYSIS-FDA.md
+/// Pitfall 1). Registration is lazy (first read); disposal unregisters
+/// everything.
+/// </summary>
+type CollectSetNode<'T, 'U when 'T: equality and 'U: equality>
+    (source: IAdaptiveSet<'T>, mapping: 'T -> IAdaptiveSet<'U>) =
+    let mutable state = Collections.CollectState<'T, 'U>.Create(1)
+    let mutable initialized = false
+    let mutable disposed = false
+
+    member private this.EnsureInitialized() =
+        if not initialized then
+            initialized <- true
+            // Read the source view first; register the sink after (the view is
+            // complete, and the sink sees only deltas that follow this point).
+            let view = source.GetValue()
+
+            for x in view do
+                let inner = mapping x
+                let innerView = inner.GetValue()
+                let mutable entry = Collections.CollectEntry<'U>(inner)
+
+                for u in innerView do
+                    let struct (g2, added) = Collections.refAdd state.Global u
+                    state.Global <- g2
+                    // The entry's own content is tracked unconditionally: only
+                    // the global output delta is conditional on newness.
+                    entry.Content.Add u |> ignore
+
+                entry.Sink <- box (Collections.CollectSink<'T, 'U>(this, x))
+
+                match box inner with
+                | :? ISetSinkRegistry as r -> r.AddSetSink(entry.Sink)
+                | _ -> ()
+
+                entry.Version <- inner.Version
+                state.Inner[x] <- entry
+
+            match box source with
+            | :? ISetSinkRegistry as r -> r.AddSetSink(box this)
+            | _ -> ()
+
+            state.DepVersions[0] <- source.Version
+
+    interface Collections.ICollectTarget<'T, 'U> with
+        member this.OnInnerDeltas(key: 'T, adds: 'U[], addCnt: int, rems: 'U[], remCnt: int) =
+            if not disposed then
+                let mutable entry = Unchecked.defaultof<Collections.CollectEntry<'U>>
+
+                if state.Inner.TryGetValue(key, &entry) then
+                    Collections.journalAppendSet &entry.Journal adds addCnt rems remCnt
+                    state.Inner[key] <- entry
+                    state.Version <- state.Version + 1L
+                    GraphContext.Default.MarkFrom(state.Edges)
+
+    interface ISetDeltaSink<'T> with
+        member this.OnDeltas(adds: 'T[], addCnt: int, rems: 'T[], remCnt: int) =
+            if not disposed then
+                Collections.journalAppendSet &state.Journal adds addCnt rems remCnt
+                state.Version <- state.Version + 1L
+                GraphContext.Default.MarkFrom(state.Edges)
+
+    interface IAdaptiveSet<'U> with
+        member this.GetValue() =
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
+
+            try
+                if disposed then
+                    invalidOp "This adaptive set has been disposed."
+
+                this.EnsureInitialized()
+
+                let mutable hasPending = false
+
+                if source.Version <> state.DepVersions[0] then
+                    source.GetValue() |> ignore
+                    state.DepVersions[0] <- source.Version
+
+                hasPending <- not state.Journal.IsEmpty
+
+                // Explicit struct enumerator: the F# KeyValue pattern over a
+                // Dictionary field can allocate per element (measured 88 B/entry
+                // in the version-check loop; zero with the explicit enumerator).
+                let mutable ie = state.Inner.GetEnumerator()
+
+                while ie.MoveNext() do
+                    let x = ie.Current.Key
+                    let e0 = ie.Current.Value
+                    let mutable entry = e0
+
+                    if entry.Node.Version <> entry.Version then
+                        entry.Node.GetValue() |> ignore
+                        // The pull (and the version getter itself, for poll
+                        // inners) may have delivered a delta into the dictionary
+                        // entry: re-read instead of clobbering the stale copy.
+                        let mutable e2 = Unchecked.defaultof<Collections.CollectEntry<'U>>
+
+                        if state.Inner.TryGetValue(x, &e2) then
+                            e2.Version <- entry.Node.Version
+                            state.Inner[x] <- e2
+                            entry <- e2
+                        else
+                            entry.Version <- entry.Node.Version
+
+                    if not hasPending && not entry.Journal.IsEmpty then
+                        hasPending <- true
+
+                if hasPending then
+                    Collections.drainCollectPush this mapping &state
+
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) state.Version
+                state.Global.Data :> IReadOnlySet<'U>
+            finally
+                ctx.ReleaseOwner()
+
+        member _.Version = state.Version
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+
+                match box source with
+                | :? ISetSinkRegistry as r -> r.RemoveSetSink(box this)
+                | _ -> ()
+
+                for KeyValue(_, entry) in state.Inner do
+                    match box entry.Node with
+                    | :? ISetSinkRegistry as r -> r.RemoveSetSink(entry.Sink)
+                    | _ -> ()
+
+                state.Inner.Clear()
+                Collections.clearSinks &state.Sinks
+
+    interface ISetSinkRegistry with
+        member this.AddSetSink(sink) = Collections.addSink &state.Sinks sink
+
+        member this.RemoveSetSink(sink) =
+            Collections.removeSink &state.Sinks sink
+
+    interface IEdgeTarget with
+        member _.EdgeCount = state.Edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
+
+/// <summary>
+/// An adaptive set bound to a scalar value (<c>ASet.bind</c>, PLAN.md Section
+/// 7.4): <c>mapping value</c> selects the inner set; when the value changes, the
+/// whole inner set is swapped (old content removed, new content added) and the
+/// old inner sink is unregistered eagerly (FDA <c>BindReader</c> semantics;
+/// ANALYSIS-FDA.md Pitfall 1). The inner set's own changes flow through a
+/// journal. Registration is lazy (first read); disposal unregisters everything.
+/// </summary>
+type BindSetNode<'T, 'U when 'U: equality>(value: IAdaptiveValue<'T>, mapping: 'T -> IAdaptiveSet<'U>) =
+    let mutable state = Collections.BindSetState<'U>.Create(1)
+    let mutable inner: IAdaptiveSet<'U> = Unchecked.defaultof<IAdaptiveSet<'U>>
+    let mutable hasInner = false
+    let mutable innerVersion = 0L
+    let mutable edgeInValue = -1
+    let mutable current: 'T = Unchecked.defaultof<'T>
+    let mutable initialized = false
+    let mutable disposed = false
+
+    member private this.UnregisterInner() =
+        if hasInner then
+            match box inner with
+            | :? ISetSinkRegistry as r -> r.RemoveSetSink(box this)
+            | _ -> ()
+
+            hasInner <- false
+
+    member private this.LoadInner() =
+        // Read first, register after: the view is complete, and the sink sees
+        // only deltas that follow this point in time.
+        let view = inner.GetValue()
+
+        for u in view do
+            state.Data.Add u |> ignore
+
+        match box inner with
+        | :? ISetSinkRegistry as r -> r.AddSetSink(box this)
+        | _ -> ()
+
+        hasInner <- true
+        innerVersion <- inner.Version
+
+    member private this.SwapTo(next: 'T) =
+        // Eager edge removal (Pitfall 1): the old inner must not deliver after
+        // the swap. Its pending journal is dropped with the content.
+        this.UnregisterInner()
+        state.Data.Clear()
+        inner <- mapping next
+        current <- next
+        this.LoadInner()
+        state.Journal.Clear()
+        state.Version <- state.Version + 1L
+
+    member private this.EnsureInitialized() =
+        if not initialized then
+            initialized <- true
+
+            match value with
+            | :? IEdgeTarget as t -> edgeInValue <- t.AddEdge(this :> IAdaptiveNode, -1)
+            | _ -> ()
+
+            current <- value.GetValue()
+            inner <- mapping current
+            this.LoadInner()
+            state.DepVersions[0] <- value.Version
+
+    interface IAdaptiveNode with
+        member this.MarkDirty() =
+            GraphContext.Default.MarkFrom(state.Edges)
+
+        member _.SetDepSlot(depIndex: int, parentIndex: int) =
+            if depIndex = -1 then
+                edgeInValue <- parentIndex
+
+        member _.OnFirstParent() = ()
+        member _.OnLastParent() = ()
+
+    interface ISetDeltaSink<'U> with
+        member this.OnDeltas(adds: 'U[], addCnt: int, rems: 'U[], remCnt: int) =
+            if not disposed then
+                Collections.journalAppendSet &state.Journal adds addCnt rems remCnt
+                state.Version <- state.Version + 1L
+                GraphContext.Default.MarkFrom(state.Edges)
+
+    interface IAdaptiveSet<'U> with
+        member this.GetValue() =
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
+
+            try
+                if disposed then
+                    invalidOp "This adaptive set has been disposed."
+
+                this.EnsureInitialized()
+
+                if value.Version <> state.DepVersions[0] then
+                    let next = value.GetValue()
+                    state.DepVersions[0] <- value.Version
+
+                    if not (EqualityComparer<'T>.Default.Equals(current, next)) then
+                        this.SwapTo(next)
+
+                if inner.Version <> innerVersion then
+                    inner.GetValue() |> ignore
+                    innerVersion <- inner.Version
+
+                if not state.Journal.IsEmpty then
+                    Collections.drainBindSetPush &state
+
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) state.Version
+                state.Data :> IReadOnlySet<'U>
+            finally
+                ctx.ReleaseOwner()
+
+        member _.Version = state.Version
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                this.UnregisterInner()
+
+                match value with
+                | :? IEdgeTarget as t -> t.RemoveEdgeAt(edgeInValue)
+                | _ -> ()
+
                 Collections.clearSinks &state.Sinks
 
     interface ISetSinkRegistry with

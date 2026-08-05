@@ -80,6 +80,31 @@ module ASet =
         else
             acc
 
+    /// <summary>
+    /// Adaptively maps over the given set and unions all resulting sets (FDA
+    /// <c>ASet.collect</c> parity; PLAN.md Section 7.4). The output is the
+    /// refcounted union: an element contributed by several inner sets
+    /// disappears only when the last contributor drops it. This is also the
+    /// dynamic <c>unionMany</c>: <c>ASet.collect id</c> over
+    /// <c>IAdaptiveSet&lt;IAdaptiveSet&lt;'T&gt;&gt;</c>.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// // group numbers by parity: the output follows both the outer set and
+    /// // the inner sets.
+    /// let buckets = CSet.empty&lt;int&gt;
+    /// let odds = CSet.empty&lt;int&gt;
+    /// let evens = CSet.empty&lt;int&gt;
+    /// let all = ASet.collect (fun b -&gt; if b % 2 = 0 then evens else odds) (CSet.value buckets)
+    /// CSet.add 1 buckets
+    /// CSet.add 2 buckets
+    /// CSet.add 3 odds
+    /// // all is now {3}
+    /// </code>
+    /// </example>
+    let inline collect ([<InlineIfLambda>] mapping: 'T -> IAdaptiveSet<'U>) (set: IAdaptiveSet<'T>) : IAdaptiveSet<'U> =
+        new CollectSetNode<'T, 'U>(set, mapping)
+
     /// <summary>The elements of the left set that are not in the right set.</summary>
     let inline difference (left: IAdaptiveSet<'T>) (right: IAdaptiveSet<'T>) : IAdaptiveSet<'T> =
         new TwoSourceSetNode<'T>(TwoSetOp.Difference, left, right)
@@ -99,6 +124,30 @@ module ASet =
     /// </summary>
     let inline ofAVal<'T, 'S when 'T: equality and 'S :> seq<'T>> (value: IAdaptiveValue<'S>) : IAdaptiveSet<'T> =
         new OfAvalSetNode<'T, 'S>(value)
+
+    /// <summary>
+    /// Adaptively maps over the given value and returns the resulting set (FDA
+    /// <c>ASet.bind</c> parity; PLAN.md Section 7.4). When the value changes,
+    /// the whole inner set is swapped: the old content is removed, the inner
+    /// sink is unregistered eagerly, and <c>mapping</c> selects the new inner
+    /// set. The inner set's own changes propagate while it is bound.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// // a set that follows the currently selected bucket
+    /// let selected = CVal.create 0
+    /// let buckets = [| CSet.empty&lt;int&gt;; CSet.empty&lt;int&gt; |]
+    /// let visible = ASet.bind (fun i -&gt; buckets[i]) (CVal.value selected)
+    /// CSet.add 7 (buckets[0])
+    /// CVal.setValue 1 selected
+    /// // visible is now empty (bucket 1), and bucket 0's later changes do not leak
+    /// </code>
+    /// </example>
+    let inline bind
+        ([<InlineIfLambda>] mapping: 'T -> IAdaptiveSet<'U>)
+        (value: IAdaptiveValue<'T>)
+        : IAdaptiveSet<'U> =
+        new BindSetNode<'T, 'U>(value, mapping)
 
     /// <summary>
     /// An adaptive set over an external reader function. The reader is called
@@ -460,6 +509,30 @@ module AMap =
         (value: IAdaptiveValue<'S>)
         : IAdaptiveMap<'K, 'V> =
         new OfAvalMapNode<'K, 'V, 'S>(value)
+
+    /// <summary>
+    /// Adaptively maps over the given value and returns the resulting map (FDA
+    /// <c>AMap.bind</c> parity; PLAN.md Section 7.4). When the value changes,
+    /// the whole inner map is swapped: the old content is removed, the inner
+    /// sink is unregistered eagerly, and <c>mapping</c> selects the new inner
+    /// map. The inner map's own changes propagate while it is bound.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// // a map that follows the currently selected table
+    /// let selected = CVal.create 0
+    /// let tables = [| CMap.empty&lt;string, int&gt;; CMap.empty&lt;string, int&gt; |]
+    /// let visible = AMap.bind (fun i -&gt; tables[i]) (CVal.value selected)
+    /// CMap.addOrUpdate "health" 10 (tables[0])
+    /// CVal.setValue 1 selected
+    /// // visible is now empty, and table 0's later changes do not leak
+    /// </code>
+    /// </example>
+    let inline bind
+        ([<InlineIfLambda>] mapping: 'T -> IAdaptiveMap<'K, 'V>)
+        (value: IAdaptiveValue<'T>)
+        : IAdaptiveMap<'K, 'V> =
+        new BindMapNode<'K, 'V, 'T>(value, mapping)
 
     /// <summary>
     /// An adaptive map driven by a compute function (FDA <c>AMap.custom</c>

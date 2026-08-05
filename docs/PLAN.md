@@ -513,11 +513,52 @@ Recorded FDA deviations:
   drain (24 B, now a module-level inline function; the Shared.fs drain/load
   functions are `inline` + `[<InlineIfLambda>]`).
 
-#### 7.4 Dynamic dependencies
+#### 7.4 Dynamic dependencies — DONE
 
+- `ASet.collect` (per-element dynamic union over a set source) with ref-counted
+  contribution tracking (the `CountingHashSet` role): `CollectSetNode`. Per
+  source element an entry holds the inner set, last-seen version, content,
+  journal, and a key-routing sink. Output = global refcounted set; a removed
+  source element unregisters its inner sink eagerly (Pitfall 1). Poll sources
+  (`ofReader`/`custom`) work as inners via the per-entry version check.
+- `ASet.bind`/`AMap.bind` over an **aval** source (FDA parity, `BindReader`
+  semantics): the whole inner collection swaps on value change; the old inner
+  sink is unregistered eagerly. `BindSetNode`/`BindMapNode`.
 - `ASet.bind`/`AMap.bind` and `collect`: per-element adaptive mapping with ref-counted
   contribution tracking (the `CountingHashSet` role). Recompute re-reads all
   dependencies; old dynamic edges are removed eagerly (Pitfall 1).
+
+Recorded deviations and notes:
+
+- `bind` is the aval-driven whole-swap (FDA terminology: `AdaptiveHashSet.fs`
+  `bind : ('A -> aset<'B>) -> aval<'A> -> aset<'B>`; the set-driven form is
+  FDA's `collect`, which is what `ASet.collect` is here). A set-source bind
+  alias is intentionally not provided: `ASet.collect` already has that exact
+  signature.
+- FDA has no `AMap.collect`; none is provided here either. A true map collect
+  would need a key-conflict rule (a set union refcounts; a map has no natural
+  answer when two inner maps collide on a key).
+- Dynamic `unionMany` = `ASet.collect id` over `IAdaptiveSet<IAdaptiveSet<'T>>`
+  (FDA's `unionMany : aset<aset<'A>> -> aset<'A>` is exactly that).
+- The F# `for KeyValue(k, v) in dictionaryField` pattern allocates per element
+  (measured 88 B/entry in the collect version-check loop). Hot loops over
+  dictionary fields must use an explicit struct enumerator.
+- Initial loads and entry creation read the source/inner view first and
+  register the sink after: the view is complete and the sink sees only deltas
+  that follow. This avoids the double-apply of a dirty source draining into
+  the journal during the load.
+- The same double-apply hazard existed in every Phase 6 node (MapSetNode,
+  FilterSetNode, UnionSetNode, TwoSourceSetNode, MapMapNode, FilterMapNode,
+  Choose2MapNode, SetToMapNode, SetToMapKeepAllNode, MapToSetNode, and both
+  reduction nodes): they registered their sinks before the initial load, so a
+  dirty derived source draining during the load pushed its delta into the
+  journal and the subsequent drain double-applied it (measured: phantom
+  refcounts that never released). All now read first and register after; the
+  permanent regression test is `dirty derived source at first read does not
+  double-apply` (set, map, and reduction paths).
+- Tests: union/refcount/churn correctness, dynamic unionMany, poll inners,
+  bind swap + eager-unregister leak checks, disposal leak checks, and a
+  zero-allocation steady-state drain test (150/150 Debug and Release).
 
 #### 7.5 Hardening
 

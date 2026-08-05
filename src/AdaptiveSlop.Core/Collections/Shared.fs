@@ -1512,3 +1512,522 @@ module internal Collections =
             state.Data.Remove state.Out.Rems.Items[i] |> ignore
 
         changed
+
+    // =============================================================================
+    // Dynamic dependencies (PLAN.md Section 7.4): collect and bind.
+    //
+    // CollectSetNode unions one inner adaptive set per source element. Each
+    // element's contribution is tracked separately (content set + journal +
+    // sink); the output is the refcounted union (the CountingHashSet role). A
+    // removed source element unregisters its inner sink eagerly (ANALYSIS-FDA.md
+    // Pitfall 1). BindSetNode/BindMapNode swap the whole inner collection when
+    // their scalar value changes (FDA BindReader semantics).
+    // =============================================================================
+
+    /// <summary>
+    /// Internal. One source element's contribution to a collect node: the inner
+    /// adaptive set, its last-seen version, the current content, the pending
+    /// journal, and the registered sink. A struct so the shared operations can
+    /// address its journal byref; the dictionary holds the authoritative copy.
+    /// </summary>
+    [<Struct>]
+    type internal CollectEntry<'U when 'U: equality> =
+        val mutable Node: IAdaptiveSet<'U>
+        val mutable Version: int64
+        val mutable Content: HashSet<'U>
+        val mutable Journal: SetDelta<'U>
+        val mutable Sink: obj
+
+        new(node: IAdaptiveSet<'U>) =
+            { Node = node
+              Version = 0L
+              Content = HashSet<'U>()
+              Journal = SetDelta<'U>.Create()
+              Sink = null }
+
+    /// <summary>Internal. Receives the side-routed deltas of one inner set.</summary>
+    type internal ICollectTarget<'T, 'U> =
+        abstract member OnInnerDeltas: key: 'T * adds: 'U[] * addCnt: int * rems: 'U[] * remCnt: int -> unit
+
+    /// <summary>
+    /// Internal. A per-element sink: routes an inner set's delivery to the
+    /// entry of its source element. Per-element allocation (amortized edge
+    /// formation; zero steady-state allocation).
+    /// </summary>
+    type internal CollectSink<'T, 'U>(target: ICollectTarget<'T, 'U>, key: 'T) =
+        interface ISetDeltaSink<'U> with
+            member this.OnDeltas(adds: 'U[], addCnt: int, rems: 'U[], remCnt: int) =
+                target.OnInnerDeltas(key, adds, addCnt, rems, remCnt)
+
+    /// <summary>Internal. State of a collect node (PLAN.md Section 7.4).</summary>
+    [<Struct>]
+    type internal CollectState<'T, 'U when 'T: equality and 'U: equality> =
+        val mutable Version: int64
+        val mutable Edges: ParentEdges
+        val mutable Sinks: SinkList
+        val mutable DepVersions: int64[]
+        val mutable Journal: SetDelta<'T>
+        val mutable Inner: Dictionary<'T, CollectEntry<'U>>
+        val mutable Global: RefCountedSet<'U>
+        val mutable OutDelta: SetDelta<'U>
+
+        new
+            (
+                version: int64,
+                edges: ParentEdges,
+                sinks: SinkList,
+                depVersions: int64[],
+                journal: SetDelta<'T>,
+                inner: Dictionary<'T, CollectEntry<'U>>,
+                counts: RefCountedSet<'U>,
+                outDelta: SetDelta<'U>
+            ) =
+            { Version = version
+              Edges = edges
+              Sinks = sinks
+              DepVersions = depVersions
+              Journal = journal
+              Inner = inner
+              Global = counts
+              OutDelta = outDelta }
+
+        static member Create(depCount: int) =
+            CollectState(
+                0L,
+                ParentEdges(),
+                SinkList.Create(),
+                Array.zeroCreate depCount,
+                SetDelta.Create(),
+                Dictionary<'T, CollectEntry<'U>>(),
+                RefCountedSet.Create(),
+                SetDelta.Create()
+            )
+
+    /// <summary>
+    /// Drain a collect node: process the source journal (removed elements drop
+    /// their contribution and unregister their inner sink; added elements create
+    /// an entry and load the inner content) and then every entry journal. By
+    /// value: the per-element hot path must not pass byrefs through byref
+    /// parameters. Returns the updated state and whether the output changed.
+    /// </summary>
+    let drainCollect
+        (target: ICollectTarget<'T, 'U>)
+        (mapping: 'T -> IAdaptiveSet<'U>)
+        (s: CollectState<'T, 'U>)
+        : struct (CollectState<'T, 'U> * bool) =
+        let mutable s = s
+        let mutable changed = false
+
+        // ---- source journal: removals first (drop entries), then adds (create).
+        let rems = s.Journal.Rems
+        let remStart = rems.Count
+        let mutable i = 0
+
+        while i < remStart do
+            let x = rems.Items[i]
+            let mutable entry = Unchecked.defaultof<CollectEntry<'U>>
+
+            if s.Inner.TryGetValue(x, &entry) then
+                // Eager edge removal (Pitfall 1): unregister before dropping.
+                match box entry.Node with
+                | :? ISetSinkRegistry as r -> r.RemoveSetSink(entry.Sink)
+                | _ -> ()
+
+                for u in entry.Content do
+                    let struct (g2, removed) = refRemove s.Global u
+                    s.Global <- g2
+
+                    if removed then
+                        s.OutDelta.Rems <- bufferAppend s.OutDelta.Rems u
+                        changed <- true
+
+                s.Inner.Remove x |> ignore
+
+            i <- i + 1
+
+        // Compact the source journal: keep entries appended during processing.
+        let remLive = s.Journal.Rems.Count
+
+        if remLive > remStart then
+            Array.Copy(s.Journal.Rems.Items, remStart, s.Journal.Rems.Items, 0, remLive - remStart)
+            s.Journal.Rems.Count <- remLive - remStart
+        else
+            s.Journal.Rems.Count <- 0
+
+        let adds = s.Journal.Adds
+        let addStart = adds.Count
+        i <- 0
+
+        while i < addStart do
+            let x = adds.Items[i]
+            let mutable existing = Unchecked.defaultof<CollectEntry<'U>>
+
+            if not (s.Inner.TryGetValue(x, &existing)) then
+                let inner = mapping x
+                // Read first, register after: the view is complete, and the sink
+                // sees only deltas that follow this point in time.
+                let view = inner.GetValue()
+                let mutable entry = CollectEntry<'U>(inner)
+
+                for u in view do
+                    let struct (g2, added) = refAdd s.Global u
+                    s.Global <- g2
+
+                    if added then
+                        s.OutDelta.Adds <- bufferAppend s.OutDelta.Adds u
+                        changed <- true
+
+                    entry.Content.Add u |> ignore
+
+                entry.Sink <- box (CollectSink<'T, 'U>(target, x))
+
+                match box inner with
+                | :? ISetSinkRegistry as r -> r.AddSetSink(entry.Sink)
+                | _ -> ()
+
+                entry.Version <- inner.Version
+                s.Inner[x] <- entry
+
+            i <- i + 1
+
+        let addLive = s.Journal.Adds.Count
+
+        if addLive > addStart then
+            Array.Copy(s.Journal.Adds.Items, addStart, s.Journal.Adds.Items, 0, addLive - addStart)
+            s.Journal.Adds.Count <- addLive - addStart
+        else
+            s.Journal.Adds.Count <- 0
+
+        // ---- entry journals. No user code runs here: the dictionary is stable.
+        // Explicit struct enumerator (the KeyValue pattern allocates per
+        // element; measured 88 B/entry in the version-check loop).
+        let mutable de = s.Inner.GetEnumerator()
+
+        while de.MoveNext() do
+            let x = de.Current.Key
+            let mutable entry = de.Current.Value
+
+            if not entry.Journal.IsEmpty then
+                let remStart = entry.Journal.Rems.Count
+                let addStart = entry.Journal.Adds.Count
+                let mutable k = 0
+
+                while k < remStart do
+                    let u = entry.Journal.Rems.Items[k]
+
+                    if entry.Content.Remove u then
+                        let struct (g2, removed) = refRemove s.Global u
+                        s.Global <- g2
+
+                        if removed then
+                            s.OutDelta.Rems <- bufferAppend s.OutDelta.Rems u
+                            changed <- true
+
+                    k <- k + 1
+
+                k <- 0
+
+                while k < addStart do
+                    let u = entry.Journal.Adds.Items[k]
+
+                    if entry.Content.Add u then
+                        let struct (g2, added) = refAdd s.Global u
+                        s.Global <- g2
+
+                        if added then
+                            s.OutDelta.Adds <- bufferAppend s.OutDelta.Adds u
+                            changed <- true
+
+                    k <- k + 1
+
+                // Compact the entry journal (no reentrancy in this pass, but
+                // keep the marker pattern: entries appended during processing
+                // would survive).
+                let remLive = entry.Journal.Rems.Count
+
+                if remLive > remStart then
+                    Array.Copy(entry.Journal.Rems.Items, remStart, entry.Journal.Rems.Items, 0, remLive - remStart)
+                    entry.Journal.Rems.Count <- remLive - remStart
+                else
+                    entry.Journal.Rems.Count <- 0
+
+                let addLive = entry.Journal.Adds.Count
+
+                if addLive > addStart then
+                    Array.Copy(entry.Journal.Adds.Items, addStart, entry.Journal.Adds.Items, 0, addLive - addStart)
+                    entry.Journal.Adds.Count <- addLive - addStart
+                else
+                    entry.Journal.Adds.Count <- 0
+
+                s.Inner[x] <- entry
+
+        struct (s, changed)
+
+    /// <summary>
+    /// Drain a collect node and push the reduced output delta to its sinks, with
+    /// notification delivery deferred (PLAN.md Section 6.5). The byref appears
+    /// only at this top-level call site (a class field address: 0 allocation).
+    /// </summary>
+    let drainCollectPush
+        (target: ICollectTarget<'T, 'U>)
+        (mapping: 'T -> IAdaptiveSet<'U>)
+        (state: CollectState<'T, 'U> byref)
+        =
+        let ctx = GraphContext.Default
+        let wasActive = ctx.TxActive
+        ctx.TxActive <- true
+
+        try
+            let struct (s2, changed) = drainCollect target mapping state
+            state <- s2
+
+            if changed then
+                pushSetDelta state.Sinks state.OutDelta
+                state.OutDelta.Clear()
+        finally
+            ctx.TxActive <- wasActive
+
+        if not wasActive then
+            ctx.DeliverNotifications()
+
+    /// <summary>
+    /// Internal. State of a bind node over a scalar value (PLAN.md Section 7.4):
+    /// one inner set, swapped when the value changes. The content set is the
+    /// output (a single contribution needs no refcounts).
+    /// </summary>
+    [<Struct>]
+    type internal BindSetState<'U when 'U: equality> =
+        val mutable Version: int64
+        val mutable Edges: ParentEdges
+        val mutable Sinks: SinkList
+        val mutable DepVersions: int64[]
+        val mutable Journal: SetDelta<'U>
+        val mutable Data: HashSet<'U>
+        val mutable OutDelta: SetDelta<'U>
+
+        new
+            (
+                version: int64,
+                edges: ParentEdges,
+                sinks: SinkList,
+                depVersions: int64[],
+                journal: SetDelta<'U>,
+                data: HashSet<'U>,
+                outDelta: SetDelta<'U>
+            ) =
+            { Version = version
+              Edges = edges
+              Sinks = sinks
+              DepVersions = depVersions
+              Journal = journal
+              Data = data
+              OutDelta = outDelta }
+
+        static member Create(depCount: int) =
+            BindSetState(
+                0L,
+                ParentEdges(),
+                SinkList.Create(),
+                Array.zeroCreate depCount,
+                SetDelta.Create(),
+                HashSet<'U>(),
+                SetDelta.Create()
+            )
+
+    /// <summary>
+    /// Drain a bind set node: apply the inner journal to the output. By value:
+    /// the per-element hot path must not pass byrefs through byref parameters.
+    /// Returns the updated state and whether the output changed.
+    /// </summary>
+    let drainBindSet (s: BindSetState<'U>) : struct (BindSetState<'U> * bool) =
+        let mutable s = s
+        let mutable changed = false
+        let rems = s.Journal.Rems
+        let remStart = rems.Count
+        let mutable i = 0
+
+        while i < remStart do
+            let u = rems.Items[i]
+
+            if s.Data.Remove u then
+                s.OutDelta.Rems <- bufferAppend s.OutDelta.Rems u
+                changed <- true
+
+            i <- i + 1
+
+        let adds = s.Journal.Adds
+        let addStart = adds.Count
+        i <- 0
+
+        while i < addStart do
+            let u = adds.Items[i]
+
+            if s.Data.Add u then
+                s.OutDelta.Adds <- bufferAppend s.OutDelta.Adds u
+                changed <- true
+
+            i <- i + 1
+
+        let remLive = s.Journal.Rems.Count
+
+        if remLive > remStart then
+            Array.Copy(s.Journal.Rems.Items, remStart, s.Journal.Rems.Items, 0, remLive - remStart)
+            s.Journal.Rems.Count <- remLive - remStart
+        else
+            s.Journal.Rems.Count <- 0
+
+        let addLive = s.Journal.Adds.Count
+
+        if addLive > addStart then
+            Array.Copy(s.Journal.Adds.Items, addStart, s.Journal.Adds.Items, 0, addLive - addStart)
+            s.Journal.Adds.Count <- addLive - addStart
+        else
+            s.Journal.Adds.Count <- 0
+
+        struct (s, changed)
+
+    /// <summary>
+    /// Drain a bind set node and push the reduced output delta to its sinks, with
+    /// notification delivery deferred (PLAN.md Section 6.5). The byref appears
+    /// only at this top-level call site (a class field address: 0 allocation).
+    /// </summary>
+    let drainBindSetPush (state: BindSetState<'U> byref) =
+        let ctx = GraphContext.Default
+        let wasActive = ctx.TxActive
+        ctx.TxActive <- true
+
+        try
+            let struct (s2, changed) = drainBindSet state
+            state <- s2
+
+            if changed then
+                pushSetDelta state.Sinks state.OutDelta
+                state.OutDelta.Clear()
+        finally
+            ctx.TxActive <- wasActive
+
+        if not wasActive then
+            ctx.DeliverNotifications()
+
+    /// <summary>
+    /// Internal. State of a bind map node over a scalar value (PLAN.md Section
+    /// 7.4): one inner map, swapped when the value changes.
+    /// </summary>
+    [<Struct>]
+    type internal BindMapState<'K, 'V when 'K: equality> =
+        val mutable Version: int64
+        val mutable Edges: ParentEdges
+        val mutable Sinks: SinkList
+        val mutable DepVersions: int64[]
+        val mutable Journal: MapDelta<'K, 'V>
+        val mutable Data: Dictionary<'K, 'V>
+        val mutable OutDelta: MapDelta<'K, 'V>
+
+        new
+            (
+                version: int64,
+                edges: ParentEdges,
+                sinks: SinkList,
+                depVersions: int64[],
+                journal: MapDelta<'K, 'V>,
+                data: Dictionary<'K, 'V>,
+                outDelta: MapDelta<'K, 'V>
+            ) =
+            { Version = version
+              Edges = edges
+              Sinks = sinks
+              DepVersions = depVersions
+              Journal = journal
+              Data = data
+              OutDelta = outDelta }
+
+        static member Create(depCount: int) =
+            BindMapState(
+                0L,
+                ParentEdges(),
+                SinkList.Create(),
+                Array.zeroCreate depCount,
+                MapDelta.Create(),
+                Dictionary<'K, 'V>(),
+                MapDelta.Create()
+            )
+
+    /// <summary>
+    /// Drain a bind map node: apply the inner journal to the output (equal
+    /// values elided defensively; the boundary already emits effective deltas).
+    /// By value: the per-element hot path must not pass byrefs through byref
+    /// parameters. Returns the updated state and whether the output changed.
+    /// </summary>
+    let drainBindMap (s: BindMapState<'K, 'V>) : struct (BindMapState<'K, 'V> * bool) =
+        let mutable s = s
+        let mutable changed = false
+        let rems = s.Journal.Rems
+        let remStart = rems.Count
+        let mutable i = 0
+
+        while i < remStart do
+            let k = rems.Items[i]
+
+            if s.Data.Remove k then
+                s.OutDelta.Rems <- bufferAppend s.OutDelta.Rems k
+                changed <- true
+
+            i <- i + 1
+
+        let sets = s.Journal.Sets
+        let setStart = sets.Count
+        i <- 0
+
+        while i < setStart do
+            let struct (k, v) = sets.Items[i]
+            let mutable old = Unchecked.defaultof<'V>
+
+            if s.Data.TryGetValue(k, &old) && EqualityComparer<'V>.Default.Equals(old, v) then
+                ()
+            else
+                s.Data[k] <- v
+                s.OutDelta.Sets <- bufferAppend s.OutDelta.Sets (struct (k, v))
+                changed <- true
+
+            i <- i + 1
+
+        let remLive = s.Journal.Rems.Count
+
+        if remLive > remStart then
+            Array.Copy(s.Journal.Rems.Items, remStart, s.Journal.Rems.Items, 0, remLive - remStart)
+            s.Journal.Rems.Count <- remLive - remStart
+        else
+            s.Journal.Rems.Count <- 0
+
+        let setLive = s.Journal.Sets.Count
+
+        if setLive > setStart then
+            Array.Copy(s.Journal.Sets.Items, setStart, s.Journal.Sets.Items, 0, setLive - setStart)
+            s.Journal.Sets.Count <- setLive - setStart
+        else
+            s.Journal.Sets.Count <- 0
+
+        struct (s, changed)
+
+    /// <summary>
+    /// Drain a bind map node and push the reduced output delta to its sinks, with
+    /// notification delivery deferred (PLAN.md Section 6.5). The byref appears
+    /// only at this top-level call site (a class field address: 0 allocation).
+    /// </summary>
+    let drainBindMapPush (state: BindMapState<'K, 'V> byref) =
+        let ctx = GraphContext.Default
+        let wasActive = ctx.TxActive
+        ctx.TxActive <- true
+
+        try
+            let struct (s2, changed) = drainBindMap state
+            state <- s2
+
+            if changed then
+                pushMapDelta state.Sinks state.OutDelta
+                state.OutDelta.Clear()
+        finally
+            ctx.TxActive <- wasActive
+
+        if not wasActive then
+            ctx.DeliverNotifications()

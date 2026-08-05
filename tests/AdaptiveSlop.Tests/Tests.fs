@@ -2691,6 +2691,52 @@ let ``observation through two-source nodes delivers correct deltas`` () =
     Assert.Equal<Map<_, _>>(Map.ofList [ "x", 7 ], last)
 
 [<Fact>]
+let ``dirty derived source at first read does not double-apply`` () =
+    // A two-source node whose derived source is dirty (pending journal) at the
+    // first read: the initial load drains the source, which pushes the delta
+    // into the node's journal. If the journal is then applied on top of the
+    // loaded view, the refcount double-counts and a later removal leaves a
+    // phantom in the output.
+    let src = CSet.empty<int>
+    let a = ASet.map (fun x -> x * 10) (CSet.value src)
+    let b = CSet.ofSeq [ 100 ]
+    let u = ASet.union a (CSet.value b)
+
+    // a is registered with src but unread by u; a is dirty when u is first
+    // read.
+    ASet.toSet a |> ignore
+    CSet.add 1 src
+
+    Assert.Equal<Set<int>>(Set.ofList [ 10; 100 ], ASet.toSet u)
+
+    // The double-apply would leave a phantom refcount: removing 10 from a's
+    // source would fail to remove 10 from the union.
+    CSet.remove 1 src
+    Assert.Equal<Set<int>>(Set.ofList [ 100 ], ASet.toSet u)
+
+    // Map node over a dirty derived source (MapMapNode).
+    let msrc = CMap.empty<int, int>
+    let ma = AMap.map (fun k v -> k, v * 10) (CMap.value msrc)
+    let mm = AMap.map (fun _ (_, v) -> v) ma
+
+    (ma :> IAdaptiveMap<_, _>).GetValue() |> ignore
+    CMap.addOrUpdate 2 20 msrc
+    Assert.Equal<Map<int, int>>(Map.ofList [ 2, 200 ], AMap.toMap mm)
+    CMap.remove 2 msrc
+    Assert.Equal<Map<int, int>>(Map.empty, AMap.toMap mm)
+
+    // Reduction over a dirty derived source (ASet.count).
+    let rsrc = CSet.empty<int>
+    let ra = ASet.map (fun x -> x * 10) (CSet.value rsrc)
+    let rc = ASet.count ra
+
+    AVal.getValue rc |> ignore
+    CSet.add 3 rsrc
+    Assert.Equal(1, AVal.getValue rc)
+    CSet.remove 3 rsrc
+    Assert.Equal(0, AVal.getValue rc)
+
+[<Fact>]
 let ``two-source node drains allocate zero in steady state`` () =
     let left = CSet.empty<int>
     let right = CSet.empty<int>
@@ -2750,6 +2796,265 @@ let ``choose2 node drains allocate zero in steady state`` () =
         if u.GetValue().Count <> 50 then
             failwith "union drifted"
 
+
+    let allocated = GC.GetAllocatedBytesForCurrentThread() - before
+    Assert.Equal(0L, allocated)
+
+// =============================================================================
+// PLAN.md Section 7.4 — dynamic dependencies (collect / bind)
+// =============================================================================
+
+[<Fact>]
+let ``ASet.collect unions the inner sets and follows their changes`` () =
+    let src = CSet.empty<int>
+    let inner = CSet.empty<int>
+    let collected = ASet.collect (fun _ -> CSet.value inner) (CSet.value src)
+
+    CSet.add 1 src
+    CSet.add 2 src
+    CSet.add 3 inner
+    CSet.add 4 inner
+
+    // Two source elements map to the same inner set: 3 and 4 each get two
+    // references, the output still holds each element once.
+    Assert.Equal<Set<int>>(Set.ofList [ 3; 4 ], ASet.toSet collected)
+
+    // Inner changes propagate to the output.
+    CSet.add 5 inner
+    Assert.Equal<Set<int>>(Set.ofList [ 3; 4; 5 ], ASet.toSet collected)
+    CSet.remove 3 inner
+    Assert.Equal<Set<int>>(Set.ofList [ 4; 5 ], ASet.toSet collected)
+
+[<Fact>]
+let ``ASet.collect refcounts shared output elements`` () =
+    // Two distinct source elements map to two distinct inner sets that share
+    // an element. Removing one contribution keeps the element in the output.
+    let buckets = CSet.empty<int>
+    let odd = CSet.ofSeq [ 1; 3 ]
+    let even = CSet.ofSeq [ 2; 4 ]
+    let shared = CSet.ofSeq [ 9 ]
+
+    let collected =
+        ASet.collect
+            (fun b ->
+                match b with
+                | 1 -> CSet.value odd
+                | 2 -> CSet.value even
+                | _ -> CSet.value shared)
+            (CSet.value buckets)
+
+    CSet.add 1 buckets
+    CSet.add 2 buckets
+    CSet.add 3 buckets
+
+    // 1 -> odd {1,3}, 2 -> even {2,4}, 3 -> shared {9}
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2; 3; 4; 9 ], ASet.toSet collected)
+
+    // Remove bucket 1: odd's elements {1,3} leave (nobody else has them).
+    CSet.remove 1 buckets
+    Assert.Equal<Set<int>>(Set.ofList [ 2; 4; 9 ], ASet.toSet collected)
+
+    // Now bucket 2 also maps to shared: 9 has two references.
+    CSet.remove 2 buckets
+    Assert.Equal<Set<int>>(Set.ofList [ 9 ], ASet.toSet collected)
+
+    // Removing bucket 3 drops the last reference: 9 leaves.
+    CSet.remove 3 buckets
+    Assert.Equal(0, (ASet.force collected).Count)
+
+[<Fact>]
+let ``ASet.collect id is the dynamic unionMany`` () =
+    // The outer set is itself adaptive: inner sets enter and leave the union.
+    let outer = CSet.empty<AdaptiveSlop.Core.ChangeableSet<int>>
+    let a = CSet.ofSeq [ 1; 2 ]
+    let b = CSet.ofSeq [ 2; 3 ]
+
+    let u = ASet.collect (fun s -> CSet.value s) (CSet.value outer)
+    CSet.add a outer
+    CSet.add b outer
+
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2; 3 ], ASet.toSet u)
+
+    // The inner sets keep contributing while they are in the outer set.
+    CSet.add 4 a
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2; 3; 4 ], ASet.toSet u)
+
+    // Removing an inner set removes its (refcounted) contribution.
+    CSet.remove a outer
+    Assert.Equal<Set<int>>(Set.ofList [ 2; 3 ], ASet.toSet u)
+
+    // The removed inner set's later changes do not leak (eager unregister).
+    CSet.add 5 a
+    Assert.Equal<Set<int>>(Set.ofList [ 2; 3 ], ASet.toSet u)
+
+[<Fact>]
+let ``ASet.collect handles source churn and inner churn in one batch`` () =
+    let outer = CSet.empty<int>
+    let inner1 = CSet.ofSeq [ 1; 2 ]
+    let inner2 = CSet.ofSeq [ 3 ]
+
+    let u =
+        ASet.collect (fun x -> if x = 1 then CSet.value inner1 else CSet.value inner2) (CSet.value outer)
+
+    CSet.add 1 outer
+    CSet.add 2 outer
+    CSet.add 3 inner1
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2; 3 ], ASet.toSet u)
+
+    // One batch: drop element 1 (inner1 leaves), element 2 stays on inner2.
+    // inner2 gains 3 in the same batch.
+    Transaction.run (fun () ->
+        CSet.remove 1 outer
+        CSet.add 3 inner2)
+    |> ignore
+
+    Assert.Equal<Set<int>>(Set.ofList [ 3 ], ASet.toSet u)
+
+    // Re-add element 1: a fresh entry maps it again.
+    CSet.add 1 outer
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2; 3 ], ASet.toSet u)
+
+[<Fact>]
+let ``ASet.collect accepts poll inner sets (ofReader)`` () =
+    let mutable current = HashSet<int>()
+    current.Add 1 |> ignore
+    current.Add 2 |> ignore
+
+    let reader =
+        ASet.ofReader (fun () ->
+            let next = HashSet<int>(current)
+            next)
+
+    let src = CSet.ofSeq [ 10; 20 ]
+    let u = ASet.collect (fun _ -> reader) (CSet.value src)
+
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2 ], ASet.toSet u)
+
+    // The poll inner changes; the version check pulls it on the next read.
+    current.Remove 1 |> ignore
+    current.Add 3 |> ignore
+    Assert.Equal<Set<int>>(Set.ofList [ 2; 3 ], ASet.toSet u)
+
+    // Drop one source element: its contribution (with the fresh polled
+    // content) leaves, the other element still contributes.
+    CSet.remove 10 src
+    Assert.Equal<Set<int>>(Set.ofList [ 2; 3 ], ASet.toSet u)
+
+[<Fact>]
+let ``ASet.bind swaps the inner set and unregisters the old one eagerly`` () =
+    let selected = CVal.create 0
+    let buckets = [| CSet.ofSeq [ 1; 2 ]; CSet.ofSeq [ 3; 4 ] |]
+
+    let visible = ASet.bind (fun i -> CSet.value buckets[i]) (CVal.value selected)
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2 ], ASet.toSet visible)
+
+    // The bound inner set's changes propagate.
+    CSet.add 5 (buckets[0])
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2; 5 ], ASet.toSet visible)
+
+    // Swap: the old content leaves, the new content enters.
+    CVal.set 1 selected
+    Assert.Equal<Set<int>>(Set.ofList [ 3; 4 ], ASet.toSet visible)
+
+    // The old inner set is unregistered: its later changes do not leak.
+    CSet.add 6 (buckets[0])
+    CSet.remove 3 (buckets[1])
+    Assert.Equal<Set<int>>(Set.ofList [ 4 ], ASet.toSet visible)
+
+    // Swapping back re-reads the current content of bucket 0 (with 6).
+    CVal.set 0 selected
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2; 5; 6 ], ASet.toSet visible)
+
+[<Fact>]
+let ``AMap.bind swaps the inner map and unregisters the old one eagerly`` () =
+    let selected = CVal.create 0
+    let tables = [| CMap.ofSeq [ "a", 1; "b", 2 ]; CMap.ofSeq [ "c", 3 ] |]
+
+    let visible = AMap.bind (fun i -> CMap.value tables[i]) (CVal.value selected)
+    Assert.Equal<Map<string, int>>(Map.ofList [ "a", 1; "b", 2 ], AMap.toMap visible)
+
+    CMap.addOrUpdate "b" 20 tables[0]
+    Assert.Equal<Map<string, int>>(Map.ofList [ "a", 1; "b", 20 ], AMap.toMap visible)
+
+    CVal.set 1 selected
+    Assert.Equal<Map<string, int>>(Map.ofList [ "c", 3 ], AMap.toMap visible)
+
+    // Old inner unregistered: later changes do not leak.
+    CMap.addOrUpdate "b" 999 tables[0]
+    CMap.remove "c" tables[1]
+    Assert.Equal<Map<string, int>>(Map.empty, AMap.toMap visible)
+
+    CVal.set 0 selected
+    Assert.Equal<Map<string, int>>(Map.ofList [ "a", 1; "b", 999 ], AMap.toMap visible)
+
+[<Fact>]
+let ``collect and bind dispose cleanly`` () =
+    let source = CSet.ofSeq [ 1; 2 ]
+    let inner = CSet.ofSeq [ 10 ]
+    let collected = ASet.collect (fun _ -> CSet.value inner) (CSet.value source)
+
+    ASet.toSet collected |> ignore
+    let cs = source :> AdaptiveSlop.Core.ChangeableSet<int>
+    let ci = inner :> AdaptiveSlop.Core.ChangeableSet<int>
+    Assert.Equal(1, cs.SinkCount)
+    Assert.Equal(2, ci.SinkCount) // one sink per source element
+
+    (collected :> IDisposable).Dispose()
+    Assert.Equal(0, cs.SinkCount)
+    Assert.Equal(0, ci.SinkCount)
+
+    Assert.Throws<InvalidOperationException>(fun () -> ASet.toSet collected |> ignore)
+    |> ignore
+
+    // Writes after disposal process nothing.
+    CSet.add 3 source
+    CSet.add 11 inner
+    Assert.Equal(0, cs.SinkCount)
+    Assert.Equal(0, ci.SinkCount)
+
+    // Bind disposal unregisters the value edge and the inner sink.
+    let selected = CVal.create 0
+    let buckets = [| CSet.ofSeq [ 1 ]; CSet.ofSeq [ 2 ] |]
+    let bound = ASet.bind (fun i -> CSet.value buckets[i]) (CVal.value selected)
+    ASet.toSet bound |> ignore
+    Assert.Equal(1, (buckets[0] :> AdaptiveSlop.Core.ChangeableSet<int>).SinkCount)
+
+    (bound :> IDisposable).Dispose()
+    Assert.Equal(0, (buckets[0] :> AdaptiveSlop.Core.ChangeableSet<int>).SinkCount)
+
+    Assert.Throws<InvalidOperationException>(fun () -> ASet.toSet bound |> ignore)
+    |> ignore
+
+[<Fact>]
+let ``collect drain allocates zero in steady state`` () =
+    let outer = CSet.empty<int>
+    let inner1 = CSet.ofSeq [ 1; 2; 3 ]
+    let inner2 = CSet.ofSeq [ 4; 5 ]
+
+    let u =
+        ASet.collect (fun x -> if x % 2 = 0 then CSet.value inner1 else CSet.value inner2) (CSet.value outer)
+
+    for i in 1..20 do
+        CSet.add i outer
+
+    // Warm up: initial load + one full drain cycle grows all buffers.
+    u.GetValue().Count |> ignore
+
+    for i in 1..20 do
+        CSet.add (i + 100) outer
+
+    u.GetValue().Count |> ignore
+
+    let before = GC.GetAllocatedBytesForCurrentThread()
+
+    for i in 1..200 do
+        // Churn an element that is actually in inner1 (1..3): the output
+        // must stay {1..5} through every remove/add cycle.
+        CSet.remove ((i % 3) + 1) inner1
+        CSet.add ((i % 3) + 1) inner1
+
+        if u.GetValue().Count <> 5 then
+            failwith "collect drifted"
 
     let allocated = GC.GetAllocatedBytesForCurrentThread() - before
     Assert.Equal(0L, allocated)

@@ -224,7 +224,10 @@ type SetReduceNode<'a, 'b, 's, 'v when 'a: equality>
 
                 if not initialized then
                     initialized <- true
-                    this.Register()
+                    // Read first, register after (see MapSetNode.EnsureInitialized
+                    // in SetNodes.fs): a dirty source draining during the initial
+                    // build would push its delta into the journal, and the
+                    // subsequent drain would double-count it.
                     let mutable acc = reduction.seed
 
                     for x in source.GetValue() do
@@ -232,6 +235,7 @@ type SetReduceNode<'a, 'b, 's, 'v when 'a: equality>
 
                     red <- acc
                     value <- reduction.view red
+                    this.Register()
                     depVersions[0] <- source.Version
 
                 if source.Version <> depVersions[0] then
@@ -382,7 +386,7 @@ type MapReduceNode<'k, 'a, 'b, 's, 'v when 'k: equality>
 
                 if not initialized then
                     initialized <- true
-                    this.Register()
+                    // Read first, register after (see the set reduction node).
                     let mutable acc = reduction.seed
 
                     for KeyValue(k, v) in source.GetValue() do
@@ -391,6 +395,7 @@ type MapReduceNode<'k, 'a, 'b, 's, 'v when 'k: equality>
 
                     red <- acc
                     value <- reduction.view red
+                    this.Register()
                     depVersions[0] <- source.Version
 
                 if source.Version <> depVersions[0] then

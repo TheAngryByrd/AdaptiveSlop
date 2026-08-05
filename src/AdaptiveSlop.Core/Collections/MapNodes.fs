@@ -47,8 +47,12 @@ type MapMapNode<'K, 'V, 'U when 'K: equality>(source: IAdaptiveMap<'K, 'V>, mapp
     member private this.EnsureInitialized() =
         if not initialized then
             initialized <- true
-            this.Register()
+            // Read first, register after (see MapSetNode.EnsureInitialized in
+            // SetNodes.fs: a dirty source draining during the load would
+            // otherwise push its delta into the journal, and the subsequent
+            // drain would double-apply it).
             Collections.loadMap mapping source &state
+            this.Register()
             state.DepVersions[0] <- source.Version
 
     interface IMapDeltaSink<'K, 'V> with
@@ -122,8 +126,9 @@ type FilterMapNode<'K, 'V when 'K: equality>
     member private this.EnsureInitialized() =
         if not initialized then
             initialized <- true
-            this.Register()
+            // Read first, register after (see MapMapNode.EnsureInitialized).
             Collections.loadMap mapOpt source &state
+            this.Register()
             state.DepVersions[0] <- source.Version
 
     interface IMapDeltaSink<'K, 'V> with
@@ -243,8 +248,9 @@ type Choose2MapNode<'K, 'V1, 'V2, 'V3 when 'K: equality>
     member private this.EnsureInitialized() =
         if not initialized then
             initialized <- true
-            this.Register()
+            // Read first, register after (see MapMapNode.EnsureInitialized).
             Collections.loadChoose2 mapping left right &state
+            this.Register()
             state.DepVersions[0] <- left.Version
             state.DepVersions[1] <- right.Version
 
@@ -360,12 +366,13 @@ type SetToMapNode<'K, 'V, 'T when 'K: equality>(source: IAdaptiveSet<'T>, toEntr
     member private this.EnsureInitialized() =
         if not initialized then
             initialized <- true
-            this.Register()
+            // Read first, register after (see MapMapNode.EnsureInitialized).
 
             for item in source.GetValue() do
                 let (k, v) = toEntry item
                 state.Data[k] <- v
 
+            this.Register()
             state.DepVersions[0] <- source.Version
 
     interface ISetDeltaSink<'T> with
@@ -562,7 +569,7 @@ type SetToMapKeepAllNode<'K, 'V, 'T when 'K: equality>(source: IAdaptiveSet<'T>,
     member private this.EnsureInitialized() =
         if not initialized then
             initialized <- true
-            this.Register()
+            // Read first, register after (see MapMapNode.EnsureInitialized).
 
             for item in source.GetValue() do
                 let (k, v) = toEntry item
@@ -575,6 +582,7 @@ type SetToMapKeepAllNode<'K, 'V, 'T when 'K: equality>(source: IAdaptiveSet<'T>,
                     fresh.Add v |> ignore
                     state.Data[k] <- fresh
 
+            this.Register()
             state.DepVersions[0] <- source.Version
 
     interface ISetDeltaSink<'T> with
@@ -784,7 +792,7 @@ type MapToSetNode<'K, 'V, 'T when 'K: equality and 'T: equality>(source: IAdapti
     member private this.EnsureInitialized() =
         if not initialized then
             initialized <- true
-            this.Register()
+            // Read first, register after (see MapMapNode.EnsureInitialized).
 
             for KeyValue(k, v) in source.GetValue() do
                 let t = select k v
@@ -792,6 +800,7 @@ type MapToSetNode<'K, 'V, 'T when 'K: equality and 'T: equality>(source: IAdapti
                 let struct (out2, _) = Collections.refAdd state.Out t
                 state.Out <- out2
 
+            this.Register()
             state.DepVersions[0] <- source.Version
 
     interface IMapDeltaSink<'K, 'V> with
@@ -1082,6 +1091,144 @@ type CustomMapNode<'K, 'V when 'K: equality>(compute: IReadOnlyDictionary<'K, 'V
         member this.Dispose() =
             if not disposed then
                 disposed <- true
+                Collections.clearSinks &state.Sinks
+
+    interface IMapSinkRegistry with
+        member this.AddMapSink(sink) = Collections.addSink &state.Sinks sink
+
+        member this.RemoveMapSink(sink) =
+            Collections.removeSink &state.Sinks sink
+
+    interface IEdgeTarget with
+        member _.EdgeCount = state.Edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
+
+/// <summary>
+/// An adaptive map bound to a scalar value (<c>AMap.bind</c>, PLAN.md Section
+/// 7.4): <c>mapping value</c> selects the inner map; when the value changes, the
+/// whole inner map is swapped (old content removed, new content added) and the
+/// old inner sink is unregistered eagerly (FDA <c>BindReader</c> semantics;
+/// ANALYSIS-FDA.md Pitfall 1). The inner map's own changes flow through a
+/// journal. Registration is lazy (first read); disposal unregisters everything.
+/// </summary>
+type BindMapNode<'K, 'V, 'T when 'K: equality>(value: IAdaptiveValue<'T>, mapping: 'T -> IAdaptiveMap<'K, 'V>) =
+    let mutable state = Collections.BindMapState<'K, 'V>.Create(1)
+    let mutable inner: IAdaptiveMap<'K, 'V> = Unchecked.defaultof<IAdaptiveMap<'K, 'V>>
+    let mutable hasInner = false
+    let mutable innerVersion = 0L
+    let mutable edgeInValue = -1
+    let mutable current: 'T = Unchecked.defaultof<'T>
+    let mutable initialized = false
+    let mutable disposed = false
+
+    member private this.UnregisterInner() =
+        if hasInner then
+            match box inner with
+            | :? IMapSinkRegistry as r -> r.RemoveMapSink(box this)
+            | _ -> ()
+
+            hasInner <- false
+
+    member private this.LoadInner() =
+        // Read first, register after: the view is complete, and the sink sees
+        // only deltas that follow this point in time.
+        let view = inner.GetValue()
+
+        for KeyValue(k, v) in view do
+            state.Data[k] <- v
+
+        match box inner with
+        | :? IMapSinkRegistry as r -> r.AddMapSink(box this)
+        | _ -> ()
+
+        hasInner <- true
+        innerVersion <- inner.Version
+
+    member private this.SwapTo(next: 'T) =
+        // Eager edge removal (Pitfall 1): the old inner must not deliver after
+        // the swap. Its pending journal is dropped with the content.
+        this.UnregisterInner()
+        state.Data.Clear()
+        inner <- mapping next
+        current <- next
+        this.LoadInner()
+        state.Journal.Clear()
+        state.Version <- state.Version + 1L
+
+    member private this.EnsureInitialized() =
+        if not initialized then
+            initialized <- true
+
+            match value with
+            | :? IEdgeTarget as t -> edgeInValue <- t.AddEdge(this :> IAdaptiveNode, -1)
+            | _ -> ()
+
+            current <- value.GetValue()
+            inner <- mapping current
+            this.LoadInner()
+            state.DepVersions[0] <- value.Version
+
+    interface IAdaptiveNode with
+        member this.MarkDirty() =
+            GraphContext.Default.MarkFrom(state.Edges)
+
+        member _.SetDepSlot(depIndex: int, parentIndex: int) =
+            if depIndex = -1 then
+                edgeInValue <- parentIndex
+
+        member _.OnFirstParent() = ()
+        member _.OnLastParent() = ()
+
+    interface IMapDeltaSink<'K, 'V> with
+        member this.OnDeltas(sets: struct ('K * 'V)[], setCnt: int, rems: 'K[], remCnt: int) =
+            if not disposed then
+                Collections.journalAppendMap &state.Journal sets setCnt rems remCnt
+                state.Version <- state.Version + 1L
+                GraphContext.Default.MarkFrom(state.Edges)
+
+    interface IAdaptiveMap<'K, 'V> with
+        member this.GetValue() =
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
+
+            try
+                if disposed then
+                    invalidOp "This adaptive map has been disposed."
+
+                this.EnsureInitialized()
+
+                if value.Version <> state.DepVersions[0] then
+                    let next = value.GetValue()
+                    state.DepVersions[0] <- value.Version
+
+                    if not (EqualityComparer<'T>.Default.Equals(current, next)) then
+                        this.SwapTo(next)
+
+                if inner.Version <> innerVersion then
+                    inner.GetValue() |> ignore
+                    innerVersion <- inner.Version
+
+                if not state.Journal.IsEmpty then
+                    Collections.drainBindMapPush &state
+
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) state.Version
+                state.Data :> IReadOnlyDictionary<'K, 'V>
+            finally
+                ctx.ReleaseOwner()
+
+        member _.Version = state.Version
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                this.UnregisterInner()
+
+                match value with
+                | :? IEdgeTarget as t -> t.RemoveEdgeAt(edgeInValue)
+                | _ -> ()
+
                 Collections.clearSinks &state.Sinks
 
     interface IMapSinkRegistry with
