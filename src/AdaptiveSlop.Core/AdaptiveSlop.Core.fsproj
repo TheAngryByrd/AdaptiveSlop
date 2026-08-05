@@ -5,10 +5,19 @@
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
   </PropertyGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="AdaptiveSlop.Tests" />
+  </ItemGroup>
+
 
   <ItemGroup>
     <Compile Include="Library.fs" />
-    <Compile Include="AdaptiveCollections.fs" />
+    <Compile Include="Collections/Shared.fs" />
+    <Compile Include="Collections/Changeable.fs" />
+    <Compile Include="Collections/SetNodes.fs" />
+    <Compile Include="Collections/MapNodes.fs" />
+    <Compile Include="Collections/ObserveNodes.fs" />
+    <Compile Include="Collections/Api.fs" />
   </ItemGroup>
 
 </Project>

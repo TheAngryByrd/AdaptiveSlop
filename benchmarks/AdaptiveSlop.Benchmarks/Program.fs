@@ -2,6 +2,7 @@ module AdaptiveSlop.Benchmarks
 
 open System.Threading
 open System.Threading.Tasks
+open System.Collections.Generic
 open BenchmarkDotNet.Attributes
 open BenchmarkDotNet.Running
 open FSharp.Data.Adaptive
@@ -818,6 +819,366 @@ type DeepWideBenchmarks() =
             transact (fun () -> fdaInputs.[fdaInputs.Length / 2].Value <- i)
             let _ = AVal.force fdaRoot
             ()
+
+// =============================================================================
+// Kipo PhysicsCache Benchmark (Pomo.Core Projections.fs PhysicsCache module)
+// The real 60 Hz update / render read shape: per frame the sim advances every
+// entity position (amap writes, the shape that was abandoned in Kipo because
+// FDA's allocations were unbearable), and the render side forces the entity
+// maps and rebuilds the movement snapshot: interpolated positions
+// (start + v * dt), velocities-derived rotations (Atan2), and a spatial grid.
+// =============================================================================
+
+[<MemoryDiagnoser>]
+type KipoPhysicsBenchmarks() =
+    let rng = System.Random 42
+    let cellSize = 4.0f
+
+    let mutable slopTime: AdaptiveSlop.Core.ChangeableValue<float32> =
+        Unchecked.defaultof<_>
+
+    let mutable slopPositions: AdaptiveSlop.Core.ChangeableMap<int, System.Numerics.Vector3> =
+        Unchecked.defaultof<_>
+
+    let mutable slopVelocities: AdaptiveSlop.Core.ChangeableMap<int, System.Numerics.Vector3> =
+        Unchecked.defaultof<_>
+
+    let mutable slopModelConfig: AdaptiveSlop.Core.ChangeableMap<int, string> =
+        Unchecked.defaultof<_>
+
+    let mutable slopEntityScenario: AdaptiveSlop.Core.ChangeableMap<int, int> =
+        Unchecked.defaultof<_>
+
+    let mutable slopScenarios: AdaptiveSlop.Core.ChangeableMap<int, int> =
+        Unchecked.defaultof<_>
+
+    let mutable slopDerivedPositions: AdaptiveSlop.Core.IAdaptiveMap<int, System.Numerics.Vector3> =
+        Unchecked.defaultof<_>
+
+    let mutable slopDerivedRotations: AdaptiveSlop.Core.IAdaptiveMap<int, float32> =
+        Unchecked.defaultof<_>
+
+    let mutable fdaTime: cval<float32> = Unchecked.defaultof<_>
+
+    let mutable fdaPositions: cmap<int, System.Numerics.Vector3> =
+        Unchecked.defaultof<_>
+
+    let mutable fdaVelocities: cmap<int, System.Numerics.Vector3> =
+        Unchecked.defaultof<_>
+
+    let mutable fdaModelConfig: cmap<int, string> = Unchecked.defaultof<_>
+    let mutable fdaEntityScenario: cmap<int, int> = Unchecked.defaultof<_>
+    let mutable fdaScenarios: cmap<int, int> = Unchecked.defaultof<_>
+
+    let mutable fdaDerivedPositions: amap<int, System.Numerics.Vector3> =
+        Unchecked.defaultof<_>
+
+    let mutable fdaDerivedRotations: amap<int, float32> = Unchecked.defaultof<_>
+
+    [<Params(250, 1000)>]
+    member val EntityCount = 0 with get, set
+
+    [<Params(50)>]
+    member val Iterations = 0 with get, set
+
+    member private this.BuildSnapshot
+        (dt: float32)
+        (positions: seq<int * System.Numerics.Vector3>)
+        (getVelocity: int -> voption<System.Numerics.Vector3>)
+        (getModelConfig: int -> voption<string>)
+        (getScenario: int -> voption<int>)
+        =
+        // Faithful clone of PhysicsCache.calculateSnapshot: interpolated
+        // positions, velocity-derived rotations, per-cell spatial grid.
+        let positionsBuilder = Dictionary<int, System.Numerics.Vector3>()
+        let rotationsBuilder = Dictionary<int, float32>()
+        let gridBuilder = Dictionary<int, ResizeArray<int>>()
+
+        for (id, startPos) in positions do
+            match getScenario id with
+            | ValueSome _ ->
+                let v = getVelocity id |> ValueOption.defaultValue System.Numerics.Vector3.Zero
+                let currentPos = startPos + v * dt
+                positionsBuilder[id] <- currentPos
+
+                let rotation =
+                    if v <> System.Numerics.Vector3.Zero then
+                        float32 (System.Math.Atan2(float v.X, float v.Z))
+                    else
+                        0.0f
+
+                rotationsBuilder[id] <- rotation
+
+                match getModelConfig id with
+                | ValueSome _ ->
+                    let cell = (int (currentPos.X / cellSize)) * 100000 + int (currentPos.Z / cellSize)
+
+                    match gridBuilder.TryGetValue cell with
+                    | true, list -> list.Add id
+                    | _ -> gridBuilder[cell] <- ResizeArray([| id |])
+                | _ -> ()
+            | _ -> ()
+
+        positionsBuilder.Count + rotationsBuilder.Count + gridBuilder.Count
+
+    [<GlobalSetup>]
+    member this.Setup() =
+        // ---- AdaptiveSlop world ----
+        slopTime <- AdaptiveSlop.Core.CVal.create 0.0f
+        slopPositions <- AdaptiveSlop.Core.CMap.empty
+        slopVelocities <- AdaptiveSlop.Core.CMap.empty
+        slopModelConfig <- AdaptiveSlop.Core.CMap.empty
+        slopEntityScenario <- AdaptiveSlop.Core.CMap.empty
+        slopScenarios <- AdaptiveSlop.Core.CMap.empty
+
+        for i in 0 .. this.EntityCount - 1 do
+            slopPositions.AddOrUpdate i (System.Numerics.Vector3(float32 i, 0.0f, 0.0f))
+            slopVelocities.AddOrUpdate i (System.Numerics.Vector3(rng.NextSingle(), 0.0f, rng.NextSingle()))
+            slopModelConfig.AddOrUpdate i ("config-" + string (i % 8))
+            slopEntityScenario.AddOrUpdate i 0
+
+        slopScenarios.AddOrUpdate 0 0
+
+        // ---- FDA world ----
+        fdaTime <- cval 0.0f
+        fdaPositions <- cmap<int, System.Numerics.Vector3> ()
+        fdaVelocities <- cmap<int, System.Numerics.Vector3> ()
+        fdaModelConfig <- cmap<int, string> ()
+        fdaEntityScenario <- cmap<int, int> ()
+        fdaScenarios <- cmap<int, int> ()
+
+        transact (fun () ->
+            for i in 0 .. this.EntityCount - 1 do
+                fdaPositions.[i] <- System.Numerics.Vector3(float32 i, 0.0f, 0.0f)
+                fdaVelocities.[i] <- System.Numerics.Vector3(rng.NextSingle(), 0.0f, rng.NextSingle())
+                fdaModelConfig.[i] <- "config-" + string (i % 8)
+                fdaEntityScenario.[i] <- 0
+
+            fdaScenarios.[0] <- 0)
+
+        // Derived nodes: the graph holds the interpolated positions and the
+        // velocity-derived rotations. The velocity lookup inside the mapping is a
+        // dynamic read (valid while velocities never change; the fully dynamic
+        // dependency is Phase 7 work).
+        let velView = AdaptiveSlop.Core.CMap.value slopVelocities |> _.GetValue()
+
+        slopDerivedPositions <-
+            AdaptiveSlop.Core.AMap.map
+                (fun id startPos ->
+                    let v =
+                        match velView.TryGetValue id with
+                        | true, v -> v
+                        | _ -> System.Numerics.Vector3.Zero
+
+                    startPos + v * 0.016f)
+                (AdaptiveSlop.Core.CMap.value slopPositions)
+
+        slopDerivedRotations <-
+            AdaptiveSlop.Core.AMap.map
+                (fun _id v ->
+                    if v <> System.Numerics.Vector3.Zero then
+                        float32 (System.Math.Atan2(float v.X, float v.Z))
+                    else
+                        0.0f)
+                (AdaptiveSlop.Core.CMap.value slopVelocities)
+
+        fdaDerivedPositions <-
+            fdaPositions
+            |> AMap.mapA (fun id startPos ->
+                adaptive {
+                    let! v = AMap.tryFind id fdaVelocities
+
+                    return startPos + (v |> Option.defaultValue System.Numerics.Vector3.Zero) * 0.016f
+                })
+
+        fdaDerivedRotations <-
+            AMap.map
+                (fun _id v ->
+                    if v <> System.Numerics.Vector3.Zero then
+                        float32 (System.Math.Atan2(float v.X, float v.Z))
+                    else
+                        0.0f)
+                fdaVelocities
+
+    [<Benchmark(Baseline = true)>]
+    member this.AdaptiveSlop() =
+        let mutable acc = 0
+
+        for _ in 1 .. this.Iterations do
+            // Sim side: advance time and every entity position (journal appends).
+            AdaptiveSlop.Core.CVal.set 0.016f slopTime
+
+            for i in 0 .. this.EntityCount - 1 do
+                let positions = AdaptiveSlop.Core.CMap.value slopPositions
+                let velocities = AdaptiveSlop.Core.CMap.value slopVelocities
+                let v = velocities.GetValue().[i]
+                slopPositions.AddOrUpdate i (positions.GetValue().[i] + v * 0.016f)
+
+            // Render side: force the maps and rebuild the movement snapshot.
+            let time = AdaptiveSlop.Core.AVal.getValue slopTime
+            let positions = AdaptiveSlop.Core.CMap.value slopPositions |> _.GetValue()
+            let velocities = AdaptiveSlop.Core.CMap.value slopVelocities |> _.GetValue()
+            let positionSeq = positions |> Seq.map (fun (KeyValue(k, v)) -> k, v)
+
+            let modelConfigs =
+                AdaptiveSlop.Core.AMap.force (AdaptiveSlop.Core.CMap.value slopModelConfig)
+
+            let entityScenarios =
+                AdaptiveSlop.Core.AMap.force (AdaptiveSlop.Core.CMap.value slopEntityScenario)
+
+            let scenarios =
+                AdaptiveSlop.Core.AMap.force (AdaptiveSlop.Core.CMap.value slopScenarios)
+
+            let getVelocity id =
+                match velocities.TryGetValue id with
+                | true, v -> ValueSome v
+                | _ -> ValueNone
+
+            let getModelConfig id =
+                match modelConfigs.TryGetValue id with
+                | true, c -> ValueSome c
+                | _ -> ValueNone
+
+            let getScenario id =
+                match entityScenarios.TryGetValue id with
+                | true, s -> ValueSome s
+                | _ -> ValueNone
+
+            acc <-
+                acc
+                + this.BuildSnapshot time positionSeq getVelocity getModelConfig getScenario
+                + scenarios.Count
+
+        if acc = -1 then
+            failwith "unreachable"
+
+    [<Benchmark>]
+    member this.FSharpDataAdaptive() =
+        let mutable acc = 0
+
+        for _ in 1 .. this.Iterations do
+            // Sim side: advance time and every entity position in one transact.
+            transact (fun () ->
+                fdaTime.Value <- 0.016f
+
+                for i in 0 .. this.EntityCount - 1 do
+                    let v = fdaVelocities.[i]
+                    fdaPositions.[i] <- fdaPositions.[i] + v * 0.016f)
+
+            // Render side: force the maps and rebuild the movement snapshot.
+            let time = AVal.force fdaTime
+            let positions = AMap.force fdaPositions
+            let velocities = AMap.force fdaVelocities
+            let positionSeq = positions |> HashMap.toSeq
+            let modelConfigs = AMap.force fdaModelConfig
+            let entityScenarios = AMap.force fdaEntityScenario
+            let scenarios = AMap.force fdaScenarios
+
+            let getVelocity id = HashMap.tryFindV id velocities
+            let getModelConfig id = HashMap.tryFindV id modelConfigs
+            let getScenario id = HashMap.tryFindV id entityScenarios
+
+            acc <-
+                acc
+                + this.BuildSnapshot time positionSeq getVelocity getModelConfig getScenario
+                + scenarios.Count
+
+        if acc = -1 then
+            failwith "unreachable"
+
+    /// The graph-as-cache variant: derived nodes hold the interpolated positions
+    /// and rotations; the render reads transient views only (no force), and the
+    /// spatial grid is the only per-frame user-code rebuild.
+    [<Benchmark>]
+    member this.AdaptiveSlop_GraphDirect() =
+        let mutable acc = 0
+
+        for _ in 1 .. this.Iterations do
+            // Sim side: advance time and every entity position (journal appends).
+            AdaptiveSlop.Core.CVal.set 0.016f slopTime
+
+            for i in 0 .. this.EntityCount - 1 do
+                let positions = AdaptiveSlop.Core.CMap.value slopPositions
+                let velocities = AdaptiveSlop.Core.CMap.value slopVelocities
+                let v = velocities.GetValue().[i]
+                slopPositions.AddOrUpdate i (positions.GetValue().[i] + v * 0.016f)
+
+            // Render side: read the graph directly. The derived positions drain
+            // the pending deltas in place (0 alloc); every view is transient.
+            let positionsView = AdaptiveSlop.Core.AMap.getValue slopDerivedPositions
+            let rotationsView = AdaptiveSlop.Core.AMap.getValue slopDerivedRotations
+            let velocitiesView = AdaptiveSlop.Core.CMap.value slopVelocities |> _.GetValue()
+            let modelConfigsView = AdaptiveSlop.Core.CMap.value slopModelConfig |> _.GetValue()
+
+            let entityScenariosView =
+                AdaptiveSlop.Core.CMap.value slopEntityScenario |> _.GetValue()
+
+            let scenariosView = AdaptiveSlop.Core.CMap.value slopScenarios |> _.GetValue()
+            let positionSeq = positionsView |> Seq.map (fun (KeyValue(k, v)) -> k, v)
+
+            let getVelocity id =
+                match velocitiesView.TryGetValue id with
+                | true, v -> ValueSome v
+                | _ -> ValueNone
+
+            let getModelConfig id =
+                match modelConfigsView.TryGetValue id with
+                | true, c -> ValueSome c
+                | _ -> ValueNone
+
+            let getScenario id =
+                match entityScenariosView.TryGetValue id with
+                | true, s -> ValueSome s
+                | _ -> ValueNone
+
+            let getScenario id =
+                match entityScenariosView.TryGetValue id with
+                | true, s -> ValueSome s
+                | _ -> ValueNone
+
+            acc <-
+                acc
+                + this.BuildSnapshot 0.016f positionSeq getVelocity getModelConfig getScenario
+                + rotationsView.Count
+                + scenariosView.Count
+
+        if acc = -1 then
+            failwith "unreachable"
+
+    /// The graph-as-cache variant for FDA: per-element adaptive blocks over the
+    /// derived maps, forced per frame (their materialization idiom).
+    [<Benchmark>]
+    member this.FSharpDataAdaptive_GraphDirect() =
+        let mutable acc = 0
+
+        for _ in 1 .. this.Iterations do
+            transact (fun () ->
+                fdaTime.Value <- 0.016f
+
+                for i in 0 .. this.EntityCount - 1 do
+                    fdaPositions.[i] <- fdaPositions.[i] + fdaVelocities.[i] * 0.016f)
+
+            // Render side: force the derived maps (FDA's materialization idiom).
+            let positions = AMap.force fdaDerivedPositions
+            let rotations = AMap.force fdaDerivedRotations
+            let velocities = AMap.force fdaVelocities
+            let modelConfigs = AMap.force fdaModelConfig
+            let entityScenarios = AMap.force fdaEntityScenario
+            let scenarios = AMap.force fdaScenarios
+            let positionSeq = positions |> HashMap.toSeq
+
+            let getVelocity id = HashMap.tryFindV id velocities
+            let getModelConfig id = HashMap.tryFindV id modelConfigs
+            let getScenario id = HashMap.tryFindV id entityScenarios
+
+            acc <-
+                acc
+                + this.BuildSnapshot 0.016f positionSeq getVelocity getModelConfig getScenario
+                + rotations.Count
+                + scenarios.Count
+
+        if acc = -1 then
+            failwith "unreachable"
 
 // =============================================================================
 // Unbalanced Tree Benchmark (asymmetric structure)
