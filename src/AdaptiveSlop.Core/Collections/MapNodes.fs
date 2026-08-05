@@ -1298,3 +1298,127 @@ type BindMapNode<'K, 'V, 'T when 'K: equality>
         member _.EdgeCount = state.Edges.Count
         member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
         member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
+
+/// <summary>
+/// Maps every entry, disposing the mapped value when its key leaves (FDA
+/// <c>AMap.mapUse</c> parity). The mapped values are stable (the mapping runs
+/// once per key). Disposing the node disposes all live mapped values and
+/// clears the output.
+/// </summary>
+type MapUseMapNode<'K, 'V, 'W when 'K: equality and 'W: equality and 'W :> IDisposable>
+    (source: IAdaptiveMap<'K, 'V>, [<InlineIfLambda>] mapping: 'K -> 'V -> 'W) =
+    let mutable state = MapNodeState<'K, 'V, 'W>.Create(1)
+    // Key -> its mapped value.
+    let mapped = Dictionary<'K, 'W>()
+    let mutable initialized = false
+    let mutable disposed = false
+
+    member private this.Register() =
+        match box source with
+        | :? IMapSinkRegistry as r -> r.AddMapSink(box (this :> IMapDeltaSink<'K, 'V>))
+        | _ -> ()
+
+    member private this.Unregister() =
+        match box source with
+        | :? IMapSinkRegistry as r -> r.RemoveMapSink(box (this :> IMapDeltaSink<'K, 'V>))
+        | _ -> ()
+
+    member private this.EnsureInitialized() =
+        if not initialized then
+            // Snapshot first, register between, then map the snapshot (the
+            // FilterMapNode convention): the mapping is user code that may
+            // write to the source, and the write must land in our journal.
+            let snapshot = Dictionary<'K, 'V>(source.GetValue())
+            this.Register()
+
+            for KeyValue(k, v) in snapshot do
+                let w = mapping k v
+                mapped[k] <- w
+                state.Data[k] <- w
+
+            state.DepVersions[0] <- source.Version
+            initialized <- true
+
+    member private this.Drain() =
+        // Removals first: the keys are gone, their values are disposed.
+        let rems = state.Journal.Rems
+
+        for i in 0 .. rems.Count - 1 do
+            let k = rems.Items[i]
+
+            if mapped.TryGetValue k |> fst then
+                let w = mapped[k]
+                mapped.Remove k |> ignore
+                w.Dispose()
+                state.Data.Remove k |> ignore
+                state.Out.Rems <- Collections.bufferAppend state.Out.Rems k
+
+        let sets = state.Journal.Sets
+
+        for i in 0 .. sets.Count - 1 do
+            let struct (k, v) = sets.Items[i]
+            let w = mapping k v
+            mapped[k] <- w
+            state.Data[k] <- w
+            state.Out.Sets <- Collections.bufferAppend state.Out.Sets (struct (k, w))
+
+        state.Journal.Clear()
+        state.Version <- state.Version + 1L
+        Collections.pushAndMarkMap state.Out &state.Sinks state.Edges
+        state.Out.Clear()
+
+    interface IMapDeltaSink<'K, 'V> with
+        member this.OnDeltas(sets: struct ('K * 'V)[], setCnt: int, rems: 'K[], remCnt: int) =
+            if not disposed then
+                Collections.journalAppendMap &state.Journal sets setCnt rems remCnt
+                state.Version <- state.Version + 1L
+                GraphContext.Default.MarkFrom(state.Edges)
+
+    interface IAdaptiveMap<'K, 'W> with
+        member this.GetValue() =
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
+
+            try
+                if disposed then
+                    invalidOp "This adaptive map has been disposed."
+
+                this.EnsureInitialized()
+
+                if source.Version <> state.DepVersions[0] then
+                    source.GetValue() |> ignore
+                    state.DepVersions[0] <- source.Version
+
+                if not state.Journal.IsEmpty then
+                    this.Drain()
+
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) state.Version
+                state.Data :> IReadOnlyDictionary<'K, 'W>
+            finally
+                ctx.ReleaseOwner()
+
+        member _.Version = state.Version
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                this.Unregister()
+                Collections.clearSinks &state.Sinks
+
+                for KeyValue(_, w) in mapped do
+                    w.Dispose()
+
+                mapped.Clear()
+                state.Data.Clear()
+
+    interface IMapSinkRegistry with
+        member this.AddMapSink(sink) = Collections.addSink &state.Sinks sink
+
+        member this.RemoveMapSink(sink) =
+            Collections.removeSink &state.Sinks sink
+
+    interface IEdgeTarget with
+        member _.EdgeCount = state.Edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)

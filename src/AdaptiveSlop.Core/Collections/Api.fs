@@ -591,6 +591,10 @@ module AMap =
     let inline chooseV ([<InlineIfLambda>] f: 'K -> 'V -> 'U voption) (mapValue: amap<'K, 'V>) : amap<'K, 'U> =
         new MapMapNode<'K, 'V, 'U>(mapValue, f)
 
+    /// <summary>Maps the values only (FDA <c>AMap.map'</c> parity; the V suffix is the value-only convention).</summary>
+    let inline mapV ([<InlineIfLambda>] f: 'V -> 'U) (mapValue: amap<'K, 'V>) : amap<'K, 'U> =
+        map (fun _ v -> f v) mapValue
+
     /// <summary>Unions both maps, resolving colliding keys with the given function.</summary>
     let inline unionWith
         ([<InlineIfLambda>] resolve: 'K -> 'V -> 'V -> 'V)
@@ -628,6 +632,13 @@ module AMap =
                 | ValueSome l, ValueSome r -> ValueSome(struct (l, r))
                 | _ -> ValueNone
         )
+
+    /// <summary>
+    /// Alias of <see cref="intersect"/> (FDA parity name; our intersect is
+    /// already the struct-pair form, gap sheet §4.6).
+    /// </summary>
+    let inline intersectV (left: amap<'K, 'V1>) (right: amap<'K, 'V2>) : amap<'K, struct ('V1 * 'V2)> =
+        intersect left right
 
     /// <summary>Intersects both maps, combining the paired values.</summary>
     let inline intersectWith
@@ -712,8 +723,17 @@ module AMap =
     let inline mapSet ([<InlineIfLambda>] mapping: 'K -> 'V) (set: aset<'K>) : amap<'K, 'V> =
         new SetToMapNode<'K, 'V, 'K>(set, (fun k -> (k, mapping k)), false)
 
-    /// <summary>An adaptive set of the map's keys (FDA <c>toASet</c> parity).</summary>
-    let inline toASet (mapValue: amap<'K, 'V>) : aset<'K> =
+    /// <summary>
+    /// An adaptive set of the map's key/value pairs (FDA <c>AMap.toASet</c>
+    /// parity, gap sheet §4.14). Struct pairs: the library convention (cf.
+    /// <see cref="intersect"/>). The former keys behavior moved to
+    /// <see cref="keys"/>.
+    /// </summary>
+    let inline toASet (mapValue: amap<'K, 'V>) : aset<struct ('K * 'V)> =
+        new MapToSetNode<'K, 'V, struct ('K * 'V)>(mapValue, fun k v -> struct (k, v))
+
+    /// <summary>An adaptive set of the map's keys (gap sheet §4.14).</summary>
+    let inline keys (mapValue: amap<'K, 'V>) : aset<'K> =
         new MapToSetNode<'K, 'V, 'K>(mapValue, fun k _ -> k)
 
     /// <summary>An adaptive set of the map's distinct values (FDA <c>toASetValues</c> parity).</summary>
@@ -750,6 +770,33 @@ module AMap =
         new BindMapNode<'K, 'V, 'T>(value, mapping)
 
     /// <summary>
+    /// Adaptively maps over the two values and returns the resulting map (FDA
+    /// <c>AMap.bind2</c> parity). When either value changes, the whole inner
+    /// map is swapped (the bind semantics). Composed as one bind over the
+    /// mapped pair (the FDA approach: nested binds would miss the inner
+    /// bind's swap, which signals by version only, not by delta).
+    /// </summary>
+    let inline bind2
+        ([<InlineIfLambda>] mapping: 'A -> 'B -> amap<'K, 'V>)
+        (a: aval<'A>)
+        (b: aval<'B>)
+        : amap<'K, 'V> =
+        bind (fun (av, bv) -> mapping av bv) (AVal.map2 (fun av bv -> (av, bv)) a b)
+
+    /// <summary>
+    /// Adaptively maps over the three values and returns the resulting map
+    /// (FDA <c>AMap.bind3</c> parity). When any value changes, the whole
+    /// inner map is swapped (the bind semantics).
+    /// </summary>
+    let inline bind3
+        ([<InlineIfLambda>] mapping: 'A -> 'B -> 'C -> amap<'K, 'V>)
+        (a: aval<'A>)
+        (b: aval<'B>)
+        (c: aval<'C>)
+        : amap<'K, 'V> =
+        bind (fun (av, bv, cv) -> mapping av bv cv) (AVal.map3 (fun av bv cv -> (av, bv, cv)) a b c)
+
+    /// <summary>
     /// An adaptive map driven by a compute function (FDA <c>AMap.custom</c>
     /// parity, pull model). The compute receives the current view and a delta
     /// builder; it appends the operations that describe the change since the
@@ -784,9 +831,34 @@ module AMap =
         let node = new ExternalMapNode<'K, 'V>(snapshot)
         (node :> amap<'K, 'V>, fun () -> node.Invalidate())
 
+    /// <summary>
+    /// Maps every entry, disposing the mapped value when its key leaves (FDA
+    /// <c>AMap.mapUse</c> parity). The mapped values are stable (the mapping
+    /// runs once per key). Disposing the returned disposable disposes all
+    /// live mapped values and clears the output map.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// let src = CMap.ofSeq [ 1, "a"; 2, "b" ]
+    /// let cleanup, mapped = src |> AMap.mapUse (fun id _ -&gt; Resource(id))
+    /// CMap.remove 1 src              // the resource for key 1 is disposed
+    /// cleanup.Dispose()              // all remaining resources are disposed
+    /// </code>
+    /// </example>
+    let inline mapUse
+        ([<InlineIfLambda>] mapping: 'K -> 'V -> 'W)
+        (mapValue: amap<'K, 'V>)
+        : IDisposable * amap<'K, 'W> =
+        let node = new MapUseMapNode<'K, 'V, 'W>(mapValue, mapping)
+        (node :> IDisposable, node :> amap<'K, 'W>)
+
     /// <summary>Keeps the entries that satisfy the predicate.</summary>
     let inline filter ([<InlineIfLambda>] predicate: 'K -> 'V -> bool) (mapValue: amap<'K, 'V>) : amap<'K, 'V> =
         new FilterMapNode<'K, 'V>(mapValue, predicate)
+
+    /// <summary>Keeps the entries whose value satisfies the predicate (FDA <c>AMap.filter'</c> parity; the V suffix is the value-only convention).</summary>
+    let inline filterV ([<InlineIfLambda>] predicate: 'V -> bool) (mapValue: amap<'K, 'V>) : amap<'K, 'V> =
+        filter (fun _ v -> predicate v) mapValue
 
     /// <summary>
     /// Adaptively maps every entry of the map to an adaptive value (FDA
@@ -894,10 +966,47 @@ module AMap =
 
         new MapReduceNode<'k, 'v, struct ('k * 'v), 's, 's>(mapValue, mapping, AdaptiveReduction.group zero add2 sub2)
 
+    /// <summary>
+    /// Adaptively folds the map with a partially invertible <c>trySubtract</c>:
+    /// removals that cannot be inverted recompute the whole fold (FDA
+    /// <c>AMap.foldHalfGroup</c> parity).
+    /// </summary>
+    let inline foldHalfGroup
+        ([<InlineIfLambda>] add: 's -> 'k -> 'v -> 's)
+        ([<InlineIfLambda>] trySubtract: 's -> 'k -> 'v -> 's voption)
+        (zero: 's)
+        (mapValue: amap<'k, 'v>)
+        : aval<'s> =
+        let inline mapping k v = struct (k, v)
+        let inline add2 s struct (k, v) = add s k v
+        let inline sub2 s struct (k, v) = trySubtract s k v
+
+        new MapReduceNode<'k, 'v, struct ('k * 'v), 's, 's>(
+            mapValue,
+            mapping,
+            AdaptiveReduction.halfGroup zero add2 sub2
+        )
+
+    /// <summary>
+    /// Adaptively sums the mapped entries (FDA <c>AMap.sumBy</c> parity).
+    /// </summary>
+    let inline sumBy ([<InlineIfLambda>] mapping: 'k -> 'v -> 'u) (mapValue: amap<'k, 'v>) : aval<'u> =
+        reduceBy (AdaptiveReduction.sum ()) mapping mapValue
+
 
     /// <summary>Adaptively gets the number of entries.</summary>
     let inline count (mapValue: amap<'K, 'V>) : aval<int> =
         AdaptiveNode<int>(fun () -> mapValue.GetValue().Count)
+
+    /// <summary>
+    /// Adaptively averages the mapped entries (needs a numeric type with
+    /// <c>DivideByInt</c>, e.g. <c>float</c>). The average is sum/count.
+    /// </summary>
+    let inline averageBy ([<InlineIfLambda>] mapping: 'k -> 'v -> ^u) (mapValue: amap<'k, 'v>) : aval<^u> =
+        AVal.map2
+            (fun total c -> LanguagePrimitives.DivideByInt total c)
+            (reduceBy (AdaptiveReduction.sum ()) mapping mapValue)
+            (count mapValue)
 
     /// <summary>Adaptively tests if the map is empty.</summary>
     let inline isEmpty (mapValue: amap<'K, 'V>) : aval<bool> =

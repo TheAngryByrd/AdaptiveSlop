@@ -3049,7 +3049,7 @@ let ``AMap mapSet, toASet and toASetValues`` () =
     )
 
     let m = CMap.empty<string, int>
-    let keys = AMap.toASet (CMap.value m)
+    let keys = AMap.keys (CMap.value m)
     let values = AMap.toASetValues (CMap.value m)
 
     CMap.addOrUpdate "a" 1 m
@@ -4970,3 +4970,152 @@ let ``ASet average and averageBy`` () =
 
     CSet.add 5.0 s
     Assert.Equal(2.75, AVal.getValue (ASet.average (CSet.value s)))
+
+// =============================================================================
+// Bring list — AMap group (docs/2026-08-05-FDA-API-GAPS.md §4): map',
+// choose', filter', intersectV, bind2/bind3, mapUse, foldHalfGroup,
+// sumBy/averageBy, toASet pairs + keys.
+// =============================================================================
+
+[<Fact>]
+let ``AMap mapV and filterV are value-only`` () =
+    let m = CMap.ofSeq [ 1, 2; 2, 4; 3, 5 ]
+
+    let doubled = AMap.mapV (fun v -> v * 2) (CMap.value m)
+    Assert.Equal<Map<int, int>>(Map.ofList [ 1, 4; 2, 8; 3, 10 ], AMap.toMap doubled)
+
+    let big = AMap.filterV (fun v -> v > 3) (CMap.value m)
+    Assert.Equal<Map<int, int>>(Map.ofList [ 2, 4; 3, 5 ], AMap.toMap big)
+
+[<Fact>]
+let ``AMap intersectV pairs the values as struct pairs`` () =
+    let a = CMap.ofSeq [ 1, "a"; 2, "b"; 3, "c" ]
+    let b = CMap.ofSeq [ 2, 20; 3, 30; 4, 40 ]
+
+    let paired = AMap.intersectV (CMap.value a) (CMap.value b)
+
+    let expected =
+        Map.ofList [ 2, struct ("b", 20); 3, struct ("c", 30) ]
+
+    Assert.Equal<Map<int, struct (string * int)>>(expected, AMap.toMap paired)
+
+[<Fact>]
+let ``AMap bind2 and bind3 remap when any input changes`` () =
+    let a = CVal.create 0
+    let b = CVal.create 0
+    let tables = [| CMap.empty<int, string>; CMap.empty<int, string>; CMap.empty<int, string> |]
+
+    let combined =
+        AMap.bind2 (fun av bv -> tables[av + bv]) (CVal.value a) (CVal.value b)
+
+    CMap.addOrUpdate 1 "x" (tables[0])
+    Assert.Equal<Map<int, string>>(Map.ofList [ 1, "x" ], AMap.toMap combined)
+
+    CVal.set 1 b // a+b = 1: table 1, still empty
+    Assert.Equal<Map<int, string>>(Map.empty, AMap.toMap combined)
+
+    CMap.addOrUpdate 2 "y" (tables[1])
+    Assert.Equal<Map<int, string>>(Map.ofList [ 2, "y" ], AMap.toMap combined)
+
+    CVal.set 1 a // a+b = 2: table 2, empty
+    Assert.Equal<Map<int, string>>(Map.empty, AMap.toMap combined)
+
+    let c = CVal.create 0
+
+    let combined3 =
+        AMap.bind3 (fun av bv cv -> tables[av + bv + cv]) (CVal.value a) (CVal.value b) (CVal.value c)
+
+    Assert.Equal<Map<int, string>>(Map.empty, AMap.toMap combined3)
+
+    CVal.set 0 a
+    CVal.set 0 b
+    CVal.set 1 c // a+b+c = 1: table 1 holds { 2 -> y }
+    Assert.Equal<Map<int, string>>(Map.ofList [ 2, "y" ], AMap.toMap combined3)
+
+[<Fact>]
+let ``AMap mapUse disposes on removal and on dispose`` () =
+    let input = CMap.ofSeq [ 1, "a"; 2, "b"; 3, "c"; 4, "d" ]
+    let refCount = ref 0
+
+    let newDisposable _ =
+        incr refCount
+
+        { new IDisposable with
+            member _.Dispose() = decr refCount }
+
+    let disp, mapValue = input |> AMap.mapUse (fun _ _ -> newDisposable ())
+
+    Assert.Equal(0, !refCount) // mapped lazily: nothing before the first read
+
+    AMap.force mapValue |> ignore
+    Assert.Equal(4, !refCount)
+
+    CMap.remove 1 input
+    AMap.force mapValue |> ignore
+    Assert.Equal(3, !refCount)
+
+    CMap.addOrUpdate 7 "g" input
+    AMap.force mapValue |> ignore
+    Assert.Equal(4, !refCount)
+
+    disp.Dispose()
+    Assert.Equal(0, !refCount)
+
+[<Fact>]
+let ``AMap foldHalfGroup, sumBy and averageBy`` () =
+    let m = CMap.ofSeq [ 1, 10; 2, 20; 3, 30 ]
+
+    // Fully invertible: removals subtract without a full recompute.
+    let sum =
+        AMap.foldHalfGroup
+            (fun s k v -> s + v)
+            (fun s k v -> ValueSome(s - v))
+            0
+            (CMap.value m)
+
+    Assert.Equal(60, AVal.getValue sum)
+
+    CMap.remove 2 m
+    Assert.Equal(40, AVal.getValue sum)
+
+    CMap.addOrUpdate 4 40 m
+    Assert.Equal(80, AVal.getValue sum)
+
+    // Non-invertible trySubtract: removals recompute the whole fold; the
+    // result stays correct.
+    let always =
+        AMap.foldHalfGroup
+            (fun s k v -> s + v)
+            (fun _ _ _ -> ValueNone)
+            0
+            (CMap.value m)
+
+    Assert.Equal(80, AVal.getValue always)
+
+    CMap.remove 4 m
+    Assert.Equal(40, AVal.getValue always)
+
+    let sums = AMap.sumBy (fun k v -> v) (CMap.value m)
+    Assert.Equal(40, AVal.getValue sums)
+
+    let mf = CMap.ofSeq [ 1, 1.0; 2, 2.0 ]
+    let avg = AMap.averageBy (fun k v -> v) (CMap.value mf)
+    Assert.Equal(1.5, AVal.getValue avg)
+
+[<Fact>]
+let ``AMap toASet returns pairs and keys returns keys`` () =
+    let m = CMap.ofSeq [ 1, "a"; 2, "b" ]
+
+    let pairs = AMap.toASet (CMap.value m)
+    let keys = AMap.keys (CMap.value m)
+
+    Assert.Equal<Set<struct (int * string)>>(
+        Set.ofList [ struct (1, "a"); struct (2, "b") ],
+        ASet.toSet pairs
+    )
+
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2 ], ASet.toSet keys)
+
+    CMap.remove 1 m
+    Assert.Equal<Set<struct (int * string)>>(Set.ofList [ struct (2, "b") ], ASet.toSet pairs)
+    Assert.Equal<Set<int>>(Set.ofList [ 2 ], ASet.toSet keys)
