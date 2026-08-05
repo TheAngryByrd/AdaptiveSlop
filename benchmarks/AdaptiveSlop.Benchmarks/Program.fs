@@ -1548,6 +1548,90 @@ type ConcurrentBenchmarks() =
         Task.WaitAll(tasks)
 
 // =============================================================================
+// Per-element adaptive map benchmark (docs/2026-08-05-MAPA-DESIGN.md §13.6)
+//
+// ASet.mapA: one element-aval write per iteration, targeted delta. The naive
+// composition (ASet.map + AVal.getValue) cannot react to an aval write at all
+// (its mapping runs only on source deltas), so its workload is a full source
+// replace: every element re-mapped per iteration — the brute-force baseline
+// the mapA design avoids.
+//
+// FDA benchmark pattern (src/Test/.../Benchmarks/Map.fs): the measured
+// method is ONE operation (one write + one read); the IterationSetup restores
+// the pre-change state and settles the graph, so the Mean is directly the
+// per-operation cost.
+// =============================================================================
+
+[<MemoryDiagnoser>]
+type MapABenchmarks() =
+    let mutable slopElements: AdaptiveSlop.Core.ChangeableValue<int>[] = [||]
+    let mutable slopSet: AdaptiveSlop.Core.ChangeableSet<int> = Unchecked.defaultof<_>
+    let mutable slopMapped: AdaptiveSlop.Core.aset<int> = Unchecked.defaultof<_>
+    let mutable slopNaive: AdaptiveSlop.Core.aset<int> = Unchecked.defaultof<_>
+    let mutable fdaElements: cval<int>[] = [||]
+    let mutable fdaSet: cset<int> = Unchecked.defaultof<_>
+    let mutable fdaMapped: aset<int> = Unchecked.defaultof<_>
+    let mutable counter = 0
+
+    [<Params(100, 1000)>]
+    member val ElementCount = 0 with get, set
+
+    [<GlobalSetup>]
+    member this.Setup() =
+        counter <- 0
+        slopElements <- Array.init this.ElementCount (fun i -> AdaptiveSlop.Core.CVal.create (i * 10))
+        slopSet <- AdaptiveSlop.Core.CSet.ofSeq [ 0 .. this.ElementCount - 1 ]
+        slopMapped <-
+            slopSet
+            |> AdaptiveSlop.Core.ASet.mapA (fun v -> AdaptiveSlop.Core.CVal.value slopElements[v % this.ElementCount])
+        slopNaive <-
+            slopSet
+            |> AdaptiveSlop.Core.ASet.map (fun v ->
+                AdaptiveSlop.Core.AVal.getValue (AdaptiveSlop.Core.CVal.value slopElements[v % this.ElementCount]))
+        fdaElements <- Array.init this.ElementCount (fun i -> cval (i * 10))
+        fdaSet <- cset [ 0 .. this.ElementCount - 1 ]
+        fdaMapped <- fdaSet |> ASet.mapA (fun v -> fdaElements[v % this.ElementCount] :> aval<int>)
+        // Settle: initialize the derived nodes outside the measurement.
+        AdaptiveSlop.Core.ASet.getValue slopMapped |> ignore
+        AdaptiveSlop.Core.ASet.getValue slopNaive |> ignore
+        transact (fun () -> fdaElements[0].Value <- 0)
+        ASet.force fdaMapped |> ignore
+
+    [<IterationSetup>]
+    member this.IterationSetup() =
+        // Restore the pre-change state and settle the graph.
+        slopElements[0].Set(0)
+        slopSet.Set(seq { 0 .. this.ElementCount - 1 })
+        AdaptiveSlop.Core.ASet.getValue slopMapped |> ignore
+        AdaptiveSlop.Core.ASet.getValue slopNaive |> ignore
+        transact (fun () -> fdaElements[0].Value <- 0)
+        ASet.force fdaMapped |> ignore
+
+    [<Benchmark(Baseline = true)>]
+    member this.AdaptiveSlopMapA() =
+        counter <- counter + 1
+        slopElements[0].Set(counter)
+        let _ = AdaptiveSlop.Core.ASet.getValue slopMapped
+        ()
+
+    [<Benchmark>]
+    member this.NaiveMapForcesOnFullReplace() =
+        counter <- counter + 1
+        // Full replace with a disjoint range: the naive composition re-maps
+        // every element (the delta is N removes + N adds).
+        let start = 100000 + this.ElementCount + counter
+        slopSet.Set(seq { start .. start + this.ElementCount - 1 })
+        let _ = AdaptiveSlop.Core.ASet.getValue slopNaive
+        ()
+
+    [<Benchmark>]
+    member this.FSharpDataAdaptive() =
+        counter <- counter + 1
+        transact (fun () -> fdaElements[0].Value <- counter)
+        let _ = ASet.force fdaMapped
+        ()
+
+// =============================================================================
 // Entry Point
 // =============================================================================
 
