@@ -206,7 +206,7 @@ type FilterMapListNode<'T, 'U>(source: IAdaptiveList<'T>, [<InlineIfLambda>] map
 
             if not out.IsEmpty then
                 version <- version + 1L
-                Collections.pushListDelta sinks out
+                Collections.pushListDelta &sinks out
 
     interface IListDeltaSink<'T> with
         member this.OnDeltas(ops: ListOp<'T>[], opCnt: int) =
@@ -379,7 +379,7 @@ type AppendListNode<'T>(left: IAdaptiveList<'T>, right: IAdaptiveList<'T>) =
 
             if not out.IsEmpty then
                 version <- version + 1L
-                Collections.pushListDelta sinks out
+                Collections.pushListDelta &sinks out
 
     interface IListDeltaSink<'T> with
         member this.OnDeltas(ops: ListOp<'T>[], opCnt: int) =

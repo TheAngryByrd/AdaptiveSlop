@@ -3778,3 +3778,74 @@ let ``changeable dispose detaches sinks`` () =
     Assert.Equal(1, s.SinkCount)
     (s :> IDisposable).Dispose()
     Assert.Equal(0, s.SinkCount)
+
+[<Fact>]
+let ``dropped derived collection nodes are collected`` () =
+    // Weak sink references (docs/2026-08-05-DESIGN-WEAK-SINK-REFERENCES.md):
+    // a derived node that was read (sink registered) and then dropped is
+    // collectible; the source keeps only a weak entry. The node is created in
+    // a separate function so the JIT cannot extend its lifetime.
+    let src = CSet.ofSeq [ 1; 2 ]
+
+    let makeWeak () =
+        let mapped = ASet.map (fun x -> x * 10) (CSet.value src)
+        ASet.force mapped |> ignore // first read registers the sink
+        WeakReference(mapped)
+
+    let weak = makeWeak ()
+    GC.Collect()
+    GC.WaitForPendingFinalizers()
+    GC.Collect()
+    Assert.False(weak.IsAlive)
+    // The source still works, and a live sink still receives deltas (delivery
+    // skips and compacts the dead entry).
+    CSet.add 3 src
+    let m2 = ASet.map (fun x -> x * 2) (CSet.value src)
+    Assert.Equal<Set<_>>(Set.ofList [ 2; 4; 6 ], Set.ofSeq (ASet.force m2))
+
+[<Fact>]
+let ``disposing an observation eventually releases the derived chain`` () =
+    // Disposing the observation removes the parent edge; with weak sinks the
+    // (then unreachable) derived node is collected and its sink entry dies.
+    // Created in a separate function so the JIT cannot extend lifetimes.
+    let src = CSet.ofSeq [ 1 ]
+
+    let makeWeak () =
+        let mapped = ASet.map (fun x -> x * 10) (CSet.value src)
+        let obs = ASet.observe (fun _ _ -> ()) mapped
+        let w = struct (WeakReference(mapped), WeakReference(obs))
+        obs.Dispose()
+        w
+
+    let struct (mappedWeak, obsWeak) = makeWeak ()
+    GC.Collect()
+    GC.WaitForPendingFinalizers()
+    GC.Collect()
+    Assert.False(mappedWeak.IsAlive)
+    Assert.False(obsWeak.IsAlive)
+
+[<Fact>]
+let ``sinks registered during delivery do not receive the current batch`` () =
+    // A sink registered reentrantly (user code inside a nested delivery) must
+    // not receive the batch in progress: its init snapshot already reflects
+    // the change, and delivering would double-apply (refcount corruption:
+    // the element would never leave).
+    let src = CSet.empty<int>
+    let a = ASet.map (fun x -> x + 1) (CSet.value src)
+    let mutable b: aset<int> = Unchecked.defaultof<_>
+    let mutable count = 0
+
+    use obs =
+        ASet.observe
+            (fun _ _ ->
+                count <- count + 1
+
+                if count = 1 then
+                    b <- ASet.map (fun x -> x * 10) (CSet.value src)
+                    ASet.force b |> ignore)
+            a
+
+    CSet.add 1 src
+    Assert.Equal<Set<_>>(Set.ofList [ 10 ], Set.ofSeq (ASet.force b))
+    CSet.remove 1 src
+    Assert.Equal<Set<int>>(Set.empty, Set.ofSeq (ASet.force b))

@@ -503,7 +503,7 @@ type SetToMapNode<'K, 'V, 'T when 'K: equality>
                             state.Journal.Adds.Count <- 0
 
                         if changed then
-                            Collections.pushMapDelta state.Sinks state.Out
+                            Collections.pushMapDelta &state.Sinks state.Out
                             state.Out.Clear()
                     finally
                         ctx2.TxActive <- wasActive
@@ -725,7 +725,7 @@ type SetToMapKeepAllNode<'K, 'V, 'T when 'K: equality>
                             state.Journal.Adds.Count <- 0
 
                         if changed then
-                            Collections.pushMapDelta state.Sinks state.Out
+                            Collections.pushMapDelta &state.Sinks state.Out
                             state.Out.Clear()
                     finally
                         ctx2.TxActive <- wasActive
@@ -953,7 +953,7 @@ type MapToSetNode<'K, 'V, 'T when 'K: equality and 'T: equality>
                             state.Journal.Sets.Count <- 0
 
                         if changed then
-                            Collections.pushSetDelta state.Sinks state.OutDelta
+                            Collections.pushSetDelta &state.Sinks state.OutDelta
                             state.OutDelta.Clear()
                     finally
                         ctx2.TxActive <- wasActive
@@ -1034,7 +1034,7 @@ type OfAvalMapNode<'K, 'V, 'S when 'K: equality and 'S :> seq<'K * 'V>>(value: I
                 // source only when it changed (a stuck version makes
                 // derived nodes stale forever).
                 state.Version <- state.Version + 1L
-                Collections.pushAndMarkMap state.Out state.Sinks state.Edges
+                Collections.pushAndMarkMap state.Out &state.Sinks state.Edges
                 state.Out.Clear()
 
             state.DepVersions[0] <- value.Version
@@ -1122,7 +1122,7 @@ type CustomMapNode<'K, 'V when 'K: equality>
                     state.Data.Remove rems.Items[i] |> ignore
 
                 state.Version <- state.Version + 1L
-                Collections.pushAndMarkMap (writer.Snapshot()) state.Sinks state.Edges
+                Collections.pushAndMarkMap (writer.Snapshot()) &state.Sinks state.Edges
                 writer.Clear()
 
     interface IAdaptiveMap<'K, 'V> with

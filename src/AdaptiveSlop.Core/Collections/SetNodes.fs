@@ -428,7 +428,7 @@ type OfAvalSetNode<'T, 'S when 'T: equality and 'S :> seq<'T>>(value: IAdaptiveV
                 // source only when it changed (a stuck version makes
                 // derived nodes stale forever).
                 state.Version <- state.Version + 1L
-                Collections.pushAndMarkSet state.Out state.Sinks state.Edges
+                Collections.pushAndMarkSet state.Out &state.Sinks state.Edges
                 state.Out.Clear()
 
             state.DepVersions[0] <- value.Version
@@ -505,7 +505,7 @@ type ReaderSetNode<'T when 'T: equality>([<InlineIfLambda>] reader: unit -> Hash
 
             if Collections.rebuildSetDiff next &state then
                 state.Version <- state.Version + 1L
-                Collections.pushAndMarkSet state.Out state.Sinks state.Edges
+                Collections.pushAndMarkSet state.Out &state.Sinks state.Edges
                 state.Out.Clear()
 
     interface IAdaptiveSet<'T> with
@@ -601,7 +601,7 @@ type CustomSetNode<'T when 'T: equality>([<InlineIfLambda>] compute: IReadOnlySe
 
                 if not writer.IsEmpty then
                     state.Version <- state.Version + 1L
-                    Collections.pushAndMarkSet (writer.Snapshot()) state.Sinks state.Edges
+                    Collections.pushAndMarkSet (writer.Snapshot()) &state.Sinks state.Edges
 
                 writer.Clear()
 

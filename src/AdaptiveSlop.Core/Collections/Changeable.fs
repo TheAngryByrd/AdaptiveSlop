@@ -46,7 +46,7 @@ type ChangeableSet<'T>(initial: seq<'T>) =
     member private this.PushAndMark() =
         if not outDelta.IsEmpty then
             version <- version + 1L
-            Collections.pushAndMarkSet outDelta sinks edges
+            Collections.pushAndMarkSet outDelta &sinks edges
             outDelta.Clear()
 
     member private this.Apply(newValue: seq<'T>) =
@@ -259,7 +259,7 @@ type ChangeableMap<'K, 'V when 'K: equality>(initial: seq<'K * 'V>) =
     member private this.PushAndMark() =
         if not outDelta.IsEmpty then
             version <- version + 1L
-            Collections.pushAndMarkMap outDelta sinks edges
+            Collections.pushAndMarkMap outDelta &sinks edges
             outDelta.Clear()
 
     member private this.Apply(newValue: seq<'K * 'V>) =
@@ -530,7 +530,7 @@ type ChangeableList<'T>(initial: seq<'T>) =
     member private this.PushAndMark() =
         if not outDelta.IsEmpty then
             version <- version + 1L
-            Collections.pushAndMarkList outDelta sinks edges
+            Collections.pushAndMarkList outDelta &sinks edges
             outDelta.Clear()
 
     member private this.JournalOp(op: ListOp<'T>) =

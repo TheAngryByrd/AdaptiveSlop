@@ -399,11 +399,19 @@ type internal IListSinkRegistry =
 /// operations, so reentrant sink growth during delivery is safe.
 /// </summary>
 [<Struct>]
+/// <summary>
+/// The sink list of a source. Entries are <see cref="WeakReference"/>: a
+/// derived node the user dropped (and that is not observed) is collected, and
+/// delivery skips its dead entry (FDA precedent: <c>WeakOutputSet</c> stores
+/// <c>WeakReference&lt;IAdaptiveObject&gt;</c>, Core.fs:210-219). A live sink
+/// is strongly reachable through its owner (the user, an observation, or a
+/// downstream node), so delivery always resolves it.
+/// </summary>
 type internal SinkList =
-    val mutable Sinks: obj[]
+    val mutable Sinks: WeakReference[]
     val mutable Count: int
 
-    new(sinks: obj[], count: int) = { Sinks = sinks; Count = count }
+    new(sinks: WeakReference[], count: int) = { Sinks = sinks; Count = count }
 
     static member Create() = SinkList(Array.zeroCreate 4, 0)
 
@@ -577,19 +585,38 @@ module internal Collections =
         Array.Copy(ops, 0, journal.Ops.Items, journal.Ops.Count, opCnt)
         journal.Ops.Count <- journal.Ops.Count + opCnt
 
-    /// Register a sink. Returns nothing; the caller decides when to unregister.
+    /// Drop dead sink entries (their node was collected). Runs at the start of
+    /// every delivery and on registration: swap-pop is safe here because no
+    /// user code can interleave. Amortized O(1) per dead entry, zero
+    /// allocation.
+    let inline compactDeadSinks (sinks: SinkList byref) =
+        let mutable i = 0
+
+        while i < sinks.Count do
+            if isNull sinks.Sinks[i].Target then
+                sinks.Sinks[i] <- sinks.Sinks[sinks.Count - 1]
+                sinks.Sinks[sinks.Count - 1] <- null
+                sinks.Count <- sinks.Count - 1
+            else
+                i <- i + 1
+
+    /// Register a sink (weakly). Returns nothing; the caller decides when to
+    /// unregister. One WeakReference per registration (amortized edge
+    /// formation, not a hot path). Dead entries are swept on registration so
+    /// the list does not accumulate between deliveries.
     let inline addSink (sinks: SinkList byref) (sink: obj) =
+        compactDeadSinks &sinks
         ensureCapacity &sinks.Sinks (sinks.Count + 1)
-        sinks.Sinks[sinks.Count] <- sink
+        sinks.Sinks[sinks.Count] <- WeakReference(sink)
         sinks.Count <- sinks.Count + 1
 
-    /// Remove a sink by identity.
+    /// Remove a sink by identity (matches the weak entry's target).
     let removeSink (sinks: SinkList byref) (sink: obj) =
         let mutable found = -1
         let mutable i = 0
 
         while found < 0 && i < sinks.Count do
-            if obj.ReferenceEquals(sinks.Sinks[i], sink) then
+            if obj.ReferenceEquals(sinks.Sinks[i].Target, sink) then
                 found <- i
             else
                 i <- i + 1
@@ -638,43 +665,65 @@ module internal Collections =
         else
             struct (state, false)
 
-    /// Push a set delta to every registered sink. The sink list is copied, so
-    /// reentrant sink growth during delivery is safe.
-    let pushSetDelta (sinks: SinkList) (delta: SetDelta<'T>) =
+    /// Push a set delta to every registered sink. The batch delivers only to
+    /// the sinks registered at the start (bound captured): a sink registered
+    /// reentrantly during delivery is not delivered, because its init snapshot
+    /// already reflects the change (register between snapshot and load) and
+    /// delivering would double-apply. Dead entries are compacted before the
+    /// loop; an entry that dies mid-delivery (a GC inside user code) is
+    /// skipped and compacted by the next delivery. The resolved target is
+    /// rooted by the local, so a mid-delivery GC cannot collect it.
+    let pushSetDelta (sinks: SinkList byref) (delta: SetDelta<'T>) =
         if not delta.IsEmpty then
+            compactDeadSinks &sinks
             let adds = delta.Adds.Items
             let addCnt = delta.Adds.Count
             let rems = delta.Rems.Items
             let remCnt = delta.Rems.Count
+            let bound = sinks.Count
+            let mutable i = 0
 
-            for i in 0 .. sinks.Count - 1 do
-                (unbox<ISetDeltaSink<'T>> sinks.Sinks[i]).OnDeltas(adds, addCnt, rems, remCnt)
+            while i < bound do
+                let target = sinks.Sinks[i].Target
 
-    /// Push a map delta to every registered sink. The sink list is copied, so
-    /// reentrant sink growth during delivery is safe.
-    let pushMapDelta (sinks: SinkList) (delta: MapDelta<'K, 'V>) =
+                if not (isNull target) then
+                    (unbox<ISetDeltaSink<'T>> target).OnDeltas(adds, addCnt, rems, remCnt)
+
+                i <- i + 1
+
+    /// Push a map delta to every registered sink. See <see cref="pushSetDelta"/>
+    /// for the dead-entry and reentrancy handling.
+    let pushMapDelta (sinks: SinkList byref) (delta: MapDelta<'K, 'V>) =
         if not delta.IsEmpty then
+            compactDeadSinks &sinks
             let sets = delta.Sets.Items
             let setCnt = delta.Sets.Count
             let rems = delta.Rems.Items
             let remCnt = delta.Rems.Count
+            let bound = sinks.Count
+            let mutable i = 0
 
-            for i in 0 .. sinks.Count - 1 do
-                (unbox<IMapDeltaSink<'K, 'V>> sinks.Sinks[i]).OnDeltas(sets, setCnt, rems, remCnt)
+            while i < bound do
+                let target = sinks.Sinks[i].Target
+
+                if not (isNull target) then
+                    (unbox<IMapDeltaSink<'K, 'V>> target).OnDeltas(sets, setCnt, rems, remCnt)
+
+                i <- i + 1
 
     /// Push a delta and mark the scalar parents of a source, with notification
     /// delivery deferred to the end of the operation (PLAN.md Section 6.5).
     /// A throwing sink is isolated: the parents are still marked (the state
     /// already moved and downstream nodes must re-read), and the exception is
     /// rethrown after marking and delivery.
-    let pushAndMarkSet (delta: SetDelta<'T>) (sinks: SinkList) (edges: ParentEdges) =
+    let pushAndMarkSet (delta: SetDelta<'T>) (sinks: SinkList byref) (edges: ParentEdges) =
         let ctx = GraphContext.Default
         let wasActive = ctx.TxActive
         ctx.TxActive <- true
 
         let firstEx =
             try
-                pushSetDelta sinks delta
+                pushSetDelta &sinks delta
                 None
             with e ->
                 Some e
@@ -696,14 +745,14 @@ module internal Collections =
     /// A throwing sink is isolated: the parents are still marked (the state
     /// already moved and downstream nodes must re-read), and the exception is
     /// rethrown after marking and delivery.
-    let pushAndMarkMap (delta: MapDelta<'K, 'V>) (sinks: SinkList) (edges: ParentEdges) =
+    let pushAndMarkMap (delta: MapDelta<'K, 'V>) (sinks: SinkList byref) (edges: ParentEdges) =
         let ctx = GraphContext.Default
         let wasActive = ctx.TxActive
         ctx.TxActive <- true
 
         let firstEx =
             try
-                pushMapDelta sinks delta
+                pushMapDelta &sinks delta
                 None
             with e ->
                 Some e
@@ -720,27 +769,36 @@ module internal Collections =
         | Some e -> raise e
         | None -> ()
 
-    /// Push a list delta to every registered sink.
-    let pushListDelta (sinks: SinkList) (delta: ListDelta<'T>) =
+    /// Push a list delta to every registered sink. See <see cref="pushSetDelta"/>
+    /// for the dead-entry and reentrancy handling.
+    let pushListDelta (sinks: SinkList byref) (delta: ListDelta<'T>) =
+        compactDeadSinks &sinks
         let ops = delta.Ops.Items
         let opCnt = delta.Ops.Count
+        let bound = sinks.Count
+        let mutable i = 0
 
-        for i in 0 .. sinks.Count - 1 do
-            (unbox<IListDeltaSink<'T>> sinks.Sinks[i]).OnDeltas(ops, opCnt)
+        while i < bound do
+            let target = sinks.Sinks[i].Target
+
+            if not (isNull target) then
+                (unbox<IListDeltaSink<'T>> target).OnDeltas(ops, opCnt)
+
+            i <- i + 1
 
     /// Push a delta and mark the scalar parents of a source, with notification
     /// delivery deferred to the end of the operation (PLAN.md Section 6.5).
     /// A throwing sink is isolated: the parents are still marked (the state
     /// already moved and downstream nodes must re-read), and the exception is
     /// rethrown after marking and delivery.
-    let pushAndMarkList (delta: ListDelta<'T>) (sinks: SinkList) (edges: ParentEdges) =
+    let pushAndMarkList (delta: ListDelta<'T>) (sinks: SinkList byref) (edges: ParentEdges) =
         let ctx = GraphContext.Default
         let wasActive = ctx.TxActive
         ctx.TxActive <- true
 
         let firstEx =
             try
-                pushListDelta sinks delta
+                pushListDelta &sinks delta
                 None
             with e ->
                 Some e
@@ -982,7 +1040,7 @@ module internal Collections =
             state <- s2
 
             if changed then
-                pushSetDelta state.Sinks state.Out
+                pushSetDelta &state.Sinks state.Out
                 state.Out.Clear()
         finally
             ctx.TxActive <- wasActive
@@ -1001,7 +1059,7 @@ module internal Collections =
             state <- s2
 
             if changed then
-                pushSetDelta state.Sinks state.Out
+                pushSetDelta &state.Sinks state.Out
                 state.Out.Clear()
         finally
             ctx.TxActive <- wasActive
@@ -1021,7 +1079,7 @@ module internal Collections =
             state <- s2
 
             if changed then
-                pushMapDelta state.Sinks state.Out
+                pushMapDelta &state.Sinks state.Out
                 state.Out.Clear()
         finally
             ctx.TxActive <- wasActive
@@ -1372,7 +1430,7 @@ module internal Collections =
             state <- s2
 
             if changed then
-                pushSetDelta state.Sinks state.OutDelta
+                pushSetDelta &state.Sinks state.OutDelta
                 state.OutDelta.Clear()
         finally
             ctx.TxActive <- wasActive
@@ -1743,7 +1801,7 @@ module internal Collections =
             state <- s2
 
             if changed then
-                pushMapDelta state.Sinks state.OutDelta
+                pushMapDelta &state.Sinks state.OutDelta
                 state.OutDelta.Clear()
         finally
             ctx.TxActive <- wasActive
@@ -2173,7 +2231,7 @@ module internal Collections =
             state <- s2
 
             if changed then
-                pushSetDelta state.Sinks state.OutDelta
+                pushSetDelta &state.Sinks state.OutDelta
                 state.OutDelta.Clear()
         finally
             ctx.TxActive <- wasActive
@@ -2292,7 +2350,7 @@ module internal Collections =
             state <- s2
 
             if changed then
-                pushSetDelta state.Sinks state.OutDelta
+                pushSetDelta &state.Sinks state.OutDelta
                 state.OutDelta.Clear()
         finally
             ctx.TxActive <- wasActive
@@ -2415,7 +2473,7 @@ module internal Collections =
             state <- s2
 
             if changed then
-                pushMapDelta state.Sinks state.OutDelta
+                pushMapDelta &state.Sinks state.OutDelta
                 state.OutDelta.Clear()
         finally
             ctx.TxActive <- wasActive
