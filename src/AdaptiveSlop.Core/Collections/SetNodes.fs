@@ -23,7 +23,7 @@ module private Id =
     let inline identityV x = ValueSome x
 
 /// <summary>An adaptive set over a fixed, immutable value. The value is computed once, at first read.</summary>
-type ConstantSet<'T>(create: unit -> FrozenSet<'T>) =
+type ConstantSet<'T>([<InlineIfLambda>] create: unit -> FrozenSet<'T>) =
     let value = lazy create ()
 
     interface IAdaptiveSet<'T> with
@@ -41,7 +41,7 @@ type ConstantSet<'T>(create: unit -> FrozenSet<'T>) =
 /// <c>ValueNone</c> to drop an element). Duplicate outputs share one reference
 /// count.
 /// </summary>
-type MapSetNode<'T, 'U when 'U: equality>(source: IAdaptiveSet<'T>, mapping: 'T -> 'U voption) =
+type MapSetNode<'T, 'U when 'U: equality>(source: IAdaptiveSet<'T>, [<InlineIfLambda>] mapping: 'T -> 'U voption) =
     let mutable state = SetNodeState<'T, 'U>.Create(1)
     let mutable initialized = false
     let mutable disposed = false
@@ -474,7 +474,7 @@ type OfAvalSetNode<'T, 'S when 'T: equality and 'S :> seq<'T>>(value: IAdaptiveV
 /// the diff as the delta. Pull-based: nothing marks this node, so consumers
 /// must re-read it (FDA <c>ASet.ofReader</c> has the same pull model).
 /// </summary>
-type ReaderSetNode<'T when 'T: equality>(reader: unit -> HashSet<'T>) =
+type ReaderSetNode<'T when 'T: equality>([<InlineIfLambda>] reader: unit -> HashSet<'T>) =
     let mutable state = SetNodeState<'T, 'T>.Create(0)
     let mutable disposed = false
 
@@ -532,7 +532,7 @@ type ReaderSetNode<'T when 'T: equality>(reader: unit -> HashSet<'T>) =
 /// queue, for example). Called on every read (poll), like
 /// <see cref="ReaderSetNode"/>. FDA <c>ASet.custom</c> parity, pull model.
 /// </summary>
-type CustomSetNode<'T when 'T: equality>(compute: IReadOnlySet<'T> -> SetDeltaBuilder<'T> -> unit) =
+type CustomSetNode<'T when 'T: equality>([<InlineIfLambda>] compute: IReadOnlySet<'T> -> SetDeltaBuilder<'T> -> unit) =
     let mutable state = SetNodeState<'T, 'T>.Create(0)
     let writer = SetDeltaBuilder<'T>()
     let mutable disposed = false
@@ -602,7 +602,7 @@ type CustomSetNode<'T when 'T: equality>(compute: IReadOnlySet<'T> -> SetDeltaBu
 /// everything.
 /// </summary>
 type CollectSetNode<'T, 'U when 'T: equality and 'U: equality>
-    (source: IAdaptiveSet<'T>, mapping: 'T -> IAdaptiveSet<'U>) =
+    (source: IAdaptiveSet<'T>, [<InlineIfLambda>] mapping: 'T -> IAdaptiveSet<'U>) =
     let mutable state = Collections.CollectState<'T, 'U>.Create(1)
     let mutable initialized = false
     let mutable disposed = false
@@ -753,7 +753,8 @@ type CollectSetNode<'T, 'U when 'T: equality and 'U: equality>
 /// ANALYSIS-FDA.md Pitfall 1). The inner set's own changes flow through a
 /// journal. Registration is lazy (first read); disposal unregisters everything.
 /// </summary>
-type BindSetNode<'T, 'U when 'U: equality>(value: IAdaptiveValue<'T>, mapping: 'T -> IAdaptiveSet<'U>) =
+type BindSetNode<'T, 'U when 'U: equality>
+    (value: IAdaptiveValue<'T>, [<InlineIfLambda>] mapping: 'T -> IAdaptiveSet<'U>) =
     let mutable state = Collections.BindSetState<'U>.Create(1)
     let mutable inner: IAdaptiveSet<'U> = Unchecked.defaultof<IAdaptiveSet<'U>>
     let mutable hasInner = false

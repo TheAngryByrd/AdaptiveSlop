@@ -31,6 +31,9 @@ type IAdaptiveSet<'T> =
     inherit IDisposable
     abstract member GetValue: unit -> IReadOnlySet<'T>
 
+/// <summary>An abbreviation for <see cref="IAdaptiveSet&lt;'T&gt;"/> (FDA <c>aset&lt;'T&gt;</c> parity).</summary>
+type aset<'T> = IAdaptiveSet<'T>
+
 /// <summary>
 /// An adaptive map: either a changeable source or a derived node. See
 /// <see cref="IAdaptiveSet&lt;'T&gt;"/> for the view and disposal contracts.
@@ -39,6 +42,9 @@ type IAdaptiveMap<'K, 'V when 'K: equality> =
     inherit IAdaptiveObject
     inherit IDisposable
     abstract member GetValue: unit -> IReadOnlyDictionary<'K, 'V>
+
+/// <summary>An abbreviation for <see cref="IAdaptiveMap&lt;'K,'V&gt;"/> (FDA <c>amap&lt;'K,'V&gt;</c> parity).</summary>
+type amap<'K, 'V when 'K: equality> = IAdaptiveMap<'K, 'V>
 
 /// <summary>
 /// Internal. Receives deltas from a set dependency. The implementation appends
@@ -401,6 +407,7 @@ type internal MapNodeState<'K, 'V, 'U when 'K: equality> =
 /// The binary set operation of <see cref="TwoSourceSetNode&lt;'T&gt;"/>:
 /// difference (left minus right), intersection, or symmetric difference.
 /// </summary>
+[<Struct>]
 type TwoSetOp =
     | Difference
     | Intersect
@@ -1600,10 +1607,10 @@ module internal Collections =
                 ParentEdges(),
                 SinkList.Create(),
                 Array.zeroCreate depCount,
-                SetDelta.Create(),
+                SetDelta<_>.Create(),
                 Dictionary<'T, CollectEntry<'U>>(),
                 RefCountedSet.Create(),
-                SetDelta.Create()
+                SetDelta<_>.Create()
             )
 
     /// <summary>
@@ -1832,9 +1839,9 @@ module internal Collections =
                 ParentEdges(),
                 SinkList.Create(),
                 Array.zeroCreate depCount,
-                SetDelta.Create(),
+                SetDelta<_>.Create(),
                 HashSet<'U>(),
-                SetDelta.Create()
+                SetDelta<_>.Create()
             )
 
     /// <summary>
@@ -1950,9 +1957,9 @@ module internal Collections =
                 ParentEdges(),
                 SinkList.Create(),
                 Array.zeroCreate depCount,
-                MapDelta.Create(),
+                MapDelta<_, _>.Create(),
                 Dictionary<'K, 'V>(),
-                MapDelta.Create()
+                MapDelta<_, _>.Create()
             )
 
     /// <summary>

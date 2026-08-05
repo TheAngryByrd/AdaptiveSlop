@@ -45,14 +45,21 @@ type AdaptiveReduction<'a, 's, 'v> =
 module AdaptiveReduction =
 
     /// <summary>Maps the observed value of a reduction.</summary>
-    let inline mapOut (mapping: 'v -> 'w) (reduction: AdaptiveReduction<'a, 's, 'v>) : AdaptiveReduction<'a, 's, 'w> =
+    let inline mapOut
+        ([<InlineIfLambda>] mapping: 'v -> 'w)
+        (reduction: AdaptiveReduction<'a, 's, 'v>)
+        : AdaptiveReduction<'a, 's, 'w> =
         { seed = reduction.seed
           add = reduction.add
           sub = reduction.sub
           view = fun s -> mapping (reduction.view s) }
 
     /// <summary>A reduction with an invertible subtract operation.</summary>
-    let inline group (zero: 's) (add: 's -> 'a -> 's) (subtract: 's -> 'a -> 's) : AdaptiveReduction<'a, 's, 's> =
+    let inline group
+        (zero: 's)
+        ([<InlineIfLambda>] add: 's -> 'a -> 's)
+        (subtract: 's -> 'a -> 's)
+        : AdaptiveReduction<'a, 's, 's> =
         { seed = zero
           add = add
           sub = fun s a -> ValueSome(subtract s a)
@@ -61,7 +68,7 @@ module AdaptiveReduction =
     /// <summary>A reduction whose subtract may fall back to a full recompute.</summary>
     let inline halfGroup
         (zero: 's)
-        (add: 's -> 'a -> 's)
+        ([<InlineIfLambda>] add: 's -> 'a -> 's)
         (trySubtract: 's -> 'a -> 's voption)
         : AdaptiveReduction<'a, 's, 's> =
         { seed = zero
@@ -70,7 +77,7 @@ module AdaptiveReduction =
           view = id }
 
     /// <summary>A reduction that recomputes the whole state on every removal.</summary>
-    let inline fold (zero: 's) (add: 's -> 'a -> 's) : AdaptiveReduction<'a, 's, 's> =
+    let inline fold (zero: 's) ([<InlineIfLambda>] add: 's -> 'a -> 's) : AdaptiveReduction<'a, 's, 's> =
         { seed = zero
           add = add
           sub = fun _ _ -> ValueNone
@@ -126,7 +133,7 @@ module AdaptiveReduction =
 /// Implements the scalar protocol: version, parent edges, dependency snapshot.
 /// </summary>
 type SetReduceNode<'a, 'b, 's, 'v when 'a: equality>
-    (source: IAdaptiveSet<'a>, mapping: 'a -> 'b, reduction: AdaptiveReduction<'b, 's, 'v>) =
+    (source: IAdaptiveSet<'a>, [<InlineIfLambda>] mapping: 'a -> 'b, reduction: AdaptiveReduction<'b, 's, 'v>) =
     let mutable version = 0L
     let mutable edges = ParentEdges()
     let mutable depVersions = [| 0L |]
@@ -270,7 +277,8 @@ type SetReduceNode<'a, 'b, 's, 'v when 'a: equality>
 /// mapped value). The mapping is applied per journal element at drain time.
 /// </summary>
 type MapReduceNode<'k, 'a, 'b, 's, 'v when 'k: equality>
-    (source: IAdaptiveMap<'k, 'a>, mapping: 'k -> 'a -> 'b, reduction: AdaptiveReduction<'b, 's, 'v>) =
+    (source: IAdaptiveMap<'k, 'a>, [<InlineIfLambda>] mapping: 'k -> 'a -> 'b, reduction: AdaptiveReduction<'b, 's, 'v>)
+    =
     let mutable version = 0L
     let mutable edges = ParentEdges()
     let mutable depVersions = [| 0L |]

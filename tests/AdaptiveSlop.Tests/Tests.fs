@@ -1588,7 +1588,7 @@ let ``collections accept element types without comparison`` () =
 let ``derived collections register lazily and dispose cleanly`` () =
     let source = CSet.ofSeq [ 1; 2 ]
     let mapped = ASet.map (fun v -> v * 2) (CSet.value source)
-    let cs = source :> AdaptiveSlop.Core.ChangeableSet<int>
+    let cs = source
     Assert.Equal(0, cs.SinkCount) // not read yet: no registration
 
     let _ = ASet.toSet mapped // first read: registers
@@ -2322,7 +2322,7 @@ let ``ASet choose keeps only mapped values`` () =
     let source = CSet.ofSeq [ 1; 2; 3; 4 ]
 
     let chosen =
-        ASet.choose (fun x -> if x % 2 = 0 then ValueSome(x * 10) else ValueNone) (CSet.value source)
+        ASet.chooseV (fun x -> if x % 2 = 0 then ValueSome(x * 10) else ValueNone) (CSet.value source)
 
     Assert.Equal<Set<_>>(Set.ofList [ 20; 40 ], Set.ofSeq (ASet.force chosen))
 
@@ -2468,7 +2468,7 @@ let ``AMap choose2 matches a reference model under random churn`` () =
 
     // The mapping: union of both sides; on conflict the right value wins.
     let m =
-        AMap.choose2
+        AMap.choose2V
             (fun _ l r ->
                 match l, r with
                 | ValueSome lv, ValueSome rv -> ValueSome rv
@@ -2502,7 +2502,7 @@ let ``AMap choose2 matches a reference model under random churn`` () =
     // a removal of a key that has no value on either side must not crash even
     // for a mapping that pattern-matches only Some/Some.
     let strict =
-        AMap.choose2
+        AMap.choose2V
             (fun _ l r ->
                 match l, r with
                 | ValueSome lv, ValueSome rv -> ValueSome(struct (lv, rv))
@@ -2994,8 +2994,8 @@ let ``collect and bind dispose cleanly`` () =
     let collected = ASet.collect (fun _ -> CSet.value inner) (CSet.value source)
 
     ASet.toSet collected |> ignore
-    let cs = source :> AdaptiveSlop.Core.ChangeableSet<int>
-    let ci = inner :> AdaptiveSlop.Core.ChangeableSet<int>
+    let cs = source
+    let ci = inner
     Assert.Equal(1, cs.SinkCount)
     Assert.Equal(2, ci.SinkCount) // one sink per source element
 
@@ -3017,10 +3017,10 @@ let ``collect and bind dispose cleanly`` () =
     let buckets = [| CSet.ofSeq [ 1 ]; CSet.ofSeq [ 2 ] |]
     let bound = ASet.bind (fun i -> CSet.value buckets[i]) (CVal.value selected)
     ASet.toSet bound |> ignore
-    Assert.Equal(1, (buckets[0] :> AdaptiveSlop.Core.ChangeableSet<int>).SinkCount)
+    Assert.Equal(1, buckets[0].SinkCount)
 
     (bound :> IDisposable).Dispose()
-    Assert.Equal(0, (buckets[0] :> AdaptiveSlop.Core.ChangeableSet<int>).SinkCount)
+    Assert.Equal(0, buckets[0].SinkCount)
 
     Assert.Throws<InvalidOperationException>(fun () -> ASet.toSet bound |> ignore)
     |> ignore
@@ -3090,3 +3090,154 @@ let ``write during a drain is deferred to the next read`` () =
 // NOTE: reading a node from inside its own mapping is out of contract
 // (undefined in FDA as well). Writes during a drain are supported: they
 // land in the journal via the compaction markers and apply exactly once.
+
+// =============================================================================
+// FDA public API parity (docs/PARITY-FDA.md)
+// =============================================================================
+
+[<Fact>]
+let ``type aliases are usable in signature positions`` () =
+    // FDA parity: aval/cval/aset/cset/amap/cmap abbreviations resolve to our
+    // interfaces and changeable types.
+    let v: aval<int> = AVal.constant 1
+    let c: cval<int> = CVal.create 2
+    let s: aset<int> = ASet.empty
+    let cs: cset<int> = CSet.empty
+    let m: amap<string, int> = AMap.empty
+    let cm: cmap<string, int> = CMap.empty
+
+    // The aliases are the same types as the long names: cross-assignment works.
+    let v2: IAdaptiveValue<int> = v
+    let c2: ChangeableValue<int> = c
+    let s2: IAdaptiveSet<int> = s
+    let cs2: ChangeableSet<int> = cs
+    let m2: IAdaptiveMap<string, int> = m
+    let cm2: ChangeableMap<string, int> = cm
+
+    Assert.Equal(1, v2.GetValue())
+    Assert.Equal(2, c2.GetValue()) // concrete cval exposes GetValue (FDA parity)
+    Assert.Equal(0, s2.GetValue().Count)
+    Assert.Equal(0, (ASet.getValue cs2).Count)
+    Assert.Equal(0, m2.GetValue().Count)
+    Assert.Equal(0, (AMap.getValue cm2).Count)
+
+[<Fact>]
+let ``AVal force and init match FDA`` () =
+    let c = AVal.init 5
+    Assert.Equal(5, AVal.force c)
+    CVal.set 6 c
+    Assert.Equal(6, AVal.force c)
+    // force is getValue under another name.
+    Assert.Equal(AVal.getValue c, AVal.force c)
+
+[<Fact>]
+let ``AVal delay computes once on first read`` () =
+    let mutable count = 0
+
+    let v: aval<int> =
+        AVal.delay (fun () ->
+            count <- count + 1
+            42)
+
+    Assert.Equal(0, count) // not computed at construction
+    Assert.Equal(42, AVal.getValue v)
+    Assert.Equal(42, AVal.getValue v)
+    Assert.Equal(1, count) // computed exactly once
+
+[<Fact>]
+let ``AVal bind2 and bind3 switch inner values`` () =
+    let a = CVal.create 1
+    let b = CVal.create 10
+    let i1 = CVal.create 100
+    let i2 = CVal.create 200
+    let i3 = CVal.create 300
+
+    let v2 =
+        AVal.bind2 (fun x y -> if x + y > 15 then CVal.value i2 else CVal.value i1) (CVal.value a) (CVal.value b)
+
+    Assert.Equal(100, AVal.getValue v2) // 1 + 10 <= 15 -> i1
+    CVal.set 6 a // 6 + 10 > 15 -> switch to i2
+    Assert.Equal(200, AVal.getValue v2)
+    CVal.set 1 a // switch back
+    Assert.Equal(100, AVal.getValue v2)
+
+    let v3 =
+        AVal.bind3
+            (fun x y z -> if x + y + z > 25 then CVal.value i3 else CVal.value i1)
+            (CVal.value a)
+            (CVal.value b)
+            (CVal.value a)
+
+    Assert.Equal(100, AVal.getValue v3) // 1 + 10 + 1 <= 25 -> i1
+    CVal.set 8 a // 8 + 10 + 8 > 25 -> switch to i3
+    Assert.Equal(300, AVal.getValue v3)
+
+[<Fact>]
+let ``AVal custom computes lazily and caches`` () =
+    let mutable counter = 0
+
+    let v: aval<int> =
+        AVal.custom (fun () ->
+            counter <- counter + 1
+            counter)
+
+    Assert.Equal(0, counter) // not computed at construction
+    Assert.Equal(1, AVal.getValue v)
+    Assert.Equal(1, AVal.getValue v)
+    Assert.Equal(1, counter) // cached: computes once per change
+
+[<Fact>]
+let ``cval Value property and UpdateTo`` () =
+    let c = CVal.create 1
+    Assert.Equal(1, c.Value)
+    c.Value <- 2
+    Assert.Equal(2, AVal.getValue (CVal.value c))
+    // UpdateTo returns whether the value changed.
+    Assert.True(c.UpdateTo 3)
+    Assert.Equal(3, c.Value)
+    Assert.False(c.UpdateTo 3)
+    Assert.False(c.UpdateTo 3)
+
+[<Fact>]
+let ``cval Value set inside a transaction defers`` () =
+    let c = CVal.create 1
+    let mutable delivered = 0
+    use obs = AVal.observe (fun _ -> delivered <- delivered + 1) (CVal.value c)
+
+    Transaction.run (fun () -> c.Value <- 2)
+    Assert.Equal(1, delivered) // one notification for the batch
+    Assert.Equal(2, AVal.getValue (CVal.value c))
+
+[<Fact>]
+let ``ASet empty and AMap empty are empty and never mark`` () =
+    let s: aset<int> = ASet.empty
+    let m: amap<string, int> = AMap.empty
+    Assert.Equal(0, s.GetValue().Count)
+    Assert.Equal(0, m.GetValue().Count)
+    Assert.Equal(0L, (s :> IAdaptiveObject).Version)
+    Assert.Equal(0L, (m :> IAdaptiveObject).Version)
+
+[<Fact>]
+let ``AMap constant and delay compute the creator once`` () =
+    let mutable count = 0
+
+    let mk () =
+        count <- count + 1
+        Dictionary(dict [ "a", 1 ])
+
+    let m: amap<string, int> = AMap.constant mk
+    Assert.Equal(0, count)
+    Assert.Equal(1, m.GetValue().Count)
+    Assert.Equal(1, m.GetValue().Count)
+    Assert.Equal(1, count)
+
+    let mutable count2 = 0
+
+    let d: amap<string, int> =
+        AMap.delay (fun () ->
+            count2 <- count2 + 1
+            Dictionary())
+
+    Assert.Equal(0, count2)
+    Assert.Equal(0, d.GetValue().Count)
+    Assert.Equal(1, count2)

@@ -12,7 +12,7 @@ open System.Collections.Frozen
 // =============================================================================
 
 /// <summary>An adaptive map over a fixed, immutable value. The value is computed once, at first read.</summary>
-type ConstantMap<'K, 'V when 'K: equality>(create: unit -> FrozenDictionary<'K, 'V>) =
+type ConstantMap<'K, 'V when 'K: equality>([<InlineIfLambda>] create: unit -> FrozenDictionary<'K, 'V>) =
     let value = lazy create ()
 
     interface IAdaptiveMap<'K, 'V> with
@@ -29,7 +29,8 @@ type ConstantMap<'K, 'V when 'K: equality>(create: unit -> FrozenDictionary<'K, 
 /// Maps every entry of a map (or chooses, when the mapping returns
 /// <c>ValueNone</c> to drop an entry).
 /// </summary>
-type MapMapNode<'K, 'V, 'U when 'K: equality>(source: IAdaptiveMap<'K, 'V>, mapping: 'K -> 'V -> 'U voption) =
+type MapMapNode<'K, 'V, 'U when 'K: equality>
+    (source: IAdaptiveMap<'K, 'V>, [<InlineIfLambda>] mapping: 'K -> 'V -> 'U voption) =
     let mutable state = MapNodeState<'K, 'V, 'U>.Create(1)
     let mutable initialized = false
     let mutable disposed = false
@@ -200,8 +201,11 @@ type FilterMapNode<'K, 'V when 'K: equality>
 /// value; the sides' current values are tracked per key.
 /// </summary>
 type Choose2MapNode<'K, 'V1, 'V2, 'V3 when 'K: equality>
-    (left: IAdaptiveMap<'K, 'V1>, right: IAdaptiveMap<'K, 'V2>, mapping: 'K -> 'V1 voption -> 'V2 voption -> 'V3 voption)
-    =
+    (
+        left: IAdaptiveMap<'K, 'V1>,
+        right: IAdaptiveMap<'K, 'V2>,
+        [<InlineIfLambda>] mapping: 'K -> 'V1 voption -> 'V2 voption -> 'V3 voption
+    ) =
     let deps: IAdaptiveObject[] =
         [| left :> IAdaptiveObject; right :> IAdaptiveObject |]
 
@@ -359,8 +363,8 @@ type internal SetToMapState<'K, 'V, 'T when 'K: equality> =
             SinkList.Create(),
             Array.zeroCreate depCount,
             Dictionary<'K, 'V>(),
-            SetDelta.Create(),
-            MapDelta.Create()
+            SetDelta<_>.Create(),
+            MapDelta<_, _>.Create()
         )
 
 /// <summary>
@@ -369,7 +373,8 @@ type internal SetToMapState<'K, 'V, 'T when 'K: equality> =
 /// removal of an entry whose value is not the current one is a no-op (gated).
 /// <c>mapSet</c> uses an unconditional removal (a set key appears once).
 /// </summary>
-type SetToMapNode<'K, 'V, 'T when 'K: equality>(source: IAdaptiveSet<'T>, toEntry: 'T -> 'K * 'V, gated: bool) =
+type SetToMapNode<'K, 'V, 'T when 'K: equality>
+    (source: IAdaptiveSet<'T>, [<InlineIfLambda>] toEntry: 'T -> 'K * 'V, gated: bool) =
     let mutable state = SetToMapState<'K, 'V, 'T>.Create(1)
     let mutable initialized = false
     let mutable disposed = false
@@ -563,8 +568,8 @@ type internal SetToMapKeepAllState<'K, 'V, 'T when 'K: equality> =
             SinkList.Create(),
             Array.zeroCreate depCount,
             Dictionary<'K, HashSet<'V>>(),
-            SetDelta.Create(),
-            MapDelta.Create()
+            SetDelta<_>.Create(),
+            MapDelta<_, _>.Create()
         )
 
 /// <summary>
@@ -573,7 +578,8 @@ type internal SetToMapKeepAllState<'K, 'V, 'T when 'K: equality> =
 /// fresh HashSet in the delta (reference identity: downstream nodes compare
 /// stored values by equality).
 /// </summary>
-type SetToMapKeepAllNode<'K, 'V, 'T when 'K: equality>(source: IAdaptiveSet<'T>, toEntry: 'T -> 'K * 'V) =
+type SetToMapKeepAllNode<'K, 'V, 'T when 'K: equality>
+    (source: IAdaptiveSet<'T>, [<InlineIfLambda>] toEntry: 'T -> 'K * 'V) =
     let mutable state = SetToMapKeepAllState<'K, 'V, 'T>.Create(1)
     let mutable initialized = false
     let mutable disposed = false
@@ -787,8 +793,8 @@ type internal MapToSetState<'K, 'V, 'T when 'K: equality and 'T: equality> =
             Array.zeroCreate depCount,
             Dictionary<'K, 'T>(),
             RefCountedSet.Create(),
-            MapDelta.Create(),
-            SetDelta.Create()
+            MapDelta<_, _>.Create(),
+            SetDelta<_>.Create()
         )
 
 /// <summary>
@@ -797,7 +803,8 @@ type internal MapToSetState<'K, 'V, 'T when 'K: equality and 'T: equality> =
 /// one reference count: an entry removal drops the output element only when
 /// the last contributing entry disappears.
 /// </summary>
-type MapToSetNode<'K, 'V, 'T when 'K: equality and 'T: equality>(source: IAdaptiveMap<'K, 'V>, select: 'K -> 'V -> 'T) =
+type MapToSetNode<'K, 'V, 'T when 'K: equality and 'T: equality>
+    (source: IAdaptiveMap<'K, 'V>, [<InlineIfLambda>] select: 'K -> 'V -> 'T) =
     let mutable state = MapToSetState<'K, 'V, 'T>.Create(1)
     let mutable initialized = false
     let mutable disposed = false
@@ -1071,7 +1078,8 @@ type OfAvalMapNode<'K, 'V, 'S when 'K: equality and 'S :> seq<'K * 'V>>(value: I
 /// The compute receives the current view and a delta builder and appends the
 /// operations that describe the change since the previous call.
 /// </summary>
-type CustomMapNode<'K, 'V when 'K: equality>(compute: IReadOnlyDictionary<'K, 'V> -> MapDeltaBuilder<'K, 'V> -> unit) =
+type CustomMapNode<'K, 'V when 'K: equality>
+    ([<InlineIfLambda>] compute: IReadOnlyDictionary<'K, 'V> -> MapDeltaBuilder<'K, 'V> -> unit) =
     let mutable state = MapNodeState<'K, 'V, 'V>.Create(0)
     let writer = MapDeltaBuilder<'K, 'V>()
     let mutable disposed = false
@@ -1140,7 +1148,8 @@ type CustomMapNode<'K, 'V when 'K: equality>(compute: IReadOnlyDictionary<'K, 'V
 /// ANALYSIS-FDA.md Pitfall 1). The inner map's own changes flow through a
 /// journal. Registration is lazy (first read); disposal unregisters everything.
 /// </summary>
-type BindMapNode<'K, 'V, 'T when 'K: equality>(value: IAdaptiveValue<'T>, mapping: 'T -> IAdaptiveMap<'K, 'V>) =
+type BindMapNode<'K, 'V, 'T when 'K: equality>
+    (value: IAdaptiveValue<'T>, [<InlineIfLambda>] mapping: 'T -> IAdaptiveMap<'K, 'V>) =
     let mutable state = Collections.BindMapState<'K, 'V>.Create(1)
     let mutable inner: IAdaptiveMap<'K, 'V> = Unchecked.defaultof<IAdaptiveMap<'K, 'V>>
     let mutable hasInner = false

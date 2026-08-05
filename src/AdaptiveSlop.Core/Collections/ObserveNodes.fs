@@ -21,11 +21,11 @@ open System.Collections.Generic
 // =============================================================================
 
 /// <summary>
-/// Internal. A set observation: sink + edge parent on the target. Delivers
+/// A set observation: sink + edge parent on the target. Delivers
 /// (view, net delta) callbacks after each batch that changes the set.
 /// </summary>
-type internal ObserveSetNode<'T when 'T: equality>
-    (target: IAdaptiveSet<'T>, callback: IReadOnlySet<'T> -> SetDelta<'T> -> unit) as this =
+type ObserveSetNode<'T when 'T: equality>
+    (target: IAdaptiveSet<'T>, [<InlineIfLambda>] callback: IReadOnlySet<'T> -> SetDelta<'T> -> unit) =
     let mutable active = true
     let mutable enqueued = false
     let mutable indexInTarget = -1
@@ -88,7 +88,7 @@ type internal ObserveSetNode<'T when 'T: equality>
     /// as a delta sink (deltas). Called once from the observe API. The initial
     /// read registers lazy derived chains (Section 6.9) so that later marks
     /// reach this observation; no callback fires on attach.
-    member internal this.Attach() =
+    member this.Attach() =
         target.GetValue() |> ignore
 
         match target with
@@ -155,11 +155,12 @@ type internal ObserveSetNode<'T when 'T: equality>
                 | _ -> ()
 
 /// <summary>
-/// Internal. A map observation: sink + edge parent on the target. Delivers
+/// A map observation: sink + edge parent on the target. Delivers
 /// (view, net delta) callbacks after each batch that changes the map.
 /// </summary>
-type internal ObserveMapNode<'K, 'V when 'K: equality>
-    (target: IAdaptiveMap<'K, 'V>, callback: IReadOnlyDictionary<'K, 'V> -> MapDelta<'K, 'V> -> unit) as this =
+type ObserveMapNode<'K, 'V when 'K: equality>
+    (target: IAdaptiveMap<'K, 'V>, [<InlineIfLambda>] callback: IReadOnlyDictionary<'K, 'V> -> MapDelta<'K, 'V> -> unit)
+    =
     let mutable active = true
     let mutable enqueued = false
     let mutable indexInTarget = -1
@@ -228,7 +229,7 @@ type internal ObserveMapNode<'K, 'V when 'K: equality>
     /// as a delta sink (deltas). Called once from the observe API. The initial
     /// read registers lazy derived chains (Section 6.9) so that later marks
     /// reach this observation; no callback fires on attach.
-    member internal this.Attach() =
+    member this.Attach() =
         target.GetValue() |> ignore
 
         match target with

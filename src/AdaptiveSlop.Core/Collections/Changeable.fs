@@ -447,3 +447,9 @@ type ChangeableMap<'K, 'V when 'K: equality>(initial: seq<'K * 'V>) =
         member _.EdgeCount = edges.Count
         member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
         member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
+
+/// <summary>An abbreviation for <see cref="ChangeableSet&lt;'T&gt;"/> (FDA <c>cset&lt;'T&gt;</c> parity).</summary>
+type cset<'T> = ChangeableSet<'T>
+
+/// <summary>An abbreviation for <see cref="ChangeableMap&lt;'K,'V&gt;"/> (FDA <c>cmap&lt;'K,'V&gt;</c> parity).</summary>
+type cmap<'K, 'V when 'K: equality> = ChangeableMap<'K, 'V>
