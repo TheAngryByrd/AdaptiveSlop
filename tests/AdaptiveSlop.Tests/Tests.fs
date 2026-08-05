@@ -5119,3 +5119,187 @@ let ``AMap toASet returns pairs and keys returns keys`` () =
     CMap.remove 1 m
     Assert.Equal<Set<struct (int * string)>>(Set.ofList [ struct (2, "b") ], ASet.toSet pairs)
     Assert.Equal<Set<int>>(Set.ofList [ 2 ], ASet.toSet keys)
+
+// =============================================================================
+// Bring list — AList simple group (gap sheet §5.1, §5.5, §5.6, §5.7):
+// mapi/choosei/filteri, indexed, ofAVal, toAVal, range, init, tryAt/tryGet/
+// tryFirst/tryLast, rev, sort family, pairwise, mapUse/mapUsei.
+// =============================================================================
+
+[<Fact>]
+let ``AList mapi choosei and filteri pass the input position`` () =
+    let l = CList.ofSeq [ 10; 20; 30 ]
+
+    let withPos = l |> AList.mapi (fun i v -> (i, v))
+    Assert.Equal<(int * int)[]>([| 0, 10; 1, 20; 2, 30 |], AList.toArray withPos)
+
+    let chosen = l |> AList.choosei (fun i v -> if i % 2 = 0 then Some(v * 10) else None)
+    Assert.Equal<int[]>([| 100; 300 |], AList.toArray chosen)
+
+    let filtered = l |> AList.filteri (fun i v -> i = 1 || v = 30)
+    Assert.Equal<int[]>([| 20; 30 |], AList.toArray filtered)
+
+    CList.insertAt 0 5 l // [ 5; 10; 20; 30 ]
+    // Mapping-time positions stick (the mapiA convention): shifted elements
+    // keep the position the mapping saw (FDA stable-Index equivalent).
+    Assert.Equal<(int * int)[]>([| 0, 5; 0, 10; 1, 20; 2, 30 |], AList.toArray withPos)
+
+    let chosen2 = l |> AList.choosei (fun i v -> if i % 2 = 0 then Some(v * 10) else None)
+    Assert.Equal<int[]>([| 50; 200 |], AList.toArray chosen2) // 5@0, 20@2
+
+[<Fact>]
+let ``AList indexed pairs elements with their positions`` () =
+    let l = CList.ofSeq [ "a"; "b" ]
+    let indexed = AList.indexed (CList.value l)
+
+    Assert.Equal<struct (int * string)[]>([| struct (0, "a"); struct (1, "b") |], AList.toArray indexed)
+
+    CList.insertAt 1 "x" l
+    // Mapping-time positions stick (the mapiA convention).
+    Assert.Equal<struct (int * string)[]>([| struct (0, "a"); struct (1, "x"); struct (1, "b") |], AList.toArray indexed)
+
+[<Fact>]
+let ``AList ofAVal rebuilds on value change`` () =
+    let v = CVal.create [| 1; 2; 3 |]
+    let l = AList.ofAVal (CVal.value v)
+
+    Assert.Equal<int[]>([| 1; 2; 3 |], AList.toArray l)
+
+    CVal.set [| 3; 4 |] v
+    Assert.Equal<int[]>([| 3; 4 |], AList.toArray l)
+
+[<Fact>]
+let ``AList toAVal materializes snapshots`` () =
+    let l = CList.ofSeq [ 1; 2 ]
+    let snap = AList.toAVal (CList.value l)
+
+    Assert.Equal<int[]>([| 1; 2 |], AVal.getValue snap)
+
+    CList.append 3 l
+    Assert.Equal<int[]>([| 1; 2; 3 |], AVal.getValue snap)
+
+[<Fact>]
+let ``AList range and init follow their inputs`` () =
+    let lo = CVal.create 1
+    let hi = CVal.create 3
+    let r = AList.range (CVal.value lo) (CVal.value hi)
+    Assert.Equal<int[]>([| 1; 2; 3 |], AList.toArray r)
+
+    CVal.set 5 hi
+    Assert.Equal<int[]>([| 1; 2; 3; 4; 5 |], AList.toArray r)
+
+    let count = CVal.create 2
+    let gen = AList.init (fun i -> i * 10) (CVal.value count)
+    Assert.Equal<int[]>([| 0; 10 |], AList.toArray gen)
+
+    CVal.set 4 count
+    Assert.Equal<int[]>([| 0; 10; 20; 30 |], AList.toArray gen)
+
+[<Fact>]
+let ``AList tryAt tryGet tryFirst tryLast`` () =
+    let l = CList.ofSeq [ 10; 20; 30 ]
+    let a = AList.tryAt 1 (CList.value l)
+    let g = AList.tryGet 5 (CList.value l)
+    let f = AList.tryFirst (CList.value l)
+    let t = AList.tryLast (CList.value l)
+
+    Assert.Equal(ValueSome 20, AVal.getValue a)
+    Assert.Equal(ValueNone, AVal.getValue g)
+    Assert.Equal(ValueSome 10, AVal.getValue f)
+    Assert.Equal(ValueSome 30, AVal.getValue t)
+
+    CList.removeAt 0 l
+    Assert.Equal(ValueSome 20, AVal.getValue f)
+    Assert.Equal(ValueSome 30, AVal.getValue t)
+
+[<Fact>]
+let ``AList rev follows the source`` () =
+    let l = CList.ofSeq [ 1; 2; 3 ]
+    let r = AList.rev (CList.value l)
+
+    Assert.Equal<int[]>([| 3; 2; 1 |], AList.toArray r)
+
+    CList.append 4 l
+    Assert.Equal<int[]>([| 4; 3; 2; 1 |], AList.toArray r)
+
+[<Fact>]
+let ``AList sort family is stable`` () =
+    let l = CList.ofSeq [ 3; 1; 2; 1 ]
+
+    Assert.Equal<int[]>([| 1; 1; 2; 3 |], AList.toArray (AList.sort (CList.value l)))
+    Assert.Equal<int[]>([| 3; 2; 1; 1 |], AList.toArray (AList.sortDescending (CList.value l)))
+    Assert.Equal<int[]>([| 1; 1; 2; 3 |], AList.toArray (AList.sortBy (fun v -> v) (CList.value l)))
+    Assert.Equal<int[]>([| 1; 1; 2; 3 |], AList.toArray (AList.sortWith (fun a b -> compare a b) (CList.value l)))
+
+    // sortByi: the projection sees the input position at poll time; stable.
+    let bySum = AList.sortByi (fun i v -> i + v) (CList.value l)
+    Assert.Equal<int[]>([| 1; 3; 2; 1 |], AList.toArray bySum) // keys: 3, 2, 4, 4
+
+    let l2 = CList.ofSeq [ 1; 2; 3 ]
+    let byDesc = AList.sortByDescending (fun v -> v) (CList.value l2)
+    Assert.Equal<int[]>([| 3; 2; 1 |], AList.toArray byDesc)
+
+    let byDesci = AList.sortByDescendingi (fun i v -> i + v) (CList.value l2)
+    Assert.Equal<int[]>([| 3; 2; 1 |], AList.toArray byDesci) // keys: 1, 3, 5
+
+[<Fact>]
+let ``AList pairwise and pairwiseCyclic`` () =
+    let l = CList.ofSeq [ 1; 2; 3 ]
+
+    let p = AList.pairwise (CList.value l)
+    Assert.Equal<struct (int * int)[]>([| struct (1, 2); struct (2, 3) |], AList.toArray p)
+
+    let pc = AList.pairwiseCyclic (CList.value l)
+    Assert.Equal<struct (int * int)[]>([| struct (1, 2); struct (2, 3); struct (3, 1) |], AList.toArray pc)
+
+    CList.insertAt 1 9 l // [ 1; 9; 2; 3 ]
+    Assert.Equal<struct (int * int)[]>([| struct (1, 9); struct (9, 2); struct (2, 3) |], AList.toArray p)
+
+[<Fact>]
+let ``AList mapUse disposes on removal and on dispose`` () =
+    let input = CList.ofSeq [ 1; 2; 3 ]
+    let refCount = ref 0
+
+    let newDisposable _ =
+        incr refCount
+
+        { new IDisposable with
+            member _.Dispose() = decr refCount }
+
+    let disp, list = input |> AList.mapUse newDisposable
+
+    Assert.Equal(0, !refCount) // mapped lazily: nothing before the first read
+
+    AList.force list |> ignore
+    Assert.Equal(3, !refCount)
+
+    CList.removeAt 0 input
+    AList.force list |> ignore
+    Assert.Equal(2, !refCount)
+
+    CList.append 7 input
+    AList.force list |> ignore
+    Assert.Equal(3, !refCount)
+
+    disp.Dispose()
+    Assert.Equal(0, !refCount)
+
+[<Fact>]
+let ``AList mapUsei disposes the replaced value on update`` () =
+    let input = CList.ofSeq [ 10 ]
+    let mutable disposes = 0
+
+    let disp, list =
+        input
+        |> AList.mapUsei (fun i v ->
+            { new IDisposable with
+                member _.Dispose() = disposes <- disposes + 1 })
+
+    AList.force list |> ignore
+
+    CList.updateAt 0 20 input // the mapped value at position 0 is replaced
+    AList.force list |> ignore
+    Assert.Equal(1, disposes)
+
+    disp.Dispose()
+    Assert.Equal(2, disposes)

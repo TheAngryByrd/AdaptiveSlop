@@ -1957,6 +1957,56 @@ module internal Collections =
 
         changed
 
+    /// <summary>
+    /// Replace the state of a list node with <paramref name="next"/> and
+    /// collect the positional diff as the output delta (prefix/suffix, the
+    /// <c>ChangeableList.ApplyDiff</c> algorithm). Returns whether anything
+    /// changed. The ops are appended via the public <see cref="ListDelta"/>
+    /// helpers (application order: removals then inserts for the structural
+    /// case, updates in place for the equal-count case).
+    /// </summary>
+    let rebuildListDiff (next: IReadOnlyList<'T>) (data: ResizeArray<'T>) (out: ListDelta<'T> byref) : bool =
+        let oldCount = data.Count
+        let newCount = next.Count
+        let mutable prefix = 0
+        let limit = min oldCount newCount
+
+        while prefix < limit
+              && EqualityComparer<'T>.Default.Equals(data[prefix], next[prefix]) do
+            prefix <- prefix + 1
+
+        let mutable suffix = 0
+        let mutable trimming = true
+
+        while trimming do
+            if
+                suffix < limit - prefix
+                && EqualityComparer<'T>.Default.Equals(data[oldCount - 1 - suffix], next[newCount - 1 - suffix])
+            then
+                suffix <- suffix + 1
+            else
+                trimming <- false
+
+        let oldMid = oldCount - prefix - suffix
+        let newMid = newCount - prefix - suffix
+
+        if oldMid = newMid then
+            for i in 0 .. oldMid - 1 do
+                let v = next[prefix + i]
+                data[prefix + i] <- v
+                out.Update(prefix + i, v)
+        else
+            for i in oldMid - 1 .. -1 .. 0 do
+                data.RemoveAt(prefix + i)
+                out.Remove(prefix + i)
+
+            for i in 0 .. newMid - 1 do
+                let v = next[prefix + i]
+                data.Insert(prefix + i, v)
+                out.Insert(prefix + i, v)
+
+        not out.IsEmpty
+
     // =============================================================================
     // Dynamic dependencies (PLAN.md Section 7.4): collect and bind.
     //

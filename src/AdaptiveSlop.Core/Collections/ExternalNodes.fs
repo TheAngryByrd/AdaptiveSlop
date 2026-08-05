@@ -220,46 +220,8 @@ type ExternalListNode<'T when 'T: equality>([<InlineIfLambda>] snapshot: unit ->
         if dirty && not disposed then
             dirty <- false
             let next = snapshot ()
-            let oldCount = data.Count
-            let newCount = next.Count
-            let mutable prefix = 0
-            let limit = min oldCount newCount
 
-            while prefix < limit
-                  && EqualityComparer<'T>.Default.Equals(data[prefix], next[prefix]) do
-                prefix <- prefix + 1
-
-            let mutable suffix = 0
-            let mutable trimming = true
-
-            while trimming do
-                if
-                    suffix < limit - prefix
-                    && EqualityComparer<'T>.Default.Equals(data[oldCount - 1 - suffix], next[newCount - 1 - suffix])
-                then
-                    suffix <- suffix + 1
-                else
-                    trimming <- false
-
-            let oldMid = oldCount - prefix - suffix
-            let newMid = newCount - prefix - suffix
-
-            if oldMid = newMid then
-                for i in 0 .. oldMid - 1 do
-                    let v = next[prefix + i]
-                    data[prefix + i] <- v
-                    out.Update(prefix + i, v)
-            else
-                for i in oldMid - 1 .. -1 .. 0 do
-                    data.RemoveAt(prefix + i)
-                    out.Remove(prefix + i)
-
-                for i in 0 .. newMid - 1 do
-                    let v = next[prefix + i]
-                    data.Insert(prefix + i, v)
-                    out.Insert(prefix + i, v)
-
-            if not out.IsEmpty then
+            if Collections.rebuildListDiff next data &out then
                 version <- version + 1L
                 Collections.pushAndMarkList out &sinks edges
                 out.Clear()

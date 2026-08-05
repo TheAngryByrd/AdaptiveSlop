@@ -1152,13 +1152,13 @@ module AList =
 
     /// <summary>Maps every element of the list.</summary>
     let inline map ([<InlineIfLambda>] f: 'T -> 'U) (list: alist<'T>) : alist<'U> =
-        new FilterMapListNode<'T, 'U>(list, fun x -> ValueSome(f x))
+        new FilterMapListNode<'T, 'U>(list, fun _ x -> ValueSome(f x))
 
     /// <summary>Maps every element, keeping only the ones the mapping returns a value for.</summary>
     let inline choose ([<InlineIfLambda>] f: 'T -> 'U option) (list: alist<'T>) : alist<'U> =
         new FilterMapListNode<'T, 'U>(
             list,
-            fun x ->
+            fun _ x ->
                 match f x with
                 | Some u -> ValueSome u
                 | None -> ValueNone
@@ -1166,11 +1166,41 @@ module AList =
 
     /// <summary>Maps every element, keeping only the ones the mapping returns a value for (voption form).</summary>
     let inline chooseV ([<InlineIfLambda>] f: 'T -> 'U voption) (list: alist<'T>) : alist<'U> =
-        new FilterMapListNode<'T, 'U>(list, f)
+        new FilterMapListNode<'T, 'U>(list, fun _ x -> f x)
 
     /// <summary>Keeps the elements that satisfy the predicate.</summary>
     let inline filter ([<InlineIfLambda>] predicate: 'T -> bool) (list: alist<'T>) : alist<'T> =
-        new FilterMapListNode<'T, 'T>(list, fun x -> if predicate x then ValueSome x else ValueNone)
+        new FilterMapListNode<'T, 'T>(list, fun _ x -> if predicate x then ValueSome x else ValueNone)
+
+    /// <summary>
+    /// Maps every element, passing the input position to the mapping (FDA
+    /// <c>AList.mapi</c> parity; the index is the <c>int</c> input position,
+    /// the positional deviation per ALIST-DESIGN §5).
+    /// </summary>
+    let inline mapi ([<InlineIfLambda>] f: int -> 'T -> 'U) (list: alist<'T>) : alist<'U> =
+        new FilterMapListNode<'T, 'U>(list, fun i x -> ValueSome(f i x))
+
+    /// <summary>Keeps the entries whose index-aware mapping returns a value (FDA <c>AList.choosei</c> parity).</summary>
+    let inline choosei ([<InlineIfLambda>] f: int -> 'T -> 'U option) (list: alist<'T>) : alist<'U> =
+        new FilterMapListNode<'T, 'U>(
+            list,
+            fun i x ->
+                match f i x with
+                | Some u -> ValueSome u
+                | None -> ValueNone
+        )
+
+    /// <summary>Keeps the elements whose index-aware predicate holds (FDA <c>AList.filteri</c> parity).</summary>
+    let inline filteri ([<InlineIfLambda>] predicate: int -> 'T -> bool) (list: alist<'T>) : alist<'T> =
+        new FilterMapListNode<'T, 'T>(list, fun i x -> if predicate i x then ValueSome x else ValueNone)
+
+    /// <summary>
+    /// An adaptive list of the elements paired with their input positions
+    /// (FDA <c>AList.indexed</c> parity; struct pair, the library convention;
+    /// the position is the <c>int</c> input position).
+    /// </summary>
+    let inline indexed (list: alist<'T>) : alist<struct (int * 'T)> =
+        mapi (fun i v -> struct (i, v)) list
 
     /// <summary>
     /// Adaptively maps every element of the list to an adaptive value (FDA
@@ -1261,6 +1291,177 @@ module AList =
     /// <summary>Adaptively tests if the list is empty.</summary>
     let inline isEmpty (list: alist<'T>) : aval<bool> =
         AdaptiveNode<bool>(fun () -> list.GetValue().Count = 0)
+
+    /// <summary>
+    /// An adaptive list over an adaptive value of a sequence (FDA
+    /// <c>AList.ofAVal</c> parity). Every change of the value replaces the
+    /// whole state and emits the positional diff as the delta.
+    /// </summary>
+    let inline ofAVal<'T, 'S when 'S :> seq<'T>> (value: aval<'S>) : alist<'T> =
+        new OfAvalListNode<'T, 'S>(value)
+
+    /// <summary>
+    /// An adaptive list generated from a count and a generator (FDA
+    /// <c>AList.init</c> parity). The list is rebuilt when the count changes.
+    /// </summary>
+    let inline init ([<InlineIfLambda>] f: int -> 'T) (count: aval<int>) : alist<'T> =
+        ofAVal (AVal.map (fun c -> Array.init c f) count)
+
+    /// <summary>
+    /// An adaptive numeric range as a list (FDA <c>AList.range</c> parity).
+    /// The list is rebuilt when either bound changes; the bounds are inclusive.
+    /// </summary>
+    let inline range (min: aval<^T>) (max: aval<^T>) : alist<^T> =
+        ofAVal (AVal.map2 (fun lo hi -> { lo .. hi }) min max)
+
+    /// <summary>
+    /// Adaptively looks up the element at the given position (FDA
+    /// <c>AList.tryAt</c> parity; the position is the <c>int</c> input
+    /// position, the positional deviation).
+    /// </summary>
+    let inline tryAt (index: int) (list: alist<'T>) : aval<'T voption> =
+        AdaptiveNode(fun () ->
+            let view = list.GetValue()
+
+            if index >= 0 && index < view.Count then
+                ValueSome view[index]
+            else
+                ValueNone)
+
+    /// <summary>Alias of <see cref="tryAt"/> (FDA parity name; both take the <c>int</c> position).</summary>
+    let inline tryGet (index: int) (list: alist<'T>) : aval<'T voption> = tryAt index list
+
+    /// <summary>Adaptively gets the first element, or <c>ValueNone</c> when empty (FDA <c>AList.tryFirst</c> parity).</summary>
+    let inline tryFirst (list: alist<'T>) : aval<'T voption> =
+        AdaptiveNode(fun () ->
+            let view = list.GetValue()
+
+            if view.Count > 0 then
+                ValueSome view[0]
+            else
+                ValueNone)
+
+    /// <summary>Adaptively gets the last element, or <c>ValueNone</c> when empty (FDA <c>AList.tryLast</c> parity).</summary>
+    let inline tryLast (list: alist<'T>) : aval<'T voption> =
+        AdaptiveNode(fun () ->
+            let view = list.GetValue()
+
+            if view.Count > 0 then
+                ValueSome view[view.Count - 1]
+            else
+                ValueNone)
+
+    /// <summary>
+    /// Materializes the list as an adaptive value. Every change materializes a
+    /// new array (the retain boundary, like <see cref="force"/>); the value
+    /// is safe to retain (FDA <c>AList.toAVal</c> parity, as <c>aval&lt;'T[]&gt;</c>,
+    /// the positional deviation).
+    /// </summary>
+    let inline toAVal (list: alist<'T>) : aval<'T[]> =
+        AdaptiveNode<'T[]>(fun () -> Seq.toArray (list.GetValue()))
+
+    /// <summary>
+    /// Reverses the list (FDA <c>AList.rev</c> parity, poll node).
+    /// </summary>
+    let inline rev (list: alist<'T>) : alist<'T> =
+        new PollListSourceNode<'T, 'T>(
+            list,
+            fun view ->
+                let next = ResizeArray<'T>(view.Count)
+
+                for i in view.Count - 1 .. -1 .. 0 do
+                    next.Add view[i]
+
+                next
+        )
+
+    /// <summary>
+    /// Sorts the list with the given comparison (FDA <c>AList.sortWith</c>
+    /// parity, stable, poll node).
+    /// </summary>
+    let inline sortWith ([<InlineIfLambda>] comparer: 'T -> 'T -> int) (list: alist<'T>) : alist<'T> =
+        new SortListNode<'T, 'T>(list, (fun _ v -> v), comparer)
+
+    /// <summary>Sorts the list ascending (FDA <c>AList.sort</c> parity, stable, poll node).</summary>
+    let inline sort (list: alist<'T>) : alist<'T> = sortWith compare list
+
+    /// <summary>Sorts the list descending (FDA <c>AList.sortDescending</c> parity, stable, poll node).</summary>
+    let inline sortDescending (list: alist<'T>) : alist<'T> = sortWith (fun a b -> compare b a) list
+
+    /// <summary>
+    /// Sorts the list by the keys given by the projection (FDA
+    /// <c>AList.sortBy</c> parity, stable, poll node).
+    /// </summary>
+    let inline sortBy ([<InlineIfLambda>] f: 'T -> 'K) (list: alist<'T>) : alist<'T> =
+        new SortListNode<'T, 'K>(list, (fun _ v -> f v), compare)
+
+    /// <summary>
+    /// Sorts the list by the keys given by the projection, passing the input
+    /// position to the projection (FDA <c>AList.sortByi</c> parity, stable,
+    /// poll node; the index is the <c>int</c> input position).
+    /// </summary>
+    let inline sortByi ([<InlineIfLambda>] f: int -> 'T -> 'K) (list: alist<'T>) : alist<'T> =
+        new SortListNode<'T, 'K>(list, f, compare)
+
+    /// <summary>Sorts the list by the keys given by the projection, descending (FDA <c>AList.sortByDescending</c> parity).</summary>
+    let inline sortByDescending ([<InlineIfLambda>] f: 'T -> 'K) (list: alist<'T>) : alist<'T> =
+        new SortListNode<'T, 'K>(list, (fun _ v -> f v), fun a b -> compare b a)
+
+    /// <summary>Sorts the list by the keys given by the projection, descending, index-aware (FDA <c>AList.sortByDescendingi</c> parity).</summary>
+    let inline sortByDescendingi ([<InlineIfLambda>] f: int -> 'T -> 'K) (list: alist<'T>) : alist<'T> =
+        new SortListNode<'T, 'K>(list, f, fun a b -> compare b a)
+
+    /// <summary>
+    /// An adaptive list of adjacent pairs (FDA <c>AList.pairwise</c> parity,
+    /// poll node; struct pairs, the library convention).
+    /// </summary>
+    let inline pairwise (list: alist<'T>) : alist<struct ('T * 'T)> =
+        new PollListSourceNode<'T, struct ('T * 'T)>(
+            list,
+            fun view ->
+                let next = ResizeArray<struct ('T * 'T)>(max 0 (view.Count - 1))
+
+                for i in 0 .. view.Count - 2 do
+                    next.Add(struct (view[i], view[i + 1]))
+
+                next
+        )
+
+    /// <summary>
+    /// An adaptive list of adjacent pairs, with the last element paired with
+    /// the first (FDA <c>AList.pairwiseCyclic</c> parity, poll node).
+    /// </summary>
+    let inline pairwiseCyclic (list: alist<'T>) : alist<struct ('T * 'T)> =
+        new PollListSourceNode<'T, struct ('T * 'T)>(
+            list,
+            fun view ->
+                let next = ResizeArray<struct ('T * 'T)>(view.Count)
+
+                for i in 0 .. view.Count - 1 do
+                    next.Add(struct (view[i], view[(i + 1) % view.Count]))
+
+                next
+        )
+
+    /// <summary>
+    /// Maps every element, disposing the mapped value when the element leaves
+    /// its position (FDA <c>AList.mapUse</c> parity). The output is 1:1 with
+    /// the input. Disposing the returned disposable disposes all live mapped
+    /// values and clears the output.
+    /// </summary>
+    let inline mapUse ([<InlineIfLambda>] mapping: 'T -> 'W) (list: alist<'T>) : IDisposable * alist<'W> =
+        let node = new MapUseListNode<'T, 'W>(list, fun _ v -> mapping v)
+        (node :> IDisposable, node :> alist<'W>)
+
+    /// <summary>
+    /// Maps every element, passing the input position to the mapping and
+    /// disposing the mapped value when the element leaves its position (FDA
+    /// <c>AList.mapUsei</c> parity; the index is the <c>int</c> input
+    /// position, the positional deviation).
+    /// </summary>
+    let inline mapUsei ([<InlineIfLambda>] mapping: int -> 'T -> 'W) (list: alist<'T>) : IDisposable * alist<'W> =
+        let node = new MapUseListNode<'T, 'W>(list, mapping)
+        (node :> IDisposable, node :> alist<'W>)
 
     /// <summary>
     /// Creates an adaptive list from an external snapshot function and an

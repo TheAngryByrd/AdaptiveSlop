@@ -50,7 +50,7 @@ type ConstantList<'T>([<InlineIfLambda>] create: unit -> 'T[]) =
 /// output; an update on a surviving element that now fails removes it (FDA
 /// choose semantics, docs/ALIST-DESIGN.md §3.4).
 /// </remarks>
-type FilterMapListNode<'T, 'U>(source: IAdaptiveList<'T>, [<InlineIfLambda>] mapping: 'T -> 'U voption) =
+type FilterMapListNode<'T, 'U>(source: IAdaptiveList<'T>, [<InlineIfLambda>] mapping: int -> 'T -> 'U voption) =
     let mutable version = 0L
     let mutable edges = ParentEdges()
     let mutable sinks = SinkList.Create()
@@ -94,7 +94,7 @@ type FilterMapListNode<'T, 'U>(source: IAdaptiveList<'T>, [<InlineIfLambda>] map
 
     member private this.Load(snapshot: ResizeArray<'T>) =
         for i in 0 .. snapshot.Count - 1 do
-            match mapping snapshot[i] with
+            match mapping i snapshot[i] with
             | ValueSome u ->
                 output.Add u
                 inputPositions.Add i
@@ -131,7 +131,7 @@ type FilterMapListNode<'T, 'U>(source: IAdaptiveList<'T>, [<InlineIfLambda>] map
 
                     match op.Kind with
                     | ListOpKind.Insert ->
-                        match mapping op.Value with
+                        match mapping p op.Value with
                         | ValueSome u ->
                             output.Insert(j, u)
                             inputPositions.Insert(j, p)
@@ -166,7 +166,7 @@ type FilterMapListNode<'T, 'U>(source: IAdaptiveList<'T>, [<InlineIfLambda>] map
 
                         inputCount <- inputCount - 1
                     | ListOpKind.Update ->
-                        match mapping op.Value with
+                        match mapping p op.Value with
                         | ValueSome u ->
                             if present then
                                 output[j] <- u
@@ -586,6 +586,344 @@ type CustomListNode<'T when 'T: equality>([<InlineIfLambda>] compute: IReadOnlyL
             if not disposed then
                 disposed <- true
                 Collections.clearSinks &sinks
+
+    interface IListSinkRegistry with
+        member this.AddListSink(sink) = Collections.addSink &sinks sink
+
+        member this.RemoveListSink(sink) =
+            Collections.removeSink &sinks sink
+
+    interface IEdgeTarget with
+        member _.EdgeCount = edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
+
+/// <summary>
+/// An adaptive list over an adaptive value of a sequence (FDA
+/// <c>AList.ofAVal</c> parity). Every change of the value replaces the whole
+/// state and emits the positional diff as the delta. Poll model: the value is
+/// re-read on every read; the diff runs only when its version moved.
+/// </summary>
+type OfAvalListNode<'T, 'S when 'S :> seq<'T>>(value: IAdaptiveValue<'S>) =
+    let mutable data = ResizeArray<'T>()
+    let mutable out = ListDelta<'T>.Create()
+    let mutable version = 0L
+    let mutable sinks = SinkList.Create()
+    let edges = ParentEdges()
+    let mutable depVersion = -1L
+    let mutable disposed = false
+
+    member private this.Poll() =
+        if not disposed then
+            let v = value.GetValue()
+
+            if value.Version <> depVersion then
+                depVersion <- value.Version
+                let next = ResizeArray<'T>(v)
+
+                if Collections.rebuildListDiff next data &out then
+                    version <- version + 1L
+                    Collections.pushAndMarkList out &sinks edges
+
+                out.Clear()
+
+    interface IAdaptiveList<'T> with
+        member this.GetValue() =
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
+
+            try
+                if disposed then
+                    invalidOp "This adaptive list has been disposed."
+
+                this.Poll()
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                data :> IReadOnlyList<'T>
+            finally
+                ctx.ReleaseOwner()
+
+        member this.Version =
+            this.Poll()
+            version
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                Collections.clearSinks &sinks
+
+    interface IListSinkRegistry with
+        member this.AddListSink(sink) = Collections.addSink &sinks sink
+
+        member this.RemoveListSink(sink) =
+            Collections.removeSink &sinks sink
+
+    interface IEdgeTarget with
+        member _.EdgeCount = edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
+
+/// <summary>
+/// A poll node that rebuilds its output from the source on every read and
+/// emits the positional diff (the gap-sheet poll-node strategy for rev, sort,
+/// pairwise). The source is re-read on every read; the diff elides the
+/// unchanged prefix/suffix.
+/// </summary>
+type PollListSourceNode<'T, 'U>
+    (source: IAdaptiveList<'T>, [<InlineIfLambda>] build: IReadOnlyList<'T> -> ResizeArray<'U>) =
+    let mutable data = ResizeArray<'U>()
+    let mutable out = ListDelta<'U>.Create()
+    let mutable version = 0L
+    let mutable sinks = SinkList.Create()
+    let edges = ParentEdges()
+    let mutable disposed = false
+
+    member private this.Poll() =
+        if not disposed then
+            let next = build (source.GetValue())
+
+            if Collections.rebuildListDiff next data &out then
+                version <- version + 1L
+                Collections.pushAndMarkList out &sinks edges
+
+            out.Clear()
+
+    interface IAdaptiveList<'U> with
+        member this.GetValue() =
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
+
+            try
+                if disposed then
+                    invalidOp "This adaptive list has been disposed."
+
+                this.Poll()
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                data :> IReadOnlyList<'U>
+            finally
+                ctx.ReleaseOwner()
+
+        member this.Version =
+            this.Poll()
+            version
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                Collections.clearSinks &sinks
+
+    interface IListSinkRegistry with
+        member this.AddListSink(sink) = Collections.addSink &sinks sink
+
+        member this.RemoveListSink(sink) =
+            Collections.removeSink &sinks sink
+
+    interface IEdgeTarget with
+        member _.EdgeCount = edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
+
+/// <summary>
+/// A stable sort node (FDA <c>AList.sortWith</c> parity, poll model). The
+/// keys are computed once per poll with their input positions (the
+/// <c>sortByi</c> mapping contract); the sort is stable by position.
+/// </summary>
+type SortListNode<'T, 'K>
+    (source: IAdaptiveList<'T>, [<InlineIfLambda>] keyMapping: int -> 'T -> 'K, [<InlineIfLambda>] comparer: 'K -> 'K -> int) =
+    let mutable data = ResizeArray<'T>()
+    let mutable out = ListDelta<'T>.Create()
+    let mutable version = 0L
+    let mutable sinks = SinkList.Create()
+    let edges = ParentEdges()
+    let mutable disposed = false
+
+    member private this.Poll() =
+        if not disposed then
+            let view = source.GetValue()
+            let n = view.Count
+            let keys = Array.zeroCreate n
+            let next = ResizeArray<'T>(n)
+
+            for i in 0 .. n - 1 do
+                next.Add view[i]
+                keys[i] <- keyMapping i view[i]
+
+            // Stable decorate-sort-undecorate: equal keys keep the input order.
+            let order = Array.init n id
+
+            Array.Sort(
+                order,
+                Comparison(fun a b ->
+                    let c = comparer keys[a] keys[b]
+                    if c <> 0 then c else compare a b)
+            )
+
+            let sorted = Array.zeroCreate n
+
+            for i in 0 .. n - 1 do
+                sorted[i] <- next[order[i]]
+
+            let rebuilt = ResizeArray<'T>(sorted)
+
+            if Collections.rebuildListDiff rebuilt data &out then
+                version <- version + 1L
+                Collections.pushAndMarkList out &sinks edges
+
+            out.Clear()
+
+    interface IAdaptiveList<'T> with
+        member this.GetValue() =
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
+
+            try
+                if disposed then
+                    invalidOp "This adaptive list has been disposed."
+
+                this.Poll()
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                data :> IReadOnlyList<'T>
+            finally
+                ctx.ReleaseOwner()
+
+        member this.Version =
+            this.Poll()
+            version
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                Collections.clearSinks &sinks
+
+    interface IListSinkRegistry with
+        member this.AddListSink(sink) = Collections.addSink &sinks sink
+
+        member this.RemoveListSink(sink) =
+            Collections.removeSink &sinks sink
+
+    interface IEdgeTarget with
+        member _.EdgeCount = edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
+
+/// <summary>
+/// Maps every element, disposing the mapped value when the element leaves its
+/// position (FDA <c>AList.mapUsei</c> parity; the index is the <c>int</c>
+/// input position, the positional deviation). The output is 1:1 with the
+/// input; a removed or updated element disposes its mapped value. Disposing
+/// the node disposes all live mapped values and clears the output.
+/// </summary>
+type MapUseListNode<'T, 'W when 'W: equality and 'W :> IDisposable>
+    (source: IAdaptiveList<'T>, [<InlineIfLambda>] mapping: int -> 'T -> 'W) =
+    let mutable version = 0L
+    let mutable edges = ParentEdges()
+    let mutable sinks = SinkList.Create()
+    let mutable depVersion = 0L
+    let mutable initialized = false
+    let mutable disposed = false
+    let mutable output = ResizeArray<'W>()
+    let mutable inputCount = 0
+    let mutable journal = ListDelta<'T>.Create()
+    let mutable out = ListDelta<'W>.Create()
+
+    member private this.Register() =
+        match box source with
+        | :? IListSinkRegistry as r -> r.AddListSink(box (this :> IListDeltaSink<'T>))
+        | _ -> ()
+
+    member private this.Unregister() =
+        match box source with
+        | :? IListSinkRegistry as r -> r.RemoveListSink(box (this :> IListDeltaSink<'T>))
+        | _ -> ()
+
+    member private this.EnsureInitialized() =
+        if not initialized then
+            let snapshot = ResizeArray<'T>(source.GetValue())
+            this.Register()
+
+            for i in 0 .. snapshot.Count - 1 do
+                output.Add(mapping i snapshot[i])
+
+            inputCount <- snapshot.Count
+            depVersion <- source.Version
+            initialized <- true
+
+    member private this.Drain() =
+        if not journal.IsEmpty then
+            out.Clear()
+            let ops = journal.Ops.Items
+            let cnt = journal.Ops.Count
+
+            for i in 0 .. cnt - 1 do
+                let op = ops[i]
+                let p = op.Position
+
+                match op.Kind with
+                | ListOpKind.Insert ->
+                    let w = mapping p op.Value
+                    output.Insert(p, w)
+                    out.Ops <- Collections.bufferAppend out.Ops (ListOp(ListOpKind.Insert, p, w, 0uy))
+                    inputCount <- inputCount + 1
+                | ListOpKind.Remove ->
+                    output[p].Dispose()
+                    output.RemoveAt p
+                    out.Ops <- Collections.bufferAppend out.Ops (ListOp(ListOpKind.Remove, p, Unchecked.defaultof<'W>, 0uy))
+                    inputCount <- inputCount - 1
+                | _ -> // Update: dispose the old mapped value, keep the position.
+                    let w = mapping p op.Value
+                    output[p].Dispose()
+                    output[p] <- w
+                    out.Ops <- Collections.bufferAppend out.Ops (ListOp(ListOpKind.Update, p, w, 0uy))
+
+            journal.Ops.Count <- 0
+            version <- version + 1L
+            Collections.pushAndMarkList out &sinks edges
+
+    interface IListDeltaSink<'T> with
+        member this.OnDeltas(ops: ListOp<'T>[], opCnt: int) =
+            if not disposed then
+                Collections.journalAppendList &journal ops opCnt
+                version <- version + 1L
+                GraphContext.Default.MarkFrom(edges)
+
+    interface IAdaptiveList<'W> with
+        member this.GetValue() =
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
+
+            try
+                if disposed then
+                    invalidOp "This adaptive list has been disposed."
+
+                this.EnsureInitialized()
+
+                if source.Version <> depVersion then
+                    source.GetValue() |> ignore
+                    depVersion <- source.Version
+
+                if not journal.IsEmpty then
+                    this.Drain()
+
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                output :> IReadOnlyList<'W>
+            finally
+                ctx.ReleaseOwner()
+
+        member _.Version = version
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                this.Unregister()
+                Collections.clearSinks &sinks
+
+                for i in 0 .. output.Count - 1 do
+                    output[i].Dispose()
+
+                output.Clear()
 
     interface IListSinkRegistry with
         member this.AddListSink(sink) = Collections.addSink &sinks sink
