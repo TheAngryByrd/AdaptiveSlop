@@ -4844,3 +4844,129 @@ let ``ofExternal: reads without invalidate allocate nothing`` () =
 
     let allocated = GC.GetAllocatedBytesForCurrentThread() - before
     Assert.Equal(0L, allocated)
+
+// =============================================================================
+// Bring list — ASet group (docs/2026-08-05-FDA-API-GAPS.md §3): range,
+// bind2/bind3, collect', mapUse, average/averageBy.
+// =============================================================================
+
+[<Fact>]
+let ``ASet range follows its bounds`` () =
+    let lo = CVal.create 1
+    let hi = CVal.create 3
+    let r = ASet.range (CVal.value lo) (CVal.value hi)
+
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2; 3 ], ASet.toSet r)
+
+    CVal.set 0 lo
+    Assert.Equal<Set<int>>(Set.ofList [ 0; 1; 2; 3 ], ASet.toSet r)
+
+    CVal.set 2 hi
+    Assert.Equal<Set<int>>(Set.ofList [ 0; 1; 2 ], ASet.toSet r)
+
+[<Fact>]
+let ``ASet bind2 and bind3 remap when any input changes`` () =
+    let a = CVal.create 0
+    let b = CVal.create 0
+    let buckets = [| CSet.empty<int>; CSet.empty<int>; CSet.empty<int> |]
+
+    let combined =
+        ASet.bind2 (fun av bv -> buckets[av + bv]) (CVal.value a) (CVal.value b)
+
+    CSet.add 1 (buckets[0])
+    Assert.Equal<Set<int>>(Set.ofList [ 1 ], ASet.toSet combined)
+
+    CVal.set 1 b // a+b = 1: bucket 1, still empty
+    Assert.Equal<Set<int>>(Set.empty, ASet.toSet combined)
+
+    CSet.add 2 (buckets[1])
+    Assert.Equal<Set<int>>(Set.ofList [ 2 ], ASet.toSet combined)
+
+    CVal.set 1 a // a+b = 2: bucket 2, empty
+    Assert.Equal<Set<int>>(Set.empty, ASet.toSet combined)
+
+    let c = CVal.create 0
+
+    let combined3 =
+        ASet.bind3 (fun av bv cv -> buckets[av + bv + cv]) (CVal.value a) (CVal.value b) (CVal.value c)
+
+    Assert.Equal<Set<int>>(Set.empty, ASet.toSet combined3)
+
+    CVal.set 0 a
+    CVal.set 0 b
+    CVal.set 1 c // a+b+c = 1: bucket 1 holds { 2 }
+    Assert.Equal<Set<int>>(Set.ofList [ 2 ], ASet.toSet combined3)
+
+[<Fact>]
+let ``ASet collect' expands statically`` () =
+    let s = CSet.ofSeq [ 1; 2; 3 ]
+    let expanded = s |> ASet.collect' (fun v -> [ v; v * 10 ])
+
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 10; 2; 20; 3; 30 ], ASet.toSet expanded)
+
+    CSet.remove 1 s
+    Assert.Equal<Set<int>>(Set.ofList [ 2; 20; 3; 30 ], ASet.toSet expanded)
+
+[<Fact>]
+let ``ASet mapUse disposes on removal and on dispose`` () =
+    let input = CSet.ofSeq [ 1; 2; 3; 4 ]
+    let refCount = ref 0
+
+    let newDisposable () =
+        incr refCount
+
+        { new IDisposable with
+            member _.Dispose() = decr refCount }
+
+    let disp, set = input |> ASet.mapUse (fun v -> newDisposable ())
+
+    Assert.Equal(0, !refCount) // mapped lazily: nothing before the first read
+
+    ASet.force set |> ignore
+    Assert.Equal(4, !refCount)
+
+    CSet.remove 1 input
+    ASet.force set |> ignore
+    Assert.Equal(3, !refCount)
+
+    CSet.add 7 input
+    ASet.force set |> ignore
+    Assert.Equal(4, !refCount)
+
+    disp.Dispose()
+    Assert.Equal(0, !refCount)
+
+[<Fact>]
+let ``ASet mapUse refcounts duplicate mapped values`` () =
+    let input = CSet.ofSeq [ 1; 2 ]
+    let mutable disposes = 0
+
+    let shared =
+        { new IDisposable with
+            member _.Dispose() = disposes <- disposes + 1 }
+
+    let disp, set = input |> ASet.mapUse (fun _ -> shared)
+
+    ASet.force set |> ignore
+    Assert.Equal(1, (ASet.force set).Count) // both elements map to one output value
+    Assert.Equal(0, disposes)
+
+    CSet.remove 1 input
+    ASet.force set |> ignore
+    Assert.Equal(1, (ASet.force set).Count) // one occurrence remains
+    Assert.Equal(0, disposes)
+
+    CSet.remove 2 input
+    ASet.force set |> ignore
+    Assert.Equal(0, (ASet.force set).Count)
+    Assert.Equal(1, disposes) // last occurrence left: disposed exactly once
+
+[<Fact>]
+let ``ASet average and averageBy`` () =
+    let s = CSet.ofSeq [ 1.0; 2.0; 3.0 ]
+
+    Assert.Equal(2.0, AVal.getValue (ASet.average (CSet.value s)))
+    Assert.Equal(4.0, AVal.getValue (ASet.averageBy (fun v -> v * 2.0) (CSet.value s)))
+
+    CSet.add 5.0 s
+    Assert.Equal(2.75, AVal.getValue (ASet.average (CSet.value s)))

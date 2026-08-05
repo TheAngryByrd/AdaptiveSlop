@@ -134,6 +134,36 @@ module ASet =
     let inline collect ([<InlineIfLambda>] mapping: 'T -> aset<'U>) (set: aset<'T>) : aset<'U> =
         new CollectSetNode<'T, 'U>(set, mapping)
 
+    /// <summary>
+    /// Flattens the set by statically expanding each element to a sequence
+    /// (FDA <c>ASet.collect'</c> parity). The expansion runs per source
+    /// element change; the inner sequences are constant.
+    /// </summary>
+    let inline collect' ([<InlineIfLambda>] mapping: 'T -> seq<'U>) (set: aset<'T>) : aset<'U> =
+        collect (mapping >> ofSeq) set
+
+    /// <summary>
+    /// Maps every element, disposing the mapped value when its last source
+    /// occurrence leaves (FDA <c>ASet.mapUse</c> parity). The mapped values
+    /// are stable (the mapping runs once per source element). Disposing the
+    /// returned disposable disposes all live mapped values and clears the
+    /// output set.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// let src = CSet.ofSeq [ 1; 2 ]
+    /// let cleanup, mapped = src |> ASet.mapUse (fun id -&gt; Resource(id))
+    /// CSet.remove 1 src          // the resource for 1 is disposed
+    /// cleanup.Dispose()          // all remaining resources are disposed
+    /// </code>
+    /// </example>
+    let inline mapUse
+        ([<InlineIfLambda>] mapping: 'A -> 'B)
+        (set: aset<'A>)
+        : IDisposable * aset<'B> =
+        let node = new MapUseSetNode<'A, 'B>(set, mapping)
+        (node :> IDisposable, node :> aset<'B>)
+
     /// <summary>The elements of the left set that are not in the right set.</summary>
     let inline difference (left: aset<'T>) (right: aset<'T>) : aset<'T> =
         new TwoSourceSetNode<'T>(TwoSetOp.Difference, left, right)
@@ -174,6 +204,40 @@ module ASet =
     /// </example>
     let inline bind ([<InlineIfLambda>] mapping: 'T -> aset<'U>) (value: aval<'T>) : aset<'U> =
         new BindSetNode<'T, 'U>(value, mapping)
+
+    /// <summary>
+    /// An adaptive numeric range (FDA <c>ASet.range</c> parity). The set is
+    /// rebuilt when either bound changes; the bounds are inclusive.
+    /// </summary>
+    let inline range (min: aval<^T>) (max: aval<^T>) : aset<^T> =
+        ofAVal (AVal.map2 (fun lo hi -> { lo .. hi }) min max)
+
+    /// <summary>
+    /// Adaptively maps over the two values and returns the resulting set (FDA
+    /// <c>ASet.bind2</c> parity). When either value changes, the whole inner
+    /// set is swapped (the bind semantics). Composed as one bind over the
+    /// mapped pair (the FDA approach: nested binds would miss the inner
+    /// bind's swap, which signals by version only, not by delta).
+    /// </summary>
+    let inline bind2
+        ([<InlineIfLambda>] mapping: 'A -> 'B -> aset<'C>)
+        (a: aval<'A>)
+        (b: aval<'B>)
+        : aset<'C> =
+        bind (fun (av, bv) -> mapping av bv) (AVal.map2 (fun av bv -> (av, bv)) a b)
+
+    /// <summary>
+    /// Adaptively maps over the three values and returns the resulting set
+    /// (FDA <c>ASet.bind3</c> parity). When any value changes, the whole
+    /// inner set is swapped (the bind semantics).
+    /// </summary>
+    let inline bind3
+        ([<InlineIfLambda>] mapping: 'A -> 'B -> 'C -> aset<'D>)
+        (a: aval<'A>)
+        (b: aval<'B>)
+        (c: aval<'C>)
+        : aset<'D> =
+        bind (fun (av, bv, cv) -> mapping av bv cv) (AVal.map3 (fun av bv cv -> (av, bv, cv)) a b c)
 
     /// <summary>
     /// An adaptive set over an external reader function. The reader is called
@@ -387,6 +451,23 @@ module ASet =
     /// <summary>Adaptively sums the mapped elements.</summary>
     let inline sumBy ([<InlineIfLambda>] mapping: 'T -> 'U) (set: aset<'T>) : aval<'U> =
         reduceBy (AdaptiveReduction.sum ()) mapping set
+
+    /// <summary>
+    /// Adaptively averages the elements (needs a numeric type with
+    /// <c>DivideByInt</c>, e.g. <c>float</c>). The average is sum/count.
+    /// </summary>
+    let inline average (set: aset<^T>) : aval<^T> =
+        AVal.map2
+            (fun total count -> LanguagePrimitives.DivideByInt total count)
+            (sum set)
+            (count set)
+
+    /// <summary>
+    /// Adaptively averages the mapped elements (needs a numeric type with
+    /// <c>DivideByInt</c>, e.g. <c>float</c>).
+    /// </summary>
+    let inline averageBy ([<InlineIfLambda>] mapping: 'T -> ^U) (set: aset<'T>) : aval<^U> =
+        average (map mapping set)
 
     /// <summary>Adaptively gets the minimum element, or <c>ValueNone</c> when empty.</summary>
     let inline tryMin (set: aset<'T>) : aval<'T voption> =

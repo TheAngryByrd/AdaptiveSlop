@@ -932,3 +932,148 @@ type BindSetNode<'T, 'U when 'U: equality>
         member _.EdgeCount = state.Edges.Count
         member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
         member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
+
+/// <summary>
+/// Maps every element, disposing the mapped value when its last source
+/// occurrence leaves (FDA <c>ASet.mapUse</c> parity). The mapped values are
+/// stable (the mapping runs once per source element); the output is a set, so
+/// two source elements mapping to one value are refcounted and the value is
+/// disposed only when the last occurrence leaves. Disposing the node disposes
+/// all live mapped values and clears the output.
+/// </summary>
+type MapUseSetNode<'A, 'B when 'A: equality and 'B: equality and 'B :> IDisposable>
+    (source: IAdaptiveSet<'A>, [<InlineIfLambda>] mapping: 'A -> 'B) =
+    let mutable state = SetNodeState<'A, 'B>.Create(1)
+    // Source element -> its mapped value.
+    let mapped = Dictionary<'A, 'B>()
+    // Output value -> occurrence count (the output set dedups).
+    let refs = Dictionary<'B, int>()
+    let mutable initialized = false
+    let mutable disposed = false
+
+    member private this.Register() =
+        match box source with
+        | :? ISetSinkRegistry as r -> r.AddSetSink(box (this :> ISetDeltaSink<'A>))
+        | _ -> ()
+
+    member private this.Unregister() =
+        match box source with
+        | :? ISetSinkRegistry as r -> r.RemoveSetSink(box (this :> ISetDeltaSink<'A>))
+        | _ -> ()
+
+    member private this.EnsureInitialized() =
+        if not initialized then
+            // Snapshot first, register between, then map the snapshot (the
+            // MapSetNode convention): the mapping is user code that may write
+            // to the source, and the write must land in our journal.
+            let snapshot = HashSet<'A>(source.GetValue())
+            this.Register()
+
+            for a in snapshot do
+                let b = mapping a
+                mapped[a] <- b
+
+                match refs.TryGetValue b with
+                | true, r -> refs[b] <- r + 1
+                | false, _ -> refs[b] <- 1
+
+                state.Set.Data.Add b |> ignore
+
+            state.DepVersions[0] <- source.Version
+            initialized <- true
+
+    member private this.Drain() =
+        // Removes first: the source elements are gone, their values may leave.
+        let rems = state.Journal.Rems
+
+        for i in 0 .. rems.Count - 1 do
+            let a = rems.Items[i]
+
+            if mapped.TryGetValue a |> fst then
+                let b = mapped[a]
+                mapped.Remove a |> ignore
+                let r = refs[b] - 1
+
+                if r = 0 then
+                    refs.Remove b |> ignore
+                    b.Dispose()
+                    state.Set.Data.Remove b |> ignore
+                    state.Out.Rems <- Collections.bufferAppend state.Out.Rems b
+                else
+                    refs[b] <- r
+
+        let adds = state.Journal.Adds
+
+        for i in 0 .. adds.Count - 1 do
+            let a = adds.Items[i]
+            let b = mapping a
+            mapped[a] <- b
+
+            match refs.TryGetValue b with
+            | true, r -> refs[b] <- r + 1
+            | false, _ ->
+                refs[b] <- 1
+                state.Set.Data.Add b |> ignore
+                state.Out.Adds <- Collections.bufferAppend state.Out.Adds b
+
+        state.Journal.Clear()
+        state.Version <- state.Version + 1L
+        Collections.pushAndMarkSet state.Out &state.Sinks state.Edges
+        state.Out.Clear()
+
+    interface ISetDeltaSink<'A> with
+        member this.OnDeltas(adds: 'A[], addCnt: int, rems: 'A[], remCnt: int) =
+            if not disposed then
+                Collections.journalAppendSet &state.Journal adds addCnt rems remCnt
+                state.Version <- state.Version + 1L
+                GraphContext.Default.MarkFrom(state.Edges)
+
+    interface IAdaptiveSet<'B> with
+        member this.GetValue() =
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
+
+            try
+                if disposed then
+                    invalidOp "This adaptive set has been disposed."
+
+                this.EnsureInitialized()
+
+                if source.Version <> state.DepVersions[0] then
+                    source.GetValue() |> ignore
+                    state.DepVersions[0] <- source.Version
+
+                if not state.Journal.IsEmpty then
+                    this.Drain()
+
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) state.Version
+                state.Set.Data :> IReadOnlySet<'B>
+            finally
+                ctx.ReleaseOwner()
+
+        member _.Version = state.Version
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                this.Unregister()
+                Collections.clearSinks &state.Sinks
+
+                for KeyValue(_, b) in mapped do
+                    b.Dispose()
+
+                mapped.Clear()
+                refs.Clear()
+                state.Set.Data.Clear()
+
+    interface ISetSinkRegistry with
+        member this.AddSetSink(sink) = Collections.addSink &state.Sinks sink
+
+        member this.RemoveSetSink(sink) =
+            Collections.removeSink &state.Sinks sink
+
+    interface IEdgeTarget with
+        member _.EdgeCount = state.Edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
