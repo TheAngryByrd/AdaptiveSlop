@@ -5400,3 +5400,118 @@ let ``AList take skip and sub follow adaptive bounds`` () =
 
     CVal.set 1 c
     Assert.Equal<int[]>([| 3 |], AList.toArray sa)
+
+// =============================================================================
+// Bring list — AList reductions group (gap sheet §5.8): reduce/reduceBy,
+// fold/foldGroup/foldHalfGroup, forall/exists, tryMin/tryMax, sum/sumBy,
+// average/averageBy, countBy.
+// =============================================================================
+
+[<Fact>]
+let ``AList reduce and reduceBy follow the deltas`` () =
+    let l = CList.ofSeq [ 1; 2; 3 ]
+
+    let sum = AList.sum (CList.value l)
+    Assert.Equal(6, AVal.getValue sum)
+
+    let sums = AList.sumBy (fun v -> v * 10) (CList.value l)
+    Assert.Equal(60, AVal.getValue sums)
+
+    CList.append 4 l
+    Assert.Equal(10, AVal.getValue sum)
+    Assert.Equal(100, AVal.getValue sums)
+
+    CList.removeAt 0 l // [ 2; 3; 4 ]
+    Assert.Equal(9, AVal.getValue sum)
+    Assert.Equal(90, AVal.getValue sums)
+
+    CList.updateAt 1 30 l // [ 2; 30; 4 ]
+    Assert.Equal(36, AVal.getValue sum)
+
+    CList.updateAt 1 30 l // no-op update: no rebuild, same value
+    Assert.Equal(36, AVal.getValue sum)
+
+[<Fact>]
+let ``AList fold family`` () =
+    let l = CList.ofSeq [ 1; 2; 3 ]
+
+    let f = AList.fold (fun s v -> s + v) 0 (CList.value l)
+    Assert.Equal(6, AVal.getValue f)
+
+    CList.append 4 l // fold recomputes on removals; appends add
+    Assert.Equal(10, AVal.getValue f)
+
+    CList.removeAt 0 l // fold cannot invert: full recompute
+    Assert.Equal(9, AVal.getValue f)
+
+    let l2 = CList.ofSeq [ 1; 2; 3 ]
+    let g = AList.foldGroup (fun s v -> s + v) (fun s v -> s - v) 0 (CList.value l2)
+    Assert.Equal(6, AVal.getValue g)
+
+    CList.removeAt 1 l2 // invertible: subtract without recompute
+    Assert.Equal(4, AVal.getValue g)
+
+    let l3 = CList.ofSeq [ 1; 2; 3 ]
+    let h = AList.foldHalfGroup (fun s v -> s + v) (fun s v -> ValueSome(s - v)) 0 (CList.value l3)
+    Assert.Equal(6, AVal.getValue h)
+
+    CList.removeAt 0 l3
+    Assert.Equal(5, AVal.getValue h)
+
+    let l4 = CList.ofSeq [ 1; 2; 3 ]
+    let nonInv = AList.foldHalfGroup (fun s v -> s + v) (fun _ _ -> ValueNone) 0 (CList.value l4)
+    Assert.Equal(6, AVal.getValue nonInv)
+
+    CList.removeAt 0 l4 // cannot invert: recompute
+    Assert.Equal(5, AVal.getValue nonInv)
+
+[<Fact>]
+let ``AList exists forall and countBy`` () =
+    let l = CList.ofSeq [ 1; 2; 3 ]
+
+    let hasEven = AList.exists (fun v -> v % 2 = 0) (CList.value l)
+    let allPos = AList.forall (fun v -> v > 0) (CList.value l)
+    let evens = AList.countBy (fun v -> v % 2 = 0) (CList.value l)
+
+    Assert.Equal(true, AVal.getValue hasEven)
+    Assert.Equal(true, AVal.getValue allPos)
+    Assert.Equal(1, AVal.getValue evens)
+
+    CList.append 4 l
+    Assert.Equal(2, AVal.getValue evens)
+
+    CList.removeAt 0 l // [ 2; 3; 4 ]: still has evens
+    Assert.Equal(true, AVal.getValue hasEven)
+
+    CList.updateAt 0 7 l // [ 7; 3; 4 ]
+    Assert.Equal(true, AVal.getValue hasEven)
+
+    CList.updateAt 2 5 l // [ 7; 3; 5 ]: no evens left
+    Assert.Equal(false, AVal.getValue hasEven)
+    Assert.Equal(0, AVal.getValue evens)
+
+[<Fact>]
+let ``AList tryMin tryMax sum average`` () =
+    let l = CList.ofSeq [ 3; 1; 2 ]
+
+    Assert.Equal(ValueSome 1, AVal.getValue (AList.tryMin (CList.value l)))
+    Assert.Equal(ValueSome 3, AVal.getValue (AList.tryMax (CList.value l)))
+    Assert.Equal(6, AVal.getValue (AList.sum (CList.value l)))
+
+    let lf = CList.ofSeq [ 1.0; 2.0; 3.0 ]
+    Assert.Equal(2.0, AVal.getValue (AList.average (CList.value lf)))
+    Assert.Equal(4.0, AVal.getValue (AList.averageBy (fun v -> v * 2.0) (CList.value lf)))
+
+    CList.removeAt 1 l // [ 3; 2 ]
+    Assert.Equal(ValueSome 2, AVal.getValue (AList.tryMin (CList.value l)))
+    Assert.Equal(ValueSome 3, AVal.getValue (AList.tryMax (CList.value l)))
+    Assert.Equal(5, AVal.getValue (AList.sum (CList.value l)))
+
+    CList.removeAt 0 lf // [ 2.0; 3.0 ]
+    Assert.Equal(2.5, AVal.getValue (AList.average (CList.value lf)))
+
+    CList.removeAt 0 l
+    CList.removeAt 0 l // empty
+    Assert.Equal(ValueNone, AVal.getValue (AList.tryMin (CList.value l)))
+    Assert.Equal(ValueNone, AVal.getValue (AList.tryMax (CList.value l)))
+    Assert.Equal(0, AVal.getValue (AList.sum (CList.value l)))

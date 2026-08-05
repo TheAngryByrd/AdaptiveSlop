@@ -287,6 +287,178 @@ type SetReduceNode<'a, 'b, 's, 'v when 'a: equality>
                 this.Unregister()
 
 /// <summary>
+/// A reduction over an adaptive list (FDA <c>AList.reduce</c> parity). The
+/// reduction state is maintained per delta: an insert adds the mapped value,
+/// a remove subtracts it (falling back to a full recompute when the reduction
+/// cannot invert, e.g. <c>AdaptiveReduction.fold</c>), an update subtracts the
+/// old and adds the new. The mirror is aligned with the input positions, so
+/// structural ops shift it with the source. Order-sensitive reductions are the
+/// user's contract (the reduction's add/sub must be delta-consistent), the
+/// same contract as the set/map reduction nodes.
+/// </summary>
+type ListReduceNode<'a, 'b, 's, 'v>
+    (source: IAdaptiveList<'a>, [<InlineIfLambda>] mapping: 'a -> 'b, reduction: AdaptiveReduction<'b, 's, 'v>)
+    =
+    let mutable version = 0L
+    let mutable edges = ParentEdges()
+    let mutable depVersion = 0L
+    let mutable journal = ListDelta<'a>.Create()
+    // Mirror of the source values plus their mapped values, aligned with the
+    // input positions (a remove inverts with the stored mapped old value; the
+    // mapping runs once per journal element).
+    let mirror = ResizeArray<struct ('a * 'b)>()
+    let mutable initialized = false
+    let mutable disposed = false
+    let mutable red = reduction.seed
+    let mutable value = reduction.view reduction.seed
+
+    member private this.Register() =
+        match box source with
+        | :? IListSinkRegistry as r -> r.AddListSink(box (this :> IListDeltaSink<'a>))
+        | _ -> ()
+
+    member private this.Unregister() =
+        match box source with
+        | :? IListSinkRegistry as r -> r.RemoveListSink(box (this :> IListDeltaSink<'a>))
+        | _ -> ()
+
+    member private this.EnsureInitialized() =
+        if not initialized then
+            this.Register()
+            this.Rebuild()
+            depVersion <- source.Version
+            initialized <- true
+
+    /// Full recompute from the current view, rebuilding the mirror. Consumes
+    /// the whole journal: the rebuilt state reflects every pending delta.
+    member private this.Rebuild() =
+        mirror.Clear()
+        let mutable acc = reduction.seed
+        let view = source.GetValue()
+
+        for i in 0 .. view.Count - 1 do
+            let v = view[i]
+            let m = mapping v
+            mirror.Add(struct (v, m))
+            acc <- reduction.add acc m
+
+        red <- acc
+        value <- reduction.view red
+        journal.Clear()
+
+    /// Apply the journal to the reduction state. The ops are applied in order
+    /// (each position refers to the state as of the previous op); an update
+    /// with an equal source value is skipped (no-op updates do not rebuild).
+    member private this.Drain() =
+        let ops = journal.Ops
+        let cnt = journal.Ops.Count
+        let mutable i = 0
+        let mutable rebuilt = false
+
+        try
+            while i < cnt && not rebuilt do
+                let op = ops.Items[i]
+                let p = op.Position
+
+                match op.Kind with
+                | ListOpKind.Insert ->
+                    let m = mapping op.Value
+                    mirror.Insert(p, struct (op.Value, m))
+                    red <- reduction.add red m
+                | ListOpKind.Remove ->
+                    if p >= 0 && p < mirror.Count then
+                        let struct (_, mappedOld) = mirror[p]
+
+                        match reduction.sub red mappedOld with
+                        | ValueSome s -> red <- s
+                        | ValueNone ->
+                            this.Rebuild()
+                            rebuilt <- true
+
+                        if not rebuilt then
+                            mirror.RemoveAt p
+                | _ -> // Update
+                    if p >= 0 && p < mirror.Count then
+                        let struct (oldV, mappedOld) = mirror[p]
+
+                        if EqualityComparer<'a>.Default.Equals(oldV, op.Value) then
+                            // No-op update: nothing to invert, nothing to add.
+                            ()
+                        else
+                            let m = mapping op.Value
+
+                            match reduction.sub red mappedOld with
+                            | ValueSome s -> red <- s
+                            | ValueNone ->
+                                this.Rebuild()
+                                rebuilt <- true
+
+                            if not rebuilt then
+                                mirror[p] <- struct (op.Value, m)
+                                red <- reduction.add red m
+
+                i <- i + 1
+        finally
+            // Consumed ops: the journal is cleared even when the drain threw;
+            // a rebuilt state already reflects every pending delta, and an
+            // applied op must never be applied again.
+            if rebuilt then
+                journal.Clear()
+            else
+                let consumed = i
+
+                if consumed > 0 then
+                    Array.Copy(ops.Items, consumed, ops.Items, 0, cnt - consumed)
+                    journal.Ops.Count <- cnt - consumed
+
+        if not rebuilt then
+            value <- reduction.view red
+            version <- version + 1L
+
+    interface IListDeltaSink<'a> with
+        member this.OnDeltas(ops: ListOp<'a>[], opCnt: int) =
+            if not disposed then
+                Collections.journalAppendList &journal ops opCnt
+                version <- version + 1L
+                GraphContext.Default.MarkFrom(edges)
+
+    interface IAdaptiveValue<'v> with
+        member this.GetValue() =
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
+
+            try
+                if disposed then
+                    invalidOp "This adaptive value has been disposed."
+
+                this.EnsureInitialized()
+
+                if source.Version <> depVersion then
+                    source.GetValue() |> ignore
+                    depVersion <- source.Version
+
+                if not journal.IsEmpty then
+                    this.Drain()
+
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                value
+            finally
+                ctx.ReleaseOwner()
+
+        member _.Version = version
+
+    interface IEdgeTarget with
+        member _.EdgeCount = edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                this.Unregister()
+
+/// <summary>
 /// A delta-driven reduction over a map. Keeps a mirror of the source
 /// values so removals and updates can invert (<c>sub</c> receives the old
 /// mapped value). The mapping is applied per journal element at drain time.

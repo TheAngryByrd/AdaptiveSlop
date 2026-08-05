@@ -1293,6 +1293,116 @@ module AList =
         AdaptiveNode<bool>(fun () -> list.GetValue().Count = 0)
 
     /// <summary>
+    /// Adaptively reduces the list with the given <see cref="AdaptiveReduction"/>
+    /// (FDA <c>AList.reduce</c> parity). The reduction state is maintained per
+    /// delta; a reduction that cannot invert a removal recomputes (e.g.
+    /// <see cref="AdaptiveReduction.fold"/>). Order-sensitive reductions are
+    /// the caller's contract (the add/sub must be delta-consistent).
+    /// </summary>
+    let inline reduce (reduction: AdaptiveReduction<'a, 's, 'v>) (list: alist<'a>) : aval<'v> =
+        new ListReduceNode<'a, 'a, 's, 'v>(list, (fun v -> v), reduction)
+
+    /// <summary>
+    /// Maps every element, then reduces the mapped values with the given
+    /// <see cref="AdaptiveReduction"/> (FDA <c>AList.reduceBy</c> parity). The
+    /// mapping runs per delta entry.
+    /// </summary>
+    let inline reduceBy
+        (reduction: AdaptiveReduction<'b, 's, 'v>)
+        ([<InlineIfLambda>] mapping: 'a -> 'b)
+        (list: alist<'a>)
+        : aval<'v> =
+        new ListReduceNode<'a, 'b, 's, 'v>(list, mapping, reduction)
+
+    /// <summary>
+    /// Adaptively folds the list with <c>add</c>; every removal recomputes the
+    /// whole fold (FDA <c>AList.fold</c> parity).
+    /// </summary>
+    let inline fold ([<InlineIfLambda>] add: 's -> 'a -> 's) (zero: 's) (list: alist<'a>) : aval<'s> =
+        reduceBy (AdaptiveReduction.fold zero add) (fun v -> v) list
+
+    /// <summary>
+    /// Adaptively folds the list with an invertible <c>subtract</c>: removals
+    /// update the state without a recompute (FDA <c>AList.foldGroup</c>
+    /// parity; the add/sub must be delta-consistent, see
+    /// <see cref="reduce"/>).
+    /// </summary>
+    let inline foldGroup
+        ([<InlineIfLambda>] add: 's -> 'a -> 's)
+        ([<InlineIfLambda>] subtract: 's -> 'a -> 's)
+        (zero: 's)
+        (list: alist<'a>)
+        : aval<'s> =
+        reduceBy (AdaptiveReduction.group zero add subtract) (fun v -> v) list
+
+    /// <summary>
+    /// Adaptively folds the list with a partially invertible
+    /// <c>trySubtract</c>: removals that cannot be inverted recompute the
+    /// whole fold (FDA <c>AList.foldHalfGroup</c> parity).
+    /// </summary>
+    let inline foldHalfGroup
+        ([<InlineIfLambda>] add: 's -> 'a -> 's)
+        ([<InlineIfLambda>] trySubtract: 's -> 'a -> 's voption)
+        (zero: 's)
+        (list: alist<'a>)
+        : aval<'s> =
+        reduceBy (AdaptiveReduction.halfGroup zero add trySubtract) (fun v -> v) list
+
+    /// <summary>Adaptively tests if any element satisfies the predicate (FDA <c>AList.exists</c> parity).</summary>
+    let inline exists ([<InlineIfLambda>] predicate: 'T -> bool) (list: alist<'T>) : aval<bool> =
+        let reduction =
+            AdaptiveReduction.countPositive |> AdaptiveReduction.mapOut (fun c -> c <> 0)
+
+        new ListReduceNode<'T, bool, int, bool>(list, predicate, reduction)
+
+    /// <summary>Adaptively tests if every element satisfies the predicate (FDA <c>AList.forall</c> parity).</summary>
+    let inline forall ([<InlineIfLambda>] predicate: 'T -> bool) (list: alist<'T>) : aval<bool> =
+        new ListReduceNode<'T, bool, int, bool>(
+            list,
+            predicate,
+            AdaptiveReduction.countNegative |> AdaptiveReduction.mapOut (fun c -> c = 0)
+        )
+
+    /// <summary>Adaptively counts the elements that satisfy the predicate (FDA <c>AList.countBy</c> parity).</summary>
+    let inline countBy ([<InlineIfLambda>] predicate: 'T -> bool) (list: alist<'T>) : aval<int> =
+        new ListReduceNode<'T, bool, int, int>(list, predicate, AdaptiveReduction.countPositive)
+
+    /// <summary>Adaptively gets the minimum element, or <c>ValueNone</c> when empty (FDA <c>AList.tryMin</c> parity).</summary>
+    let inline tryMin (list: alist<'T>) : aval<'T voption> =
+        reduce (AdaptiveReduction.tryMin ()) list
+
+    /// <summary>Adaptively gets the maximum element, or <c>ValueNone</c> when empty (FDA <c>AList.tryMax</c> parity).</summary>
+    let inline tryMax (list: alist<'T>) : aval<'T voption> =
+        reduce (AdaptiveReduction.tryMax ()) list
+
+    /// <summary>Adaptively sums the elements (FDA <c>AList.sum</c> parity; needs an additive numeric type).</summary>
+    let inline sum (list: alist<'T>) : aval<'T> = reduce (AdaptiveReduction.sum ()) list
+
+    /// <summary>Adaptively sums the mapped elements (FDA <c>AList.sumBy</c> parity).</summary>
+    let inline sumBy ([<InlineIfLambda>] mapping: 'T -> 'U) (list: alist<'T>) : aval<'U> =
+        reduceBy (AdaptiveReduction.sum ()) mapping list
+
+    /// <summary>
+    /// Adaptively averages the elements (needs a numeric type with
+    /// <c>DivideByInt</c>, e.g. <c>float</c>; FDA <c>AList.average</c> parity).
+    /// </summary>
+    let inline average (list: alist<^T>) : aval<^T> =
+        AVal.map2
+            (fun total c -> LanguagePrimitives.DivideByInt total c)
+            (sum list)
+            (count list)
+
+    /// <summary>
+    /// Adaptively averages the mapped elements (needs a numeric type with
+    /// <c>DivideByInt</c>, e.g. <c>float</c>; FDA <c>AList.averageBy</c> parity).
+    /// </summary>
+    let inline averageBy ([<InlineIfLambda>] mapping: 'T -> ^U) (list: alist<'T>) : aval<^U> =
+        AVal.map2
+            (fun total c -> LanguagePrimitives.DivideByInt total c)
+            (sumBy mapping list)
+            (count list)
+
+    /// <summary>
     /// An adaptive list over an adaptive value of a sequence (FDA
     /// <c>AList.ofAVal</c> parity). Every change of the value replaces the
     /// whole state and emits the positional diff as the delta.
