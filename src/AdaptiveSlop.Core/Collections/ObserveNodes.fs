@@ -134,10 +134,15 @@ type ObserveSetNode<'T when 'T: equality>
                 if not journal.IsEmpty then
                     let addStart = journal.Adds.Count
                     let remStart = journal.Rems.Count
-                    reduceJournal ()
-                    callback view out
-                    compact &journal.Adds addStart
-                    compact &journal.Rems remStart
+
+                    try
+                        reduceJournal ()
+                        callback view out
+                    finally
+                        // Compact even when the callback (or the reduce) threw:
+                        // consumed entries must not be delivered twice.
+                        compact &journal.Adds addStart
+                        compact &journal.Rems remStart
 
     interface IObservation with
         member _.IsActive = active
@@ -166,52 +171,39 @@ type ObserveMapNode<'K, 'V when 'K: equality>
     let mutable indexInTarget = -1
     let mutable journal = MapDelta<'K, 'V>.Create()
     let mutable out = MapDelta<'K, 'V>.Create()
-    // Reused scratch: net op count per key (positive = set, negative = removed).
-    let counts = Dictionary<'K, int>()
-    // Reused scratch: the last set value per key (the delivered Set carries it).
+    // Reused scratch: the last set value per key (the delivered Set carries
+    // it). A key present in this dictionary at the end of a reduce is present
+    // in the batch's final state; a key delivered as Rem (or Set then Rem) is
+    // absent (delivery is sets-then-rems, and producers emit net deltas).
     let lastValues = Dictionary<'K, 'V>()
 
-    /// Reduce the journal to a net delta. Effective source ops strictly
-    /// alternate per key, so the net count decides: positive -> Set with the
-    /// last value, negative -> Rem, zero -> nothing.
+    /// Reduce the journal to a net delta. Presence-based: Sets record the last
+    /// value, Rems drop the key, so Set;Set;Rem nets to a Rem (no KeyNotFound
+    /// lookup, no lost removal) and Set;Rem nets to a Rem.
     let reduceJournal () =
         out.Clear()
 
         for i in 0 .. journal.Sets.Count - 1 do
             let struct (k, v) = journal.Sets.Items[i]
-            let mutable n = 0
-
-            if counts.TryGetValue(k, &n) then
-                counts[k] <- n + 1
-            else
-                counts[k] <- 1
-
             lastValues[k] <- v
 
         for i in 0 .. journal.Rems.Count - 1 do
             let k = journal.Rems.Items[i]
-            let mutable n = 0
-
-            if counts.TryGetValue(k, &n) then
-                counts[k] <- n - 1
-            else
-                counts[k] <- -1
-
             lastValues.Remove k |> ignore
 
         // Explicit struct-enumerator loop: `for KeyValue in dict` boxes the
         // enumerator (measured 24 B per delivery).
-        let mutable e = counts.GetEnumerator()
+        let mutable e = lastValues.GetEnumerator()
 
         while e.MoveNext() do
-            let kvp = e.Current
+            out.Sets <- Collections.bufferAppend out.Sets (struct (e.Current.Key, e.Current.Value))
 
-            if kvp.Value > 0 then
-                out.Sets <- Collections.bufferAppend out.Sets (struct (kvp.Key, lastValues[kvp.Key]))
-            elif kvp.Value < 0 then
-                out.Rems <- Collections.bufferAppend out.Rems kvp.Key
+        for i in 0 .. journal.Rems.Count - 1 do
+            let k = journal.Rems.Items[i]
 
-        counts.Clear()
+            if not (lastValues.ContainsKey k) then
+                out.Rems <- Collections.bufferAppend out.Rems k
+
         lastValues.Clear()
 
     /// Keep the entries appended after <paramref name="start"/> (reentrant
@@ -275,10 +267,15 @@ type ObserveMapNode<'K, 'V when 'K: equality>
                 if not journal.IsEmpty then
                     let setStart = journal.Sets.Count
                     let remStart = journal.Rems.Count
-                    reduceJournal ()
-                    callback view out
-                    compact &journal.Sets setStart
-                    compact &journal.Rems remStart
+
+                    try
+                        reduceJournal ()
+                        callback view out
+                    finally
+                        // Compact even when the callback (or the reduce) threw:
+                        // consumed entries must not be delivered twice.
+                        compact &journal.Sets setStart
+                        compact &journal.Rems remStart
 
     interface IObservation with
         member _.IsActive = active

@@ -124,13 +124,30 @@ type internal TransactionBuffer() =
 
     member _.Commit() =
         let mutable i = 0
+        let mutable firstEx: exn option = None
 
         while i < count do
-            buffer[i].Commit()
+            try
+                buffer[i].Commit()
+            with e ->
+                if firstEx.IsNone then
+                    firstEx <- Some e
+
+                // Do not apply the rest of the batch; discard it.
+                i <- i + 1
+
+                while i < count do
+                    buffer[i].Abort()
+                    i <- i + 1
+
             i <- i + 1
 
         Array.Clear(buffer, 0, count)
         count <- 0
+
+        match firstEx with
+        | Some e -> raise e
+        | None -> ()
 
     member _.Abort() =
         let mutable i = 0
@@ -187,6 +204,18 @@ type internal DependencyCollector() =
         frameDepth <- frameDepth - 1
         count <- frameStarts[frameDepth]
         frameDepth
+
+    /// Clear the whole buffer. Called when the outermost evaluation ends:
+    /// the collector lives on the static default graph context, so without
+    /// this the deepest evaluation's objects stay reachable through the
+    /// static root until a deeper evaluation overwrites the slots.
+    member _.Clear() =
+        if count > 0 then
+            Array.Clear(depBuffer, 0, count)
+            Array.Clear(versionBuffer, 0, count)
+
+        count <- 0
+        frameDepth <- 0
 
     /// Get the current frame's deps (depBuffer, versionBuffer, start, length)
     /// Returns struct tuple to avoid heap allocation
@@ -316,6 +345,7 @@ type internal PostRing(capacity: int) =
     member this.Enqueue(item: obj) =
         let mutable h = Volatile.Read(&head)
         let mutable enqueued = false
+        let mutable spins = 0
 
         while not enqueued do
             let idx = int (h &&& int64 mask)
@@ -328,8 +358,17 @@ type internal PostRing(capacity: int) =
                     Volatile.Write(&slot.Seq, seq + 1)
                     enqueued <- true
             elif seq < int h then
-                // The ring is full: the slot has not been consumed yet. Wait.
-                Thread.SpinWait(8)
+                // The ring is full: the slot has not been consumed yet. Wait
+                // with bounded backoff (policy: Post blocks until the owner
+                // drains; items are never dropped).
+                spins <- spins + 1
+
+                if spins >= 32 then
+                    Thread.Yield() |> ignore
+                    spins <- 0
+                else
+                    Thread.SpinWait(8)
+
                 h <- Volatile.Read(&head)
             else
                 // Claimed by another producer; retry at the new head.
@@ -527,13 +566,34 @@ type internal GraphContext() =
             this.ReleaseOwner()
 
     /// Deliver every queued notification. Notifications queued during delivery
-    /// are delivered in the same drain.
-    member internal _.DeliverNotifications() =
+    /// are delivered in the same drain. A throwing callback is isolated: the
+    /// rest of the queue still drains, and the first exception is rethrown
+    /// after the drain. A callback that enqueues without bound (a write in a
+    /// callback that observes the written value) is cut off by a depth limit
+    /// (policy: callbacks must not write the values they observe).
+    member internal this.DeliverNotifications() =
+        let mutable delivered = 0
+        let mutable firstEx: exn option = None
+
         while notifyCount > 0 do
+            if delivered >= 10000 then
+                failwith
+                    "AdaptiveSlop: notification delivery exceeded 10000 rounds. A callback keeps writing an observed value (infinite notification loop)."
+
+            delivered <- delivered + 1
             notifyCount <- notifyCount - 1
             let sink = notifications[notifyCount]
             notifications[notifyCount] <- Unchecked.defaultof<INotifiable>
-            sink.Deliver()
+
+            try
+                sink.Deliver()
+            with e ->
+                if firstEx.IsNone then
+                    firstEx <- Some e
+
+        match firstEx with
+        | Some e -> raise e
+        | None -> ()
 
 module internal AdaptiveRuntime =
     let internal getWriteGeneration () = GraphContext.Default.WriteGeneration
@@ -566,6 +626,9 @@ module internal AdaptiveRuntime =
         finally
             if collector.PopFrame() = 0 then
                 ctx.CollectorActive <- false
+                // Drop references to the evaluation's dependencies: the
+                // collector is reachable from the static default context.
+                collector.Clear()
 
 /// <summary>
 /// Applies changes posted from foreign threads.
@@ -649,6 +712,12 @@ module Transaction =
 
 
 type ConstantValue<'T>(value: 'T) =
+    // An edge target with a real edge list: AdaptiveNode promotes to the
+    // flag-based dirty check only when every dependency link is complete
+    // (depSlot >= 0). Constants must therefore be edge targets; their version
+    // never changes, so no mark ever fires and the edges are never used.
+    let edges = ParentEdges()
+
     interface IAdaptiveValue<'T> with
         member this.GetValue() =
             AdaptiveRuntime.addDependency (this :> IAdaptiveObject) 0L
@@ -656,9 +725,16 @@ type ConstantValue<'T>(value: 'T) =
 
         member _.Version = 0L
 
+    interface IEdgeTarget with
+        member _.EdgeCount = edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
+
 type LazyConstantValue<'T>([<InlineIfLambda>] create: unit -> 'T) =
     let mutable computed = false
     let mutable value = Unchecked.defaultof<'T>
+    // See ConstantValue: an edge target so dependents can promote to Clean.
+    let edges = ParentEdges()
 
     interface IAdaptiveValue<'T> with
         member this.GetValue() =
@@ -674,6 +750,11 @@ type LazyConstantValue<'T>([<InlineIfLambda>] create: unit -> 'T) =
 
         member _.Version = 0L
 
+    interface IEdgeTarget with
+        member _.EdgeCount = edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
+
 type AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
     let mutable version = 0L
     let mutable hasValue = false
@@ -682,7 +763,6 @@ type AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
     let mutable depVersions: int64[] = Array.empty
     // Position of this node in the parents array of each dependency. -1 = no edge.
     let mutable depSlots: int[] = Array.empty
-    let mutable arraysFromPool = false
     let mutable depCount = 0
     let edges = ParentEdges()
     let mutable dirtyState = DirtyState.MaybeDirty
@@ -802,17 +882,15 @@ type AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
         if observed && not sameSet then
             this.TearDownEdges()
 
-        // Store the new dependency set and the version snapshots.
+        // Store the new dependency set and the version snapshots. Plain
+        // arrays, not ArrayPool: a rented array is only returned when the node
+        // grows, so a garbage-collected node leaks its rented arrays out of
+        // the pool (this type has no IDisposable/finalizer). In the steady
+        // state (dep count unchanged) plain arrays allocate nothing either.
         if deps.Length < newLen then
-            if arraysFromPool && deps.Length > 0 then
-                ArrayPool<IAdaptiveObject>.Shared.Return(deps, true)
-                ArrayPool<int64>.Shared.Return(depVersions, true)
-                ArrayPool<int>.Shared.Return(depSlots, true)
-
-            deps <- ArrayPool<IAdaptiveObject>.Shared.Rent(newLen)
-            depVersions <- ArrayPool<int64>.Shared.Rent(newLen)
-            depSlots <- ArrayPool<int>.Shared.Rent(newLen)
-            arraysFromPool <- true
+            deps <- Array.zeroCreate newLen
+            depVersions <- Array.zeroCreate<int64> newLen
+            depSlots <- Array.create newLen -1
 
         Array.Copy(newDeps, newStart, deps, 0, newLen)
         Array.Copy(newVersions, newStart, depVersions, 0, newLen)
@@ -945,7 +1023,13 @@ type ChangeableValue<'T>(initial: 'T) =
     /// Post is the only operation a foreign thread may call on a graph. It never
     /// touches graph state: it writes the typed pending field and, if the source is
     /// not queued yet, pushes the source onto the bounded post ring. If the ring is
-    /// full, Post waits until the owner drains it.
+    /// full, Post waits (spin with yield backoff) until the owner drains it; items
+    /// are never dropped.
+    /// </para>
+    /// <para>
+    /// The pending value crosses threads as a plain (non-atomic) write. 'T must be
+    /// a reference type or a struct no larger than a machine word: larger structs
+    /// can tear (the owner may apply a value mixed from two posts).
     /// </para>
     /// </remarks>
     /// <example>
@@ -1075,6 +1159,22 @@ type MapNNode<'T, 'U>(deps: IAdaptiveValue<'T>[], [<InlineIfLambda>] compute: 'T
                     dirty <- true
 
                 i <- i + 1
+
+            // Verified clean: promote to the flag-based check (as AdaptiveNode
+            // does) so later reads do not re-walk the dependency closure. The
+            // links are complete once every dep has a slot, so marks arrive.
+            if not dirty && edges.Count > 0 then
+                let mutable complete = true
+                let mutable j = 0
+
+                while complete && j < deps.Length do
+                    if depSlots[j] < 0 then
+                        complete <- false
+
+                    j <- j + 1
+
+                if complete then
+                    dirtyState <- DirtyState.Clean
 
             lastCheckedWriteGen <- writeGen
             dirtyCache <- dirty
@@ -1242,6 +1342,21 @@ type ReduceNode<'T>(deps: IAdaptiveValue<'T>[], init: 'T, [<InlineIfLambda>] red
 
                 i <- i + 1
 
+            // Verified clean: promote to the flag-based check (as AdaptiveNode
+            // does) so later reads do not re-walk the dependency closure.
+            if not dirty && edges.Count > 0 then
+                let mutable complete = true
+                let mutable j = 0
+
+                while complete && j < deps.Length do
+                    if depSlots[j] < 0 then
+                        complete <- false
+
+                    j <- j + 1
+
+                if complete then
+                    dirtyState <- DirtyState.Clean
+
             lastCheckedWriteGen <- writeGen
             dirtyCache <- dirty
             dirty
@@ -1263,10 +1378,19 @@ type ReduceNode<'T>(deps: IAdaptiveValue<'T>[], init: 'T, [<InlineIfLambda>] red
         version <- version + 1L
 
         dirtyState <-
-            if edges.Count > 0 then
+            if AdaptiveRuntime.getWriteGeneration () <> checkedGen then
+                // A write from user code inside the reduce callback: the value
+                // may be stale, keep Dirty so the next read recomputes.
+                DirtyState.Dirty
+            elif edges.Count > 0 then
                 DirtyState.Clean
             else
                 DirtyState.MaybeDirty
+
+        // The recompute is valid as of checkedGen: key the cache there so
+        // later reads at the same generation skip the version check.
+        lastCheckedWriteGen <- checkedGen
+        dirtyCache <- false
 
     /// Registration cascade: this node gained its first parent.
     member private this.RegisterWithDeps() =
@@ -1382,12 +1506,15 @@ type Observation<'T>(target: IAdaptiveValue<'T>, [<InlineIfLambda>] callback: 'T
             enqueued <- false
 
             if active then
+                // The version is consumed only after the callback succeeds: a
+                // throwing callback keeps the observation's lastVersion stale,
+                // so the next delivery re-reads and re-delivers the change.
                 let newValue = target.GetValue()
                 let newVersion = (target :> IAdaptiveObject).Version
 
                 if newVersion <> lastVersion then
-                    lastVersion <- newVersion
                     callback newValue
+                    lastVersion <- newVersion
 
     interface IObservation with
         member _.IsActive = active

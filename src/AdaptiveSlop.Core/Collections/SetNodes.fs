@@ -58,17 +58,18 @@ type MapSetNode<'T, 'U when 'U: equality>(source: IAdaptiveSet<'T>, [<InlineIfLa
 
     member private this.EnsureInitialized() =
         if not initialized then
-            initialized <- true
             // Snapshot first, register between, then run the mapping over the
             // snapshot: the mapping is user code that may write to the source
             // (the transient view must not be iterated while it is mutated),
             // and the write must land in our journal (register before the
             // mapping runs). A dirty source draining during the snapshot read
-            // pushes to nobody: no double-apply.
+            // pushes to nobody: no double-apply. The flag is set last: an
+            // exception leaves the node uninitialized so the next read retries.
             let snapshot = HashSet<'T>(source.GetValue())
             this.Register()
             Collections.loadRefSet mapping snapshot &state
             state.DepVersions[0] <- source.Version
+            initialized <- true
 
     interface ISetDeltaSink<'T> with
         member this.OnDeltas(adds: 'T[], addCnt: int, rems: 'T[], remCnt: int) =
@@ -139,12 +140,13 @@ type FilterSetNode<'T when 'T: equality>(source: IAdaptiveSet<'T>, [<InlineIfLam
 
     member private this.EnsureInitialized() =
         if not initialized then
-            initialized <- true
             // Snapshot first, register between (see MapSetNode.EnsureInitialized).
+            // The flag is set last: an exception leaves the node uninitialized.
             let snapshot = HashSet<'T>(source.GetValue())
             this.Register()
             Collections.loadPlainSet mapOpt snapshot &state
             state.DepVersions[0] <- source.Version
+            initialized <- true
 
     interface ISetDeltaSink<'T> with
         member this.OnDeltas(adds: 'T[], addCnt: int, rems: 'T[], remCnt: int) =
@@ -215,9 +217,9 @@ type UnionSetNode<'T when 'T: equality>(left: IAdaptiveSet<'T>, right: IAdaptive
 
     member private this.EnsureInitialized() =
         if not initialized then
-            initialized <- true
             // Snapshot first, register between (see MapSetNode.EnsureInitialized).
             // The identity mapping cannot write; the snapshot is for uniformity.
+            // The flag is set last: an exception leaves the node uninitialized.
             let leftSnapshot = HashSet<'T>(left.GetValue())
             let rightSnapshot = HashSet<'T>(right.GetValue())
             this.RegisterSide left
@@ -226,6 +228,7 @@ type UnionSetNode<'T when 'T: equality>(left: IAdaptiveSet<'T>, right: IAdaptive
             Collections.loadRefSet Id.identityV rightSnapshot &state
             state.DepVersions[0] <- left.Version
             state.DepVersions[1] <- right.Version
+            initialized <- true
 
     interface ISetDeltaSink<'T> with
         member this.OnDeltas(adds: 'T[], addCnt: int, rems: 'T[], remCnt: int) =
@@ -316,12 +319,13 @@ type TwoSourceSetNode<'T when 'T: equality>(op: TwoSetOp, left: IAdaptiveSet<'T>
 
     member private this.EnsureInitialized() =
         if not initialized then
-            initialized <- true
             // Read first, register after (see MapSetNode.EnsureInitialized).
+            // The flag is set last: an exception leaves the node uninitialized.
             Collections.loadTwoSet op left right &state
             this.Register()
             state.DepVersions[0] <- left.Version
             state.DepVersions[1] <- right.Version
+            initialized <- true
 
     interface Collections.ITwoSetSinkTarget<'T> with
         member this.OnSideDeltas(side: int, adds: 'T[], addCnt: int, rems: 'T[], remCnt: int) =
@@ -396,15 +400,37 @@ type OfAvalSetNode<'T, 'S when 'T: equality and 'S :> seq<'T>>(value: IAdaptiveV
 
     member private this.EnsureInitialized() =
         if not initialized then
-            initialized <- true
-
             match value with
             | :? IEdgeTarget as t -> edgeInValue <- t.AddEdge(this :> IAdaptiveNode, -1)
             | _ -> ()
 
             // Initial load: materialize the value and build the state.
+            // The flag is set last: an exception leaves the node uninitialized.
+            // The init diff is not pushed: clear the out buffer so it cannot
+            // pollute the first real delta.
             let next = HashSet<'T>(value.GetValue())
             Collections.rebuildSetDiff next &state |> ignore
+            state.Out.Clear()
+            state.DepVersions[0] <- value.Version
+            initialized <- true
+
+    /// Re-read the value when it changed and emit the diff. Called from
+    /// GetValue and from the Version getter (poll model, like
+    /// <see cref="CustomSetNode"/>): a downstream re-pulls only when this
+    /// node's version moves, so the version must advance on the read path.
+    member private this.Poll() =
+        if value.Version <> state.DepVersions[0] then
+            // The value may yield a transient seq: materialize it.
+            let next = HashSet<'T>(value.GetValue())
+
+            if Collections.rebuildSetDiff next &state then
+                // The version must advance: downstream nodes re-pull the
+                // source only when it changed (a stuck version makes
+                // derived nodes stale forever).
+                state.Version <- state.Version + 1L
+                Collections.pushAndMarkSet state.Out &state.Sinks state.Edges
+                state.Out.Clear()
+
             state.DepVersions[0] <- value.Version
 
     interface IAdaptiveNode with
@@ -428,23 +454,16 @@ type OfAvalSetNode<'T, 'S when 'T: equality and 'S :> seq<'T>>(value: IAdaptiveV
                     invalidOp "This adaptive set has been disposed."
 
                 this.EnsureInitialized()
-
-                if value.Version <> state.DepVersions[0] then
-                    // The value may yield a transient seq: materialize it.
-                    let next = HashSet<'T>(value.GetValue())
-
-                    if Collections.rebuildSetDiff next &state then
-                        Collections.pushAndMarkSet state.Out state.Sinks state.Edges
-                        state.Out.Clear()
-
-                    state.DepVersions[0] <- value.Version
-
+                this.Poll()
                 AdaptiveRuntime.addDependency (this :> IAdaptiveObject) state.Version
                 state.Set.Data :> IReadOnlySet<'T>
             finally
                 ctx.ReleaseOwner()
 
-        member _.Version = state.Version
+        member this.Version =
+            this.EnsureInitialized()
+            this.Poll()
+            state.Version
 
     interface IDisposable with
         member this.Dispose() =
@@ -486,7 +505,7 @@ type ReaderSetNode<'T when 'T: equality>([<InlineIfLambda>] reader: unit -> Hash
 
             if Collections.rebuildSetDiff next &state then
                 state.Version <- state.Version + 1L
-                Collections.pushAndMarkSet state.Out state.Sinks state.Edges
+                Collections.pushAndMarkSet state.Out &state.Sinks state.Edges
                 state.Out.Clear()
 
     interface IAdaptiveSet<'T> with
@@ -535,6 +554,9 @@ type ReaderSetNode<'T when 'T: equality>([<InlineIfLambda>] reader: unit -> Hash
 type CustomSetNode<'T when 'T: equality>([<InlineIfLambda>] compute: IReadOnlySet<'T> -> SetDeltaBuilder<'T> -> unit) =
     let mutable state = SetNodeState<'T, 'T>.Create(0)
     let writer = SetDeltaBuilder<'T>()
+    // Reused scratch: prior presence of every element touched by one poll
+    // (construction-time allocation; zero steady-state allocation).
+    let scratch = Dictionary<'T, bool>()
     let mutable disposed = false
 
     member private this.Poll() =
@@ -543,17 +565,44 @@ type CustomSetNode<'T when 'T: equality>([<InlineIfLambda>] compute: IReadOnlySe
             compute (state.Set.Data :> IReadOnlySet<'T>) writer
 
             if not writer.IsEmpty then
-                let adds = writer.Adds
-                let rems = writer.Rems
+                // Net-delta invariant: the delivered delta must not carry the
+                // same element in both adds and rems (consumers apply the
+                // buffers order-free). Adds apply first by convention; record
+                // the prior presence of every touched element, apply the
+                // batch, then deliver the net transition.
+                scratch.Clear()
 
-                for i in 0 .. adds.Count - 1 do
-                    state.Set.Data.Add adds.Items[i] |> ignore
+                for i in 0 .. writer.Adds.Count - 1 do
+                    let x = writer.Adds.Items[i]
 
-                for i in 0 .. rems.Count - 1 do
-                    state.Set.Data.Remove rems.Items[i] |> ignore
+                    if not (scratch.ContainsKey x) then
+                        scratch[x] <- state.Set.Data.Contains x
 
-                state.Version <- state.Version + 1L
-                Collections.pushAndMarkSet (writer.Snapshot()) state.Sinks state.Edges
+                    state.Set.Data.Add x |> ignore
+
+                for i in 0 .. writer.Rems.Count - 1 do
+                    let x = writer.Rems.Items[i]
+
+                    if not (scratch.ContainsKey x) then
+                        scratch[x] <- state.Set.Data.Contains x
+
+                    state.Set.Data.Remove x |> ignore
+
+                writer.Clear()
+                let mutable e = scratch.GetEnumerator()
+
+                while e.MoveNext() do
+                    let x = e.Current.Key
+                    let prior = e.Current.Value
+                    let final = state.Set.Data.Contains x
+
+                    if prior <> final then
+                        if final then writer.Add x else writer.Remove x
+
+                if not writer.IsEmpty then
+                    state.Version <- state.Version + 1L
+                    Collections.pushAndMarkSet (writer.Snapshot()) &state.Sinks state.Edges
+
                 writer.Clear()
 
     interface IAdaptiveSet<'T> with
@@ -642,6 +691,7 @@ type CollectSetNode<'T, 'U when 'T: equality and 'U: equality>
                 state.Inner[x] <- entry
 
             state.DepVersions[0] <- source.Version
+            initialized <- true
 
     interface Collections.ICollectTarget<'T, 'U> with
         member this.OnInnerDeltas(key: 'T, adds: 'U[], addCnt: int, rems: 'U[], remCnt: int) =
@@ -800,8 +850,6 @@ type BindSetNode<'T, 'U when 'U: equality>
 
     member private this.EnsureInitialized() =
         if not initialized then
-            initialized <- true
-
             match value with
             | :? IEdgeTarget as t -> edgeInValue <- t.AddEdge(this :> IAdaptiveNode, -1)
             | _ -> ()
@@ -810,6 +858,7 @@ type BindSetNode<'T, 'U when 'U: equality>
             inner <- mapping current
             this.LoadInner()
             state.DepVersions[0] <- value.Version
+            initialized <- true
 
     interface IAdaptiveNode with
         member this.MarkDirty() =

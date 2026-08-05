@@ -826,3 +826,320 @@ entities (identical in both libraries — the graph does not allocate it).
 |------------------- |------------ |-------------------- |----------:|-----------:|---------:|------:|--------:|---------:|-------:|----------:|------------:|
 | AdaptiveSlop       | 4           | 500                 |  53.82 μs |   6.926 μs | 0.380 μs |  1.00 |    0.01 |   0.0610 |      - |     849 B |        1.00 |
 | FSharpDataAdaptive | 4           | 500                 | 593.65 μs | 110.121 μs | 6.036 μs | 11.03 |    0.12 | 112.3047 | 0.9766 |  944848 B |    1,112.90 |
+
+---
+
+## 2026-08-05 — Hostile-review fixes + weak-reference sinks
+
+- Commit: 77fa089 (feat/hostile-review-fixes: ea5c455 hostile-review fixes + c992e76 weak-reference sinks); docs/archive/2026-08-05-DESIGN-WEAK-SINK-REFERENCES.md
+- Machine: WSL2 (Linux Fedora Remix), AMD Ryzen 9 6900HX 3.29GHz, 16 logical / 8 physical cores, .NET 8.0.29, x64 RyuJIT (x86-64-v3)
+- Job: DefaultJob — full suite, 134 benchmarks (BenchmarkResults/BenchmarkRun-20260805-132907.log)
+
+### What changed
+
+- Correctness fixes from the hostile reviews (docs/archive/2026-08-05-GLM_REVIEW_FINDINGS.md,
+  docs/archive/2026-08-05-KIMI_REVIEW_FINDINGS.md): ofAVal poll-on-version, net deltas at all
+  producers, list replay validation, ReduceNode write-generation guard, exception-safe
+  drain compaction, notification isolation, Set-supersedes-batch, real changeable
+  Dispose, plus allocation fixes (de-boxed enumerators, pre-sized scratch sets).
+- Weak-reference sinks (GLM 10): SinkList entries are now WeakReference; a derived
+  collection node that was read and then dropped is collected (FDA precedent:
+  WeakOutputSet). Delivery compacts dead entries at batch start; reentrant
+  registrations during delivery are not delivered (bound captured).
+
+### Regressions vs the 2026-08-07 section (same machine, doc rule: AdaptiveSlop mean beyond the baseline error margin)
+
+- Map 45.08 → 54.57 μs (+21%), Set 42.48 → 50.42 μs (+19%), Map2 64.79 → 68.16 μs (+5%,
+  marginal), DeepWide 5/3 162.18 → 176.70 μs (+9%), UnbalancedTree ShallowChange 50/5
+  51.70 → 57.68 μs (+12%), KipoPhysics GraphDirect 250 917.2 → 954.6 μs (+4%, marginal).
+- SetTransform (+7%) and KipoPhysics GraphDirect 1000 (+3%) also grew, but stay inside the
+  baseline error margin (ShortRun baseline; this run is the default job) — not counted.
+- Everything else is flat or faster. The largest wins: DeepWide 7/4 −41%, 5/4 −32%, 7/3 −22%;
+  OptimizedWideTree Map2Chain w10 −16%, w50 −15%, w500 −14%; WideTree w500 −15%; DeepChain
+  d1000 −14%, d100 −13%; UnbalancedTree DeepChange 50/20 −14%, 10/5 −13%, 100/20 −13%;
+  LargeCollection −8%; DiamondGraph −7%; ReadHeavy −7%; Bind −5%; Transaction −5%;
+  Concurrent −4%; Value −3%; MapTransform −3%.
+- Allocated stays zero on every steady-state path (Gen0 "-"). The rows with allocation are
+  the documented non-steady paths (ListWriteRead, KipoPhysics, Concurrent, Transaction).
+- New benchmarks with no prior baseline: ListAppend 71.48 μs, ListTransform 158.8 μs,
+  ListWriteRead 24.07 / 24.95 / 36.88 / 276.91 μs (Count 0 / 1000 / 10000 / 100000).
+- FDA-relative: AdaptiveSlop is faster on every path except the losses already present in the
+  2026-08-07 section (DeepWide wide/deep, UnbalancedTree ShallowChange at depth ≥ 50,
+  ListWriteRead at Count 100000); those ratios are unchanged within noise.
+
+### BindBenchmarks
+
+| Method             | Iterations | Mean      | Error     | StdDev   | Ratio | RatioSD | Gen0    | Allocated | Alloc Ratio |
+|------------------- |----------- |----------:|----------:|---------:|------:|--------:|--------:|----------:|------------:|
+| AdaptiveSlop       | 1000       |  72.62 μs |  0.792 μs | 0.741 μs |  1.00 |    0.01 |       - |         - |          NA |
+| FSharpDataAdaptive | 1000       | 539.77 μs | 10.190 μs | 9.532 μs |  7.43 |    0.15 | 69.3359 |  584000 B |          NA |
+
+### ConcurrentBenchmarks
+
+| Method             | ThreadCount | IterationsPerThread | Mean      | Error    | StdDev   | Ratio | RatioSD | Gen0     | Gen1   | Allocated | Alloc Ratio |
+|------------------- |------------ |-------------------- |----------:|---------:|---------:|------:|--------:|---------:|-------:|----------:|------------:|
+| AdaptiveSlop       | 4           | 500                 |  51.55 μs | 0.971 μs | 0.861 μs |  1.00 |    0.02 |   0.0610 |      - |     849 B |        1.00 |
+| FSharpDataAdaptive | 4           | 500                 | 502.85 μs | 7.996 μs | 6.677 μs |  9.76 |    0.20 | 112.3047 | 0.9766 |  944848 B |    1,112.90 |
+
+### DeepChainBenchmarks
+
+| Method             | Depth | Iterations | Mean         | Error      | StdDev     | Ratio | RatioSD | Gen0   | Allocated | Alloc Ratio |
+|------------------- |------ |----------- |-------------:|-----------:|-----------:|------:|--------:|-------:|----------:|------------:|
+| **AdaptiveSlop**       | **5**     | **100**        |     **24.20 μs** |   **0.407 μs** |   **0.381 μs** |  **1.00** |    **0.02** |      **-** |         **-** |          **NA** |
+| FSharpDataAdaptive | 5     | 100        |     71.28 μs |   0.679 μs |   0.567 μs |  2.95 |    0.05 | 5.6152 |   47200 B |          NA |
+|                    |       |            |              |            |            |       |         |        |           |             |
+| **AdaptiveSlop**       | **10**    | **100**        |     **49.82 μs** |   **0.507 μs** |   **0.424 μs** |  **1.00** |    **0.01** |      **-** |         **-** |          **NA** |
+| FSharpDataAdaptive | 10    | 100        |    120.21 μs |   0.695 μs |   0.650 μs |  2.41 |    0.02 | 5.6152 |   47200 B |          NA |
+|                    |       |            |              |            |            |       |         |        |           |             |
+| **AdaptiveSlop**       | **20**    | **100**        |    **116.96 μs** |   **2.328 μs** |   **3.108 μs** |  **1.00** |    **0.04** |      **-** |         **-** |          **NA** |
+| FSharpDataAdaptive | 20    | 100        |    227.49 μs |   1.787 μs |   1.584 μs |  1.95 |    0.05 | 5.6152 |   47200 B |          NA |
+|                    |       |            |              |            |            |       |         |        |           |             |
+| **AdaptiveSlop**       | **100**   | **100**        |    **628.59 μs** |   **6.804 μs** |   **5.312 μs** |  **1.00** |    **0.01** |      **-** |         **-** |          **NA** |
+| FSharpDataAdaptive | 100   | 100        |  1,111.67 μs |   7.387 μs |   6.909 μs |  1.77 |    0.02 | 3.9063 |   47200 B |          NA |
+|                    |       |            |              |            |            |       |         |        |           |             |
+| **AdaptiveSlop**       | **1000**  | **100**        |  **6,767.47 μs** |  **85.838 μs** |  **80.292 μs** |  **1.00** |    **0.02** |      **-** |         **-** |          **NA** |
+| FSharpDataAdaptive | 1000  | 100        | 11,144.61 μs | 178.116 μs | 148.735 μs |  1.65 |    0.03 |      - |   47200 B |          NA |
+
+### DeepWideBenchmarks
+
+| Method             | Depth | BranchingFactor | Iterations | Mean         | Error      | StdDev     | Ratio | RatioSD | Gen0   | Allocated | Alloc Ratio |
+|------------------- |------ |---------------- |----------- |-------------:|-----------:|-----------:|------:|--------:|-------:|----------:|------------:|
+| **AdaptiveSlop**       | **3**     | **2**               | **50**         |     **10.23 μs** |   **0.045 μs** |   **0.040 μs** |  **1.00** |    **0.01** |      **-** |         **-** |          **NA** |
+| FSharpDataAdaptive | 3     | 2               | 50         |     29.89 μs |   0.102 μs |   0.090 μs |  2.92 |    0.01 | 2.8076 |   23600 B |          NA |
+|                    |       |                 |            |              |            |            |       |         |        |           |             |
+| **AdaptiveSlop**       | **3**     | **3**               | **50**         |     **27.99 μs** |   **0.079 μs** |   **0.070 μs** |  **1.00** |    **0.00** |      **-** |         **-** |          **NA** |
+| FSharpDataAdaptive | 3     | 3               | 50         |     49.88 μs |   0.150 μs |   0.141 μs |  1.78 |    0.01 | 2.8076 |   23600 B |          NA |
+|                    |       |                 |            |              |            |            |       |         |        |           |             |
+| **AdaptiveSlop**       | **3**     | **4**               | **50**         |     **48.41 μs** |   **0.190 μs** |   **0.178 μs** |  **1.00** |    **0.01** |      **-** |         **-** |          **NA** |
+| FSharpDataAdaptive | 3     | 4               | 50         |     62.15 μs |   0.174 μs |   0.163 μs |  1.28 |    0.01 | 2.8076 |   23600 B |          NA |
+|                    |       |                 |            |              |            |            |       |         |        |           |             |
+| **AdaptiveSlop**       | **5**     | **2**               | **50**         |     **24.81 μs** |   **0.083 μs** |   **0.069 μs** |  **1.00** |    **0.00** |      **-** |         **-** |          **NA** |
+| FSharpDataAdaptive | 5     | 2               | 50         |     42.68 μs |   0.299 μs |   0.250 μs |  1.72 |    0.01 | 2.8076 |   23600 B |          NA |
+|                    |       |                 |            |              |            |            |       |         |        |           |             |
+| **AdaptiveSlop**       | **5**     | **3**               | **50**         |    **176.70 μs** |   **2.758 μs** |   **2.445 μs** |  **1.00** |    **0.02** |      **-** |         **-** |          **NA** |
+| FSharpDataAdaptive | 5     | 3               | 50         |     78.95 μs |   0.153 μs |   0.128 μs |  0.45 |    0.01 | 2.8076 |   23600 B |          NA |
+|                    |       |                 |            |              |            |            |       |         |        |           |             |
+| **AdaptiveSlop**       | **5**     | **4**               | **50**         |    **667.06 μs** |   **2.366 μs** |   **1.976 μs** |  **1.00** |    **0.00** |      **-** |         **-** |          **NA** |
+| FSharpDataAdaptive | 5     | 4               | 50         |    104.86 μs |   0.147 μs |   0.131 μs |  0.16 |    0.00 | 2.8076 |   23600 B |          NA |
+|                    |       |                 |            |              |            |            |       |         |        |           |             |
+| **AdaptiveSlop**       | **7**     | **2**               | **50**         |     **78.69 μs** |   **1.237 μs** |   **1.157 μs** |  **1.00** |    **0.02** |      **-** |         **-** |          **NA** |
+| FSharpDataAdaptive | 7     | 2               | 50         |     56.01 μs |   0.200 μs |   0.187 μs |  0.71 |    0.01 | 2.8076 |   23600 B |          NA |
+|                    |       |                 |            |              |            |            |       |         |        |           |             |
+| **AdaptiveSlop**       | **7**     | **3**               | **50**         |  **1,581.63 μs** |  **30.746 μs** |  **35.407 μs** |  **1.00** |    **0.03** |      **-** |         **-** |          **NA** |
+| FSharpDataAdaptive | 7     | 3               | 50         |    114.41 μs |   0.659 μs |   0.617 μs |  0.07 |    0.00 | 2.8076 |   23600 B |          NA |
+|                    |       |                 |            |              |            |            |       |         |        |           |             |
+| **AdaptiveSlop**       | **7**     | **4**               | **50**         | **11,262.63 μs** | **222.969 μs** | **319.776 μs** |  **1.00** |    **0.04** |      **-** |         **-** |          **NA** |
+| FSharpDataAdaptive | 7     | 4               | 50         |    155.38 μs |   1.010 μs |   0.945 μs |  0.01 |    0.00 | 2.6855 |   23600 B |          NA |
+
+### DiamondGraphBenchmarks
+
+| Method             | Iterations | Mean     | Error   | StdDev  | Ratio | RatioSD | Gen0    | Allocated | Alloc Ratio |
+|------------------- |----------- |---------:|--------:|--------:|------:|--------:|--------:|----------:|------------:|
+| AdaptiveSlop       | 1000       | 137.5 μs | 0.37 μs | 0.35 μs |  1.00 |    0.00 |       - |         - |          NA |
+| FSharpDataAdaptive | 1000       | 613.8 μs | 8.28 μs | 7.75 μs |  4.47 |    0.06 | 73.2422 |  616000 B |          NA |
+
+### IncrementalChainBenchmarks
+
+| Method             | InitialSize | Mutations | Mean      | Error    | StdDev   | Ratio | RatioSD | Gen0     | Allocated | Alloc Ratio |
+|------------------- |------------ |---------- |----------:|---------:|---------:|------:|--------:|---------:|----------:|------------:|
+| **AdaptiveSlop**       | **100**         | **200**       |  **50.84 μs** | **0.098 μs** | **0.092 μs** |  **1.00** |    **0.00** |        **-** |         **-** |          **NA** |
+| FSharpDataAdaptive | 100         | 200       | 521.15 μs | 4.359 μs | 4.077 μs | 10.25 |    0.08 |  76.1719 |  638704 B |          NA |
+|                    |             |           |           |          |          |       |         |          |           |             |
+| **AdaptiveSlop**       | **1000**        | **200**       |  **48.66 μs** | **0.266 μs** | **0.249 μs** |  **1.00** |    **0.01** |        **-** |         **-** |          **NA** |
+| FSharpDataAdaptive | 1000        | 200       | 527.97 μs | 7.101 μs | 6.295 μs | 10.85 |    0.14 |  78.1250 |  656512 B |          NA |
+|                    |             |           |           |          |          |       |         |          |           |             |
+| **AdaptiveSlop**       | **10000**       | **200**       |  **49.11 μs** | **0.153 μs** | **0.144 μs** |  **1.00** |    **0.00** |        **-** |         **-** |          **NA** |
+| FSharpDataAdaptive | 10000       | 200       | 579.03 μs | 3.715 μs | 3.102 μs | 11.79 |    0.07 | 101.5625 |  852736 B |          NA |
+
+### KipoPhysicsBenchmarks
+
+| Method                         | EntityCount | Iterations | Mean         | Error         | StdDev        | Median       | Ratio | RatioSD | Gen0       | Gen1       | Gen2       | Allocated    | Alloc Ratio |
+|------------------------------- |------------ |----------- |-------------:|--------------:|--------------:|-------------:|------:|--------:|-----------:|-----------:|-----------:|-------------:|------------:|
+| **AdaptiveSlop**                   | **250**         | **50**         |   **2,323.1 μs** |      **25.68 μs** |      **22.77 μs** |   **2,327.9 μs** |  **1.00** |    **0.01** |   **671.8750** |   **132.8125** |          **-** |   **5502.73 KB** |       **1.000** |
+| FSharpDataAdaptive             | 250         | 50         |   7,216.3 μs |      48.62 μs |      45.48 μs |   7,232.3 μs |  3.11 |    0.04 |  1726.5625 |   250.0000 |          - |  14116.91 KB |       2.565 |
+| AdaptiveSlop_GraphDirect       | 250         | 50         |     954.6 μs |       2.15 μs |       1.90 μs |     954.1 μs |  0.41 |    0.00 |     1.9531 |          - |          - |     21.48 KB |       0.004 |
+| FSharpDataAdaptive_GraphDirect | 250         | 50         |  95,077.0 μs |   4,386.55 μs |  12,933.84 μs |  99,631.6 μs | 40.93 |    5.56 | 15600.0000 | 14600.0000 | 14000.0000 | 125574.53 KB |      22.820 |
+|                                |             |            |              |               |               |              |       |         |            |            |            |              |             |
+| **AdaptiveSlop**                   | **1000**        | **50**         |  **10,086.9 μs** |      **49.54 μs** |      **46.34 μs** |  **10,092.7 μs** |  **1.00** |    **0.01** |  **2906.2500** |  **1031.2500** |          **-** |  **23801.92 KB** |       **1.000** |
+| FSharpDataAdaptive             | 1000        | 50         |  35,258.4 μs |     198.42 μs |     185.60 μs |  35,205.4 μs |  3.50 |    0.02 |  7666.6667 |  2333.3333 |          - |  62694.85 KB |       2.634 |
+| AdaptiveSlop_GraphDirect       | 1000        | 50         |   3,763.0 μs |       7.81 μs |       7.31 μs |   3,762.4 μs |  0.37 |    0.00 |          - |          - |          - |     21.48 KB |       0.001 |
+| FSharpDataAdaptive_GraphDirect | 1000        | 50         | 707,153.0 μs | 115,960.42 μs | 341,911.94 μs | 489,388.7 μs | 70.11 |   33.74 | 55000.0000 | 48000.0000 | 40000.0000 | 458548.35 KB |      19.265 |
+
+### LargeCollectionBenchmarks
+
+| Method             | InitialSize | Iterations | Mean      | Error     | StdDev    | Ratio | RatioSD | Gen0    | Gen1   | Allocated | Alloc Ratio |
+|------------------- |------------ |----------- |----------:|----------:|----------:|------:|--------:|--------:|-------:|----------:|------------:|
+| AdaptiveSlop       | 10000       | 200        |  2.422 μs | 0.0067 μs | 0.0060 μs |  1.00 |    0.00 |       - |      - |         - |          NA |
+| FSharpDataAdaptive | 10000       | 200        | 79.939 μs | 0.7938 μs | 0.7425 μs | 33.01 |    0.31 | 28.0762 | 1.7090 |  235456 B |          NA |
+
+### ListAppendBenchmarks
+
+| Method             | Iterations | Mean        | Error    | StdDev   | Ratio | RatioSD | Gen0     | Gen1     | Gen2   | Allocated | Alloc Ratio |
+|------------------- |----------- |------------:|---------:|---------:|------:|--------:|---------:|---------:|-------:|----------:|------------:|
+| AdaptiveSlop       | 500        |    71.48 μs | 0.220 μs | 0.195 μs |  1.00 |    0.00 |        - |        - |      - |         - |          NA |
+| FSharpDataAdaptive | 500        | 2,530.62 μs | 9.717 μs | 9.089 μs | 35.41 |    0.15 | 289.0625 | 285.1563 | 7.8125 | 2434678 B |          NA |
+
+### ListTransformBenchmarks
+
+| Method             | Iterations | Mean       | Error    | StdDev   | Ratio | RatioSD | Gen0     | Gen1     | Gen2   | Allocated | Alloc Ratio |
+|------------------- |----------- |-----------:|---------:|---------:|------:|--------:|---------:|---------:|-------:|----------:|------------:|
+| AdaptiveSlop       | 500        |   158.8 μs |  0.53 μs |  0.50 μs |  1.00 |    0.00 |        - |        - |      - |         - |          NA |
+| FSharpDataAdaptive | 500        | 2,840.7 μs | 18.81 μs | 15.71 μs | 17.88 |    0.11 | 343.7500 | 167.9688 | 7.8125 | 2899669 B |          NA |
+
+### ListWriteReadBenchmarks
+
+| Method             | Count  | Mean      | Error     | StdDev     | Median    | Ratio | RatioSD | Allocated  | Alloc Ratio |
+|------------------- |------- |----------:|----------:|-----------:|----------:|------:|--------:|-----------:|------------:|
+| **AdaptiveSlop**       | **0**      |  **24.07 μs** |  **0.480 μs** |   **0.801 μs** |  **24.08 μs** |  **1.00** |    **0.05** |   **17.29 KB** |        **1.00** |
+| FSharpDataAdaptive | 0      | 251.06 μs |  4.992 μs |   3.897 μs | 250.46 μs | 10.44 |    0.37 |  141.05 KB |        8.16 |
+|                    |        |           |           |            |           |       |         |            |             |
+| **AdaptiveSlop**       | **1000**   |  **24.95 μs** |  **2.844 μs** |   **8.342 μs** |  **20.57 μs** |  **1.11** |    **0.51** |   **52.34 KB** |        **1.00** |
+| FSharpDataAdaptive | 1000   | 229.28 μs | 36.093 μs | 105.285 μs | 171.77 μs | 10.16 |    5.71 |  180.94 KB |        3.46 |
+|                    |        |           |           |            |           |       |         |            |             |
+| **AdaptiveSlop**       | **10000**  |  **36.88 μs** |  **3.618 μs** |  **10.322 μs** |  **35.62 μs** |  **1.08** |    **0.44** |  **247.23 KB** |        **1.00** |
+| FSharpDataAdaptive | 10000  | 192.41 μs |  9.387 μs |  26.166 μs | 184.87 μs |  5.65 |    1.81 |  202.94 KB |        0.82 |
+|                    |        |           |           |            |           |       |         |            |             |
+| **AdaptiveSlop**       | **100000** | **276.91 μs** |  **5.559 μs** |  **14.350 μs** | **273.68 μs** |  **1.00** |    **0.07** | **2356.61 KB** |        **1.00** |
+| FSharpDataAdaptive | 100000 | 224.53 μs |  4.824 μs |  13.764 μs | 222.95 μs |  0.81 |    0.06 |  222.94 KB |        0.09 |
+
+### Map2Benchmarks
+
+| Method             | Iterations | Mean      | Error    | StdDev   | Ratio | RatioSD | Gen0    | Allocated | Alloc Ratio |
+|------------------- |----------- |----------:|---------:|---------:|------:|--------:|--------:|----------:|------------:|
+| AdaptiveSlop       | 1000       |  68.16 μs | 0.175 μs | 0.163 μs |  1.00 |    0.00 |       - |         - |          NA |
+| FSharpDataAdaptive | 1000       | 400.48 μs | 1.626 μs | 1.521 μs |  5.88 |    0.03 | 62.9883 |  528000 B |          NA |
+
+### MapBenchmarks
+
+| Method             | Iterations | Mean      | Error    | StdDev   | Ratio | RatioSD | Gen0     | Allocated | Alloc Ratio |
+|------------------- |----------- |----------:|---------:|---------:|------:|--------:|---------:|----------:|------------:|
+| AdaptiveSlop       | 1000       |  54.57 μs | 0.109 μs | 0.096 μs |  1.00 |    0.00 |        - |         - |          NA |
+| FSharpDataAdaptive | 1000       | 309.47 μs | 2.996 μs | 2.803 μs |  5.67 |    0.05 | 104.9805 |  880000 B |          NA |
+
+### MapTransformBenchmarks
+
+| Method             | Iterations | Mean       | Error   | StdDev  | Ratio | RatioSD | Gen0     | Allocated | Alloc Ratio |
+|------------------- |----------- |-----------:|--------:|--------:|------:|--------:|---------:|----------:|------------:|
+| AdaptiveSlop       | 500        |   119.6 μs | 0.20 μs | 0.18 μs |  1.00 |    0.00 |        - |         - |          NA |
+| FSharpDataAdaptive | 500        | 1,137.3 μs | 9.25 μs | 8.65 μs |  9.51 |    0.07 | 210.9375 | 1769408 B |          NA |
+
+### OptimizedWideTreeBenchmarks
+
+| Method                 | Width | Iterations | Mean        | Error    | StdDev   | Ratio | RatioSD | Gen0   | Allocated | Alloc Ratio |
+|----------------------- |------ |----------- |------------:|---------:|---------:|------:|--------:|-------:|----------:|------------:|
+| **AdaptiveSlop_Map2Chain** | **10**    | **100**        |    **29.80 μs** | **0.065 μs** | **0.058 μs** |  **1.00** |    **0.00** |      **-** |         **-** |          **NA** |
+| AdaptiveSlop_Reduce    | 10    | 100        |    10.06 μs | 0.030 μs | 0.028 μs |  0.34 |    0.00 |      - |         - |          NA |
+| FSharpDataAdaptive     | 10    | 100        |    85.24 μs | 0.467 μs | 0.437 μs |  2.86 |    0.02 | 5.6152 |   47200 B |          NA |
+|                        |       |            |             |          |          |       |         |        |           |             |
+| **AdaptiveSlop_Map2Chain** | **50**    | **100**        |   **201.57 μs** | **0.530 μs** | **0.496 μs** |  **1.00** |    **0.00** |      **-** |         **-** |          **NA** |
+| AdaptiveSlop_Reduce    | 50    | 100        |    41.76 μs | 0.120 μs | 0.112 μs |  0.21 |    0.00 |      - |         - |          NA |
+| FSharpDataAdaptive     | 50    | 100        |   345.16 μs | 0.545 μs | 0.483 μs |  1.71 |    0.00 | 5.3711 |   47200 B |          NA |
+|                        |       |            |             |          |          |       |         |        |           |             |
+| **AdaptiveSlop_Map2Chain** | **100**   | **100**        |   **458.20 μs** | **2.884 μs** | **2.698 μs** |  **1.00** |    **0.01** |      **-** |         **-** |          **NA** |
+| AdaptiveSlop_Reduce    | 100   | 100        |    82.18 μs | 0.182 μs | 0.170 μs |  0.18 |    0.00 |      - |         - |          NA |
+| FSharpDataAdaptive     | 100   | 100        |   672.58 μs | 1.977 μs | 1.849 μs |  1.47 |    0.01 | 4.8828 |   47200 B |          NA |
+|                        |       |            |             |          |          |       |         |        |           |             |
+| **AdaptiveSlop_Map2Chain** | **500**   | **100**        | **2,300.94 μs** | **7.047 μs** | **6.592 μs** |  **1.00** |    **0.00** |      **-** |         **-** |          **NA** |
+| AdaptiveSlop_Reduce    | 500   | 100        |   404.40 μs | 0.640 μs | 0.599 μs |  0.18 |    0.00 |      - |         - |          NA |
+| FSharpDataAdaptive     | 500   | 100        | 3,395.71 μs | 7.459 μs | 6.977 μs |  1.48 |    0.01 | 3.9063 |   47200 B |          NA |
+
+### ReadHeavyBenchmarks
+
+| Method             | WriteCount | ReadsPerWrite | Mean      | Error    | StdDev   | Ratio | Gen0   | Allocated | Alloc Ratio |
+|------------------- |----------- |-------------- |----------:|---------:|---------:|------:|-------:|----------:|------------:|
+| AdaptiveSlop       | 100        | 50            |  46.93 μs | 0.073 μs | 0.068 μs |  1.00 |      - |         - |          NA |
+| FSharpDataAdaptive | 100        | 50            | 113.82 μs | 0.268 μs | 0.251 μs |  2.43 | 5.6152 |   47200 B |          NA |
+
+### SetBenchmarks
+
+| Method             | Iterations | Mean      | Error    | StdDev   | Ratio | RatioSD | Gen0     | Allocated | Alloc Ratio |
+|------------------- |----------- |----------:|---------:|---------:|------:|--------:|---------:|----------:|------------:|
+| AdaptiveSlop       | 1000       |  50.42 μs | 0.093 μs | 0.087 μs |  1.00 |    0.00 |        - |         - |          NA |
+| FSharpDataAdaptive | 1000       | 319.60 μs | 2.233 μs | 2.088 μs |  6.34 |    0.04 | 105.9570 |  888000 B |          NA |
+
+### SetTransformBenchmarks
+
+| Method             | Iterations | Mean       | Error   | StdDev  | Ratio | RatioSD | Gen0     | Allocated | Alloc Ratio |
+|------------------- |----------- |-----------:|--------:|--------:|------:|--------:|---------:|----------:|------------:|
+| AdaptiveSlop       | 500        |   125.8 μs | 0.33 μs | 0.31 μs |  1.00 |    0.00 |        - |         - |          NA |
+| FSharpDataAdaptive | 500        | 1,286.3 μs | 9.10 μs | 8.51 μs | 10.23 |    0.07 | 185.5469 | 1561456 B |          NA |
+
+### TransactionBenchmarks
+
+| Method                     | ValueCount | Iterations | Mean       | Error   | StdDev  | Ratio | Gen0    | Allocated | Alloc Ratio |
+|--------------------------- |----------- |----------- |-----------:|--------:|--------:|------:|--------:|----------:|------------:|
+| AdaptiveSlop_Batched       | 10         | 500        |   351.4 μs | 0.68 μs | 0.56 μs |  1.00 |  1.4648 |  15.63 KB |        1.00 |
+| FSharpDataAdaptive_Batched | 10         | 500        | 1,481.1 μs | 3.18 μs | 2.66 μs |  4.21 | 87.8906 | 726.56 KB |       46.50 |
+
+### UnbalancedTreeBenchmarks
+
+| Method                     | DeepBranchDepth | ShallowBranchCount | Iterations | Mean      | Error    | StdDev   | Ratio | Gen0   | Allocated | Alloc Ratio |
+|--------------------------- |---------------- |------------------- |----------- |----------:|---------:|---------:|------:|-------:|----------:|------------:|
+| **AdaptiveSlop_DeepChange**    | **10**              | **5**                  | **50**         |  **44.60 μs** | **0.130 μs** | **0.122 μs** |  **1.00** |      **-** |         **-** |          **NA** |
+| FDA_DeepChange             | 10              | 5                  | 50         | 104.25 μs | 0.294 μs | 0.275 μs |  2.34 | 2.8076 |   23600 B |          NA |
+| AdaptiveSlop_ShallowChange | 10              | 5                  | 50         |  21.89 μs | 0.059 μs | 0.055 μs |  0.49 |      - |         - |          NA |
+| FDA_ShallowChange          | 10              | 5                  | 50         |  50.08 μs | 0.107 μs | 0.094 μs |  1.12 | 2.8076 |   23600 B |          NA |
+|                            |                 |                    |            |           |          |          |       |        |           |             |
+| **AdaptiveSlop_DeepChange**    | **10**              | **20**                 | **50**         | **107.39 μs** | **0.212 μs** | **0.188 μs** |  **1.00** |      **-** |         **-** |          **NA** |
+| FDA_DeepChange             | 10              | 20                 | 50         | 211.28 μs | 0.353 μs | 0.330 μs |  1.97 | 2.6855 |   23600 B |          NA |
+| AdaptiveSlop_ShallowChange | 10              | 20                 | 50         |  78.43 μs | 0.138 μs | 0.129 μs |  0.73 |      - |         - |          NA |
+| FDA_ShallowChange          | 10              | 20                 | 50         | 155.34 μs | 0.405 μs | 0.378 μs |  1.45 | 2.6855 |   23600 B |          NA |
+|                            |                 |                    |            |           |          |          |       |        |           |             |
+| **AdaptiveSlop_DeepChange**    | **10**              | **50**                 | **50**         | **235.37 μs** | **0.700 μs** | **0.655 μs** |  **1.00** |      **-** |         **-** |          **NA** |
+| FDA_DeepChange             | 10              | 50                 | 50         | 426.31 μs | 0.659 μs | 0.584 μs |  1.81 | 2.4414 |   23600 B |          NA |
+| AdaptiveSlop_ShallowChange | 10              | 50                 | 50         | 203.99 μs | 1.289 μs | 1.205 μs |  0.87 |      - |         - |          NA |
+| FDA_ShallowChange          | 10              | 50                 | 50         | 365.08 μs | 1.016 μs | 0.950 μs |  1.55 | 2.4414 |   23600 B |          NA |
+|                            |                 |                    |            |           |          |          |       |        |           |             |
+| **AdaptiveSlop_DeepChange**    | **50**              | **5**                  | **50**         | **176.06 μs** | **0.368 μs** | **0.344 μs** |  **1.00** |      **-** |         **-** |          **NA** |
+| FDA_DeepChange             | 50              | 5                  | 50         | 315.90 μs | 0.627 μs | 0.586 μs |  1.79 | 2.4414 |   23600 B |          NA |
+| AdaptiveSlop_ShallowChange | 50              | 5                  | 50         |  57.68 μs | 0.276 μs | 0.258 μs |  0.33 |      - |         - |          NA |
+| FDA_ShallowChange          | 50              | 5                  | 50         |  50.35 μs | 0.212 μs | 0.199 μs |  0.29 | 2.8076 |   23600 B |          NA |
+|                            |                 |                    |            |           |          |          |       |        |           |             |
+| **AdaptiveSlop_DeepChange**    | **50**              | **20**                 | **50**         | **243.17 μs** | **0.905 μs** | **0.847 μs** |  **1.00** |      **-** |         **-** |          **NA** |
+| FDA_DeepChange             | 50              | 20                 | 50         | 448.20 μs | 1.511 μs | 1.413 μs |  1.84 | 2.4414 |   23600 B |          NA |
+| AdaptiveSlop_ShallowChange | 50              | 20                 | 50         | 122.99 μs | 0.959 μs | 0.897 μs |  0.51 |      - |         - |          NA |
+| FDA_ShallowChange          | 50              | 20                 | 50         | 159.55 μs | 0.437 μs | 0.387 μs |  0.66 | 2.6855 |   23600 B |          NA |
+|                            |                 |                    |            |           |          |          |       |        |           |             |
+| **AdaptiveSlop_DeepChange**    | **50**              | **50**                 | **50**         | **399.17 μs** | **1.257 μs** | **1.176 μs** |  **1.00** |      **-** |         **-** |          **NA** |
+| FDA_DeepChange             | 50              | 50                 | 50         | 676.40 μs | 1.131 μs | 0.944 μs |  1.69 | 1.9531 |   23600 B |          NA |
+| AdaptiveSlop_ShallowChange | 50              | 50                 | 50         | 249.06 μs | 0.667 μs | 0.592 μs |  0.62 |      - |         - |          NA |
+| FDA_ShallowChange          | 50              | 50                 | 50         | 372.07 μs | 2.352 μs | 2.085 μs |  0.93 | 2.4414 |   23600 B |          NA |
+|                            |                 |                    |            |           |          |          |       |        |           |             |
+| **AdaptiveSlop_DeepChange**    | **100**             | **5**                  | **50**         | **346.39 μs** | **0.767 μs** | **0.717 μs** |  **1.00** |      **-** |         **-** |          **NA** |
+| FDA_DeepChange             | 100             | 5                  | 50         | 575.74 μs | 1.648 μs | 1.542 μs |  1.66 | 1.9531 |   23600 B |          NA |
+| AdaptiveSlop_ShallowChange | 100             | 5                  | 50         | 103.92 μs | 0.787 μs | 0.697 μs |  0.30 |      - |         - |          NA |
+| FDA_ShallowChange          | 100             | 5                  | 50         |  49.22 μs | 0.135 μs | 0.126 μs |  0.14 | 2.8076 |   23600 B |          NA |
+|                            |                 |                    |            |           |          |          |       |        |           |             |
+| **AdaptiveSlop_DeepChange**    | **100**             | **20**                 | **50**         | **409.30 μs** | **1.335 μs** | **1.249 μs** |  **1.00** |      **-** |         **-** |          **NA** |
+| FDA_DeepChange             | 100             | 20                 | 50         | 708.82 μs | 1.843 μs | 1.724 μs |  1.73 | 1.9531 |   23600 B |          NA |
+| AdaptiveSlop_ShallowChange | 100             | 20                 | 50         | 164.55 μs | 2.515 μs | 2.352 μs |  0.40 |      - |         - |          NA |
+| FDA_ShallowChange          | 100             | 20                 | 50         | 162.56 μs | 0.348 μs | 0.325 μs |  0.40 | 2.6855 |   23600 B |          NA |
+|                            |                 |                    |            |           |          |          |       |        |           |             |
+| **AdaptiveSlop_DeepChange**    | **100**             | **50**                 | **50**         | **539.44 μs** | **2.292 μs** | **2.144 μs** |  **1.00** |      **-** |         **-** |          **NA** |
+| FDA_DeepChange             | 100             | 50                 | 50         | 975.04 μs | 2.897 μs | 2.710 μs |  1.81 | 1.9531 |   23600 B |          NA |
+| AdaptiveSlop_ShallowChange | 100             | 50                 | 50         | 293.30 μs | 1.453 μs | 1.359 μs |  0.54 |      - |         - |          NA |
+| FDA_ShallowChange          | 100             | 50                 | 50         | 367.57 μs | 0.905 μs | 0.756 μs |  0.68 | 2.4414 |   23600 B |          NA |
+
+### ValueBenchmarks
+
+| Method             | Iterations | Mean      | Error    | StdDev   | Ratio | RatioSD | Gen0    | Allocated | Alloc Ratio |
+|------------------- |----------- |----------:|---------:|---------:|------:|--------:|--------:|----------:|------------:|
+| AdaptiveSlop       | 1000       |  48.15 μs | 0.147 μs | 0.138 μs |  1.00 |    0.00 |       - |         - |          NA |
+| FSharpDataAdaptive | 1000       | 301.90 μs | 1.640 μs | 1.454 μs |  6.27 |    0.03 | 56.1523 |  472000 B |          NA |
+
+### WideTreeBenchmarks
+
+| Method             | Width | Iterations | Mean        | Error     | StdDev    | Ratio | RatioSD | Gen0   | Allocated | Alloc Ratio |
+|------------------- |------ |----------- |------------:|----------:|----------:|------:|--------:|-------:|----------:|------------:|
+| **AdaptiveSlop**       | **10**    | **100**        |    **30.67 μs** |  **0.169 μs** |  **0.158 μs** |  **1.00** |    **0.01** |      **-** |         **-** |          **NA** |
+| FSharpDataAdaptive | 10    | 100        |    84.35 μs |  0.223 μs |  0.198 μs |  2.75 |    0.02 | 5.6152 |   47200 B |          NA |
+|                    |       |            |             |           |           |       |         |        |           |             |
+| **AdaptiveSlop**       | **50**    | **100**        |   **198.94 μs** |  **0.719 μs** |  **0.672 μs** |  **1.00** |    **0.00** |      **-** |         **-** |          **NA** |
+| FSharpDataAdaptive | 50    | 100        |   338.01 μs |  0.891 μs |  0.790 μs |  1.70 |    0.01 | 5.3711 |   47200 B |          NA |
+|                    |       |            |             |           |           |       |         |        |           |             |
+| **AdaptiveSlop**       | **100**   | **100**        |   **452.23 μs** |  **1.980 μs** |  **1.654 μs** |  **1.00** |    **0.00** |      **-** |         **-** |          **NA** |
+| FSharpDataAdaptive | 100   | 100        |   666.93 μs |  2.066 μs |  1.933 μs |  1.47 |    0.01 | 4.8828 |   47200 B |          NA |
+|                    |       |            |             |           |           |       |         |        |           |             |
+| **AdaptiveSlop**       | **500**   | **100**        | **2,264.01 μs** | **14.654 μs** | **13.707 μs** |  **1.00** |    **0.01** |      **-** |         **-** |          **NA** |
+| FSharpDataAdaptive | 500   | 100        | 3,421.83 μs | 14.785 μs | 13.830 μs |  1.51 |    0.01 | 3.9063 |   47200 B |          NA |
+

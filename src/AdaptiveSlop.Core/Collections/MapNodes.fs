@@ -47,12 +47,12 @@ type MapMapNode<'K, 'V, 'U when 'K: equality>
 
     member private this.EnsureInitialized() =
         if not initialized then
-            initialized <- true
             // Snapshot first, register between, then run the mapping over the
             // snapshot (see MapSetNode.EnsureInitialized in SetNodes.fs): the
             // mapping is user code that may write to the source, and the write
             // must land in our journal. A dirty source draining during the
-            // snapshot read pushes to nobody: no double-apply.
+            // snapshot read pushes to nobody: no double-apply. The flag is set
+            // last: an exception leaves the node uninitialized.
             let snapshot = Dictionary<'K, 'V>()
 
             for KeyValue(k, v) in source.GetValue() do
@@ -61,6 +61,7 @@ type MapMapNode<'K, 'V, 'U when 'K: equality>
             this.Register()
             Collections.loadMap mapping snapshot &state
             state.DepVersions[0] <- source.Version
+            initialized <- true
 
     interface IMapDeltaSink<'K, 'V> with
         member this.OnDeltas(sets: struct ('K * 'V)[], setCnt: int, rems: 'K[], remCnt: int) =
@@ -132,8 +133,8 @@ type FilterMapNode<'K, 'V when 'K: equality>
 
     member private this.EnsureInitialized() =
         if not initialized then
-            initialized <- true
             // Snapshot first, register between (see MapMapNode.EnsureInitialized).
+            // The flag is set last: an exception leaves the node uninitialized.
             let snapshot = Dictionary<'K, 'V>()
 
             for KeyValue(k, v) in source.GetValue() do
@@ -142,6 +143,7 @@ type FilterMapNode<'K, 'V when 'K: equality>
             this.Register()
             Collections.loadMap mapOpt snapshot &state
             state.DepVersions[0] <- source.Version
+            initialized <- true
 
     interface IMapDeltaSink<'K, 'V> with
         member this.OnDeltas(sets: struct ('K * 'V)[], setCnt: int, rems: 'K[], remCnt: int) =
@@ -262,8 +264,8 @@ type Choose2MapNode<'K, 'V1, 'V2, 'V3 when 'K: equality>
 
     member private this.EnsureInitialized() =
         if not initialized then
-            initialized <- true
             // Snapshot first, register between (see MapMapNode.EnsureInitialized).
+            // The flag is set last: an exception leaves the node uninitialized.
             let leftSnapshot = Dictionary<'K, 'V1>()
 
             for KeyValue(k, v) in left.GetValue() do
@@ -278,6 +280,7 @@ type Choose2MapNode<'K, 'V1, 'V2, 'V3 when 'K: equality>
             Collections.loadChoose2 mapping leftSnapshot rightSnapshot &state
             state.DepVersions[0] <- left.Version
             state.DepVersions[1] <- right.Version
+            initialized <- true
 
     interface IAdaptiveMap<'K, 'V3> with
         member this.GetValue() =
@@ -391,8 +394,8 @@ type SetToMapNode<'K, 'V, 'T when 'K: equality>
 
     member private this.EnsureInitialized() =
         if not initialized then
-            initialized <- true
             // Snapshot first, register between (see MapMapNode.EnsureInitialized).
+            // The flag is set last: an exception leaves the node uninitialized.
             let snapshot = HashSet<'T>(source.GetValue())
             this.Register()
 
@@ -401,6 +404,7 @@ type SetToMapNode<'K, 'V, 'T when 'K: equality>
                 state.Data[k] <- v
 
             state.DepVersions[0] <- source.Version
+            initialized <- true
 
     interface ISetDeltaSink<'T> with
         member this.OnDeltas(adds: 'T[], addCnt: int, rems: 'T[], remCnt: int) =
@@ -499,7 +503,7 @@ type SetToMapNode<'K, 'V, 'T when 'K: equality>
                             state.Journal.Adds.Count <- 0
 
                         if changed then
-                            Collections.pushMapDelta state.Sinks state.Out
+                            Collections.pushMapDelta &state.Sinks state.Out
                             state.Out.Clear()
                     finally
                         ctx2.TxActive <- wasActive
@@ -596,8 +600,8 @@ type SetToMapKeepAllNode<'K, 'V, 'T when 'K: equality>
 
     member private this.EnsureInitialized() =
         if not initialized then
-            initialized <- true
             // Snapshot first, register between (see MapMapNode.EnsureInitialized).
+            // The flag is set last: an exception leaves the node uninitialized.
             let snapshot = HashSet<'T>(source.GetValue())
             this.Register()
 
@@ -613,6 +617,7 @@ type SetToMapKeepAllNode<'K, 'V, 'T when 'K: equality>
                     state.Data[k] <- fresh
 
             state.DepVersions[0] <- source.Version
+            initialized <- true
 
     interface ISetDeltaSink<'T> with
         member this.OnDeltas(adds: 'T[], addCnt: int, rems: 'T[], remCnt: int) =
@@ -720,7 +725,7 @@ type SetToMapKeepAllNode<'K, 'V, 'T when 'K: equality>
                             state.Journal.Adds.Count <- 0
 
                         if changed then
-                            Collections.pushMapDelta state.Sinks state.Out
+                            Collections.pushMapDelta &state.Sinks state.Out
                             state.Out.Clear()
                     finally
                         ctx2.TxActive <- wasActive
@@ -821,8 +826,8 @@ type MapToSetNode<'K, 'V, 'T when 'K: equality and 'T: equality>
 
     member private this.EnsureInitialized() =
         if not initialized then
-            initialized <- true
             // Snapshot first, register between (see MapMapNode.EnsureInitialized).
+            // The flag is set last: an exception leaves the node uninitialized.
             let snapshot = Dictionary<'K, 'V>()
 
             for KeyValue(k, v) in source.GetValue() do
@@ -837,6 +842,7 @@ type MapToSetNode<'K, 'V, 'T when 'K: equality and 'T: equality>
                 state.Out <- out2
 
             state.DepVersions[0] <- source.Version
+            initialized <- true
 
     interface IMapDeltaSink<'K, 'V> with
         member this.OnDeltas(sets: struct ('K * 'V)[], setCnt: int, rems: 'K[], remCnt: int) =
@@ -947,7 +953,7 @@ type MapToSetNode<'K, 'V, 'T when 'K: equality and 'T: equality>
                             state.Journal.Sets.Count <- 0
 
                         if changed then
-                            Collections.pushSetDelta state.Sinks state.OutDelta
+                            Collections.pushSetDelta &state.Sinks state.OutDelta
                             state.OutDelta.Clear()
                     finally
                         ctx2.TxActive <- wasActive
@@ -993,19 +999,44 @@ type OfAvalMapNode<'K, 'V, 'S when 'K: equality and 'S :> seq<'K * 'V>>(value: I
 
     member private this.EnsureInitialized() =
         if not initialized then
-            initialized <- true
-
             match value with
             | :? IEdgeTarget as t -> edgeInValue <- t.AddEdge(this :> IAdaptiveNode, -1)
             | _ -> ()
 
             // Initial load: materialize the value and build the state.
+            // The flag is set last: an exception leaves the node uninitialized.
+            // The init diff is not pushed: clear the out buffer so it cannot
+            // pollute the first real delta.
             let next = Dictionary<'K, 'V>()
 
             for (k, v) in value.GetValue() do
                 next[k] <- v
 
             Collections.rebuildMapDiff next &state |> ignore
+            state.Out.Clear()
+            state.DepVersions[0] <- value.Version
+            initialized <- true
+
+    /// Re-read the value when it changed and emit the diff. Called from
+    /// GetValue and from the Version getter (poll model, like
+    /// <see cref="CustomSetNode"/>): a downstream re-pulls only when this
+    /// node's version moves, so the version must advance on the read path.
+    member private this.Poll() =
+        if value.Version <> state.DepVersions[0] then
+            // The value may yield a transient seq: materialize it.
+            let next = Dictionary<'K, 'V>()
+
+            for (k, v) in value.GetValue() do
+                next[k] <- v
+
+            if Collections.rebuildMapDiff next &state then
+                // The version must advance: downstream nodes re-pull the
+                // source only when it changed (a stuck version makes
+                // derived nodes stale forever).
+                state.Version <- state.Version + 1L
+                Collections.pushAndMarkMap state.Out &state.Sinks state.Edges
+                state.Out.Clear()
+
             state.DepVersions[0] <- value.Version
 
     interface IAdaptiveNode with
@@ -1029,26 +1060,16 @@ type OfAvalMapNode<'K, 'V, 'S when 'K: equality and 'S :> seq<'K * 'V>>(value: I
                     invalidOp "This adaptive map has been disposed."
 
                 this.EnsureInitialized()
-
-                if value.Version <> state.DepVersions[0] then
-                    // The value may yield a transient seq: materialize it.
-                    let next = Dictionary<'K, 'V>()
-
-                    for (k, v) in value.GetValue() do
-                        next[k] <- v
-
-                    if Collections.rebuildMapDiff next &state then
-                        Collections.pushAndMarkMap state.Out state.Sinks state.Edges
-                        state.Out.Clear()
-
-                    state.DepVersions[0] <- value.Version
-
+                this.Poll()
                 AdaptiveRuntime.addDependency (this :> IAdaptiveObject) state.Version
                 state.Data :> IReadOnlyDictionary<'K, 'V>
             finally
                 ctx.ReleaseOwner()
 
-        member _.Version = state.Version
+        member this.Version =
+            this.EnsureInitialized()
+            this.Poll()
+            state.Version
 
     interface IDisposable with
         member this.Dispose() =
@@ -1101,7 +1122,7 @@ type CustomMapNode<'K, 'V when 'K: equality>
                     state.Data.Remove rems.Items[i] |> ignore
 
                 state.Version <- state.Version + 1L
-                Collections.pushAndMarkMap (writer.Snapshot()) state.Sinks state.Edges
+                Collections.pushAndMarkMap (writer.Snapshot()) &state.Sinks state.Edges
                 writer.Clear()
 
     interface IAdaptiveMap<'K, 'V> with
@@ -1195,8 +1216,6 @@ type BindMapNode<'K, 'V, 'T when 'K: equality>
 
     member private this.EnsureInitialized() =
         if not initialized then
-            initialized <- true
-
             match value with
             | :? IEdgeTarget as t -> edgeInValue <- t.AddEdge(this :> IAdaptiveNode, -1)
             | _ -> ()
@@ -1205,6 +1224,7 @@ type BindMapNode<'K, 'V, 'T when 'K: equality>
             inner <- mapping current
             this.LoadInner()
             state.DepVersions[0] <- value.Version
+            initialized <- true
 
     interface IAdaptiveNode with
         member this.MarkDirty() =
