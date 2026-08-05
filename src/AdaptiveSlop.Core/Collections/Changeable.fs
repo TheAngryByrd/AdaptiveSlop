@@ -120,7 +120,9 @@ type ChangeableSet<'T>(initial: seq<'T>) =
             journalCount <- 0
             this.PushAndMark()
 
-    /// <summary>Replaces the whole set. Last write wins inside a transaction.</summary>
+    /// <summary>Replaces the whole set. Supersedes the whole batch inside a
+    /// transaction (later writes of the batch are discarded; matches the
+    /// list, docs/ALIST-DESIGN.md §3.3).</summary>
     member this.Set(newValue: seq<'T>) =
         let ctx = GraphContext.Default
         ctx.ClaimOwner()
@@ -179,13 +181,16 @@ type ChangeableSet<'T>(initial: seq<'T>) =
 
     interface ICommit with
         member this.Commit() =
+            // The pending full replace supersedes the whole batch: journaled
+            // ops replay first, then the replace applies last (matches the
+            // list, docs/ALIST-DESIGN.md §3.3).
+            this.CommitJournal()
+
             match pendingValue with
             | ValueSome newValue ->
                 pendingValue <- ValueNone
                 this.Apply newValue
             | ValueNone -> ()
-
-            this.CommitJournal()
 
         member this.Abort() =
             pendingValue <- ValueNone
@@ -206,7 +211,11 @@ type ChangeableSet<'T>(initial: seq<'T>) =
         member _.Version = version
 
     interface IDisposable with
-        member _.Dispose() = ()
+        member this.Dispose() =
+            // Real teardown: detach every sink and parent edge so derived
+            // nodes and observations do not keep this source alive.
+            Collections.clearSinks &sinks
+            edges.Clear()
 
     /// Internal. Number of registered derived sinks (tests).
     member internal _.SinkCount = sinks.Count
@@ -385,7 +394,9 @@ type ChangeableMap<'K, 'V when 'K: equality>(initial: seq<'K * 'V>) =
         finally
             ctx.ReleaseOwner()
 
-    /// <summary>Replaces the whole map. Last write wins inside a transaction.</summary>
+    /// <summary>Replaces the whole map. Supersedes the whole batch inside a
+    /// transaction (later writes of the batch are discarded; matches the
+    /// list, docs/ALIST-DESIGN.md §3.3).</summary>
     member this.Set(newValue: seq<'K * 'V>) =
         let ctx = GraphContext.Default
         ctx.ClaimOwner()
@@ -406,13 +417,16 @@ type ChangeableMap<'K, 'V when 'K: equality>(initial: seq<'K * 'V>) =
 
     interface ICommit with
         member this.Commit() =
+            // The pending full replace supersedes the whole batch: journaled
+            // ops replay first, then the replace applies last (matches the
+            // list, docs/ALIST-DESIGN.md §3.3).
+            this.CommitJournal()
+
             match pendingValue with
             | ValueSome newValue ->
                 pendingValue <- ValueNone
                 this.Apply newValue
             | ValueNone -> ()
-
-            this.CommitJournal()
 
         member this.Abort() =
             pendingValue <- ValueNone
@@ -433,7 +447,11 @@ type ChangeableMap<'K, 'V when 'K: equality>(initial: seq<'K * 'V>) =
         member _.Version = version
 
     interface IDisposable with
-        member _.Dispose() = ()
+        member this.Dispose() =
+            // Real teardown: detach every sink and parent edge so derived
+            // nodes and observations do not keep this source alive.
+            Collections.clearSinks &sinks
+            edges.Clear()
 
     /// Internal. Number of registered derived sinks (tests).
     member internal _.SinkCount = sinks.Count
@@ -493,7 +511,21 @@ type ChangeableList<'T>(initial: seq<'T>) =
     // the position at the replay-time end, so several appends in one batch
     // land in write order (the pre-transaction count is the same for all of
     // them; sequential replay would reverse them).
-    let mutable journalReplayCount = 0
+    //
+    // The full replay state (a copy of the list plus every journaled op)
+    // validates positional writes and the UpdateAt equality check against the
+    // state the batch has actually built, so commit replay cannot throw and
+    // the batch is all-or-nothing.
+    let mutable journalReplay: ResizeArray<'T> voption = ValueNone
+
+    member private this.EnsureJournalSession() =
+        match journalReplay with
+        | ValueNone ->
+            // One O(n) copy per transaction session that writes the list.
+            let copy = ResizeArray<'T>(data)
+            journalReplay <- ValueSome copy
+            copy
+        | ValueSome r -> r
 
     member private this.PushAndMark() =
         if not outDelta.IsEmpty then
@@ -502,25 +534,29 @@ type ChangeableList<'T>(initial: seq<'T>) =
             outDelta.Clear()
 
     member private this.JournalOp(op: ListOp<'T>) =
-        // A journal session starts at the pre-transaction count; the replay
-        // state is data + the ops journaled so far.
-        if journalCount = 0 then
-            journalReplayCount <- data.Count
+        let replay = this.EnsureJournalSession()
 
         Collections.ensureCapacity &journal (journalCount + 1)
-        journal[journalCount] <- op
-        journalCount <- journalCount + 1
 
         match op.Kind with
         | ListOpKind.Insert ->
-            if op.Position = -1 then
-                // Append at the replay-time end.
-                journal[journalCount - 1] <- ListOp(ListOpKind.Insert, journalReplayCount, op.Value, 0uy)
-
-            journalReplayCount <- journalReplayCount + 1
-        | ListOpKind.Remove -> journalReplayCount <- journalReplayCount - 1
-        | ListOpKind.Clear -> journalReplayCount <- 0
+            // Resolve the -1 sentinel ("append at the replay-time end") now:
+            // several appends in one batch land in write order.
+            let pos = if op.Position = -1 then replay.Count else op.Position
+            replay.Insert(pos, op.Value)
+            journal[journalCount] <- ListOp(ListOpKind.Insert, pos, op.Value, 0uy)
+        | ListOpKind.Remove ->
+            replay.RemoveAt op.Position
+            journal[journalCount] <- op
+        | ListOpKind.Update ->
+            replay[op.Position] <- op.Value
+            journal[journalCount] <- op
+        | ListOpKind.Clear ->
+            replay.Clear()
+            journal[journalCount] <- op
         | _ -> ()
+
+        journalCount <- journalCount + 1
 
         if not flushEnqueued then
             flushEnqueued <- true
@@ -587,7 +623,9 @@ type ChangeableList<'T>(initial: seq<'T>) =
         this.PushAndMark()
 
     /// Replay the transaction journal in order against the data and push the
-    /// whole batch as one delta. The journal replay runs before the pending
+    /// whole batch as one delta. Every journaled op was validated against the
+    /// replay state at write time, so the replay cannot throw and the batch
+    /// applies all-or-nothing. The journal replay runs before the pending
     /// full replace: journaled positions are pre-transaction-relative, so they
     /// are only valid against the pre-transaction data.
     member private this.CommitJournal() =
@@ -633,6 +671,8 @@ type ChangeableList<'T>(initial: seq<'T>) =
             journalCount <- 0
             this.PushAndMark()
 
+        journalReplay <- ValueNone
+
     /// <summary>Appends an element at the end of the list.</summary>
     member this.Append(value: 'T) =
         let ctx = GraphContext.Default
@@ -673,15 +713,23 @@ type ChangeableList<'T>(initial: seq<'T>) =
         ctx.ClaimOwner()
 
         try
-            if position < 0 || position > data.Count then
-                raise (ArgumentOutOfRangeException(nameof position))
-
             if ctx.TxActive then
-                // An insert at the pre-transaction end is an append: use the
+                // Validate against the replay state: positions refer to the
+                // state built by the earlier ops of the batch, not the
+                // pre-transaction data.
+                let replay = this.EnsureJournalSession()
+
+                if position < 0 || position > replay.Count then
+                    raise (ArgumentOutOfRangeException(nameof position))
+
+                // An insert at the replay-time end is an append: use the
                 // sentinel so it lands at the replay-time end.
-                let pos = if position = data.Count then -1 else position
+                let pos = if position = replay.Count then -1 else position
                 this.JournalOp(ListOp(ListOpKind.Insert, pos, value, 0uy))
             else
+                if position < 0 || position > data.Count then
+                    raise (ArgumentOutOfRangeException(nameof position))
+
                 data.Insert(position, value)
                 this.ApplyAndFlush(ListOp(ListOpKind.Insert, position, value, 0uy))
         finally
@@ -693,12 +741,19 @@ type ChangeableList<'T>(initial: seq<'T>) =
         ctx.ClaimOwner()
 
         try
-            if position < 0 || position >= data.Count then
-                raise (ArgumentOutOfRangeException(nameof position))
-
             if ctx.TxActive then
+                // Validate against the replay state: positions refer to the
+                // state built by the earlier ops of the batch.
+                let replay = this.EnsureJournalSession()
+
+                if position < 0 || position >= replay.Count then
+                    raise (ArgumentOutOfRangeException(nameof position))
+
                 this.JournalOp(ListOp(ListOpKind.Remove, position, Unchecked.defaultof<'T>, 0uy))
             else
+                if position < 0 || position >= data.Count then
+                    raise (ArgumentOutOfRangeException(nameof position))
+
                 data.RemoveAt position
                 this.ApplyAndFlush(ListOp(ListOpKind.Remove, position, Unchecked.defaultof<'T>, 0uy))
         finally
@@ -713,13 +768,22 @@ type ChangeableList<'T>(initial: seq<'T>) =
         ctx.ClaimOwner()
 
         try
-            if position < 0 || position >= data.Count then
-                raise (ArgumentOutOfRangeException(nameof position))
+            if ctx.TxActive then
+                // The equality check runs against the replay state: an update
+                // that restores the committed value of a position touched
+                // earlier in the batch must still journal.
+                let replay = this.EnsureJournalSession()
 
-            if not (EqualityComparer<'T>.Default.Equals(data[position], value)) then
-                if ctx.TxActive then
+                if position < 0 || position >= replay.Count then
+                    raise (ArgumentOutOfRangeException(nameof position))
+
+                if not (EqualityComparer<'T>.Default.Equals(replay[position], value)) then
                     this.JournalOp(ListOp(ListOpKind.Update, position, value, 0uy))
-                else
+            else
+                if position < 0 || position >= data.Count then
+                    raise (ArgumentOutOfRangeException(nameof position))
+
+                if not (EqualityComparer<'T>.Default.Equals(data[position], value)) then
                     data[position] <- value
                     this.ApplyAndFlush(ListOp(ListOpKind.Update, position, value, 0uy))
         finally
@@ -731,19 +795,32 @@ type ChangeableList<'T>(initial: seq<'T>) =
         ctx.ClaimOwner()
 
         try
-            let mutable index = -1
-            let mutable i = 0
+            if ctx.TxActive then
+                // Remove the first occurrence in the replay state: the value
+                // may have been inserted by an earlier op of the batch.
+                let replay = this.EnsureJournalSession()
+                let mutable index = -1
+                let mutable i = 0
 
-            while index < 0 && i < data.Count do
-                if EqualityComparer<'T>.Default.Equals(data[i], value) then
-                    index <- i
-                else
-                    i <- i + 1
+                while index < 0 && i < replay.Count do
+                    if EqualityComparer<'T>.Default.Equals(replay[i], value) then
+                        index <- i
+                    else
+                        i <- i + 1
 
-            if index >= 0 then
-                if ctx.TxActive then
+                if index >= 0 then
                     this.JournalOp(ListOp(ListOpKind.Remove, index, Unchecked.defaultof<'T>, 0uy))
-                else
+            else
+                let mutable index = -1
+                let mutable i = 0
+
+                while index < 0 && i < data.Count do
+                    if EqualityComparer<'T>.Default.Equals(data[i], value) then
+                        index <- i
+                    else
+                        i <- i + 1
+
+                if index >= 0 then
                     data.RemoveAt index
                     this.ApplyAndFlush(ListOp(ListOpKind.Remove, index, Unchecked.defaultof<'T>, 0uy))
         finally
@@ -786,6 +863,7 @@ type ChangeableList<'T>(initial: seq<'T>) =
             if ctx.TxActive then
                 pendingValue <- ValueSome newValues
                 journalCount <- 0
+                journalReplay <- ValueNone
                 flushEnqueued <- true
                 GraphContext.Default.TxBuffer.Enqueue(this :> ICommit)
             else
@@ -823,6 +901,7 @@ type ChangeableList<'T>(initial: seq<'T>) =
         member this.Abort() =
             pendingValue <- ValueNone
             journalCount <- 0
+            journalReplay <- ValueNone
             flushEnqueued <- false
 
     interface IAdaptiveList<'T> with
@@ -839,7 +918,11 @@ type ChangeableList<'T>(initial: seq<'T>) =
         member _.Version = version
 
     interface IDisposable with
-        member _.Dispose() = ()
+        member this.Dispose() =
+            // Real teardown: detach every sink and parent edge so derived
+            // nodes and observations do not keep this source alive.
+            Collections.clearSinks &sinks
+            edges.Clear()
 
     /// Internal. Number of registered derived sinks (tests).
     member internal _.SinkCount = sinks.Count

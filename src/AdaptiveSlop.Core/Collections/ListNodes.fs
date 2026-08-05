@@ -104,12 +104,13 @@ type FilterMapListNode<'T, 'U>(source: IAdaptiveList<'T>, [<InlineIfLambda>] map
 
     member private this.EnsureInitialized() =
         if not initialized then
-            initialized <- true
             // Snapshot first, register between, then load (PLAN.md §7.4).
+            // The flag is set last: an exception leaves the node uninitialized.
             let snapshot = ResizeArray<'T>(source.GetValue())
             this.Register()
             this.Load(snapshot)
             depVersion <- source.Version
+            initialized <- true
 
     member private this.Drain() =
         if not journal.IsEmpty then
@@ -117,88 +118,91 @@ type FilterMapListNode<'T, 'U>(source: IAdaptiveList<'T>, [<InlineIfLambda>] map
             let ops = journal.Ops.Items
             let cnt = journal.Ops.Count
             let mutable i = 0
+            // Consumed count: applied ops must never be applied again; the op
+            // that threw survives for the next drain.
+            let mutable opsDone = 0
 
-            while i < cnt do
-                let op = ops[i]
-                let p = op.Position
-                let j = this.LowerBound p
-                let present = this.Contains(p, j)
+            try
+                while i < cnt do
+                    let op = ops[i]
+                    let p = op.Position
+                    let j = this.LowerBound p
+                    let present = this.Contains(p, j)
 
-                match op.Kind with
-                | ListOpKind.Insert ->
-                    match mapping op.Value with
-                    | ValueSome u ->
-                        output.Insert(j, u)
-                        inputPositions.Insert(j, p)
-
-                        // Elements at input positions >= p shifted +1; the
-                        // tail starts after the inserted position.
-                        for k in j + 1 .. inputPositions.Count - 1 do
-                            inputPositions[k] <- inputPositions[k] + 1
-
-                        out.Ops <- Collections.bufferAppend out.Ops (ListOp(ListOpKind.Insert, j, u, 0uy))
-                    | ValueNone ->
-                        // Elements at input positions >= p shifted +1 even when
-                        // the new element does not survive.
-                        for k in j .. inputPositions.Count - 1 do
-                            inputPositions[k] <- inputPositions[k] + 1
-
-                    inputCount <- inputCount + 1
-                | ListOpKind.Remove ->
-                    if present then
-                        output.RemoveAt j
-                        inputPositions.RemoveAt j
-
-                        out.Ops <-
-                            Collections.bufferAppend
-                                out.Ops
-                                (ListOp(ListOpKind.Remove, j, Unchecked.defaultof<'U>, 0uy))
-
-                    // Elements at input positions > p shifted -1, whether or
-                    // not the removed element was in the output.
-                    for k in j .. inputPositions.Count - 1 do
-                        inputPositions[k] <- inputPositions[k] - 1
-
-                    inputCount <- inputCount - 1
-                | ListOpKind.Update ->
-                    match mapping op.Value with
-                    | ValueSome u ->
-                        if present then
-                            output[j] <- u
-                            out.Ops <- Collections.bufferAppend out.Ops (ListOp(ListOpKind.Update, j, u, 0uy))
-                        else
+                    match op.Kind with
+                    | ListOpKind.Insert ->
+                        match mapping op.Value with
+                        | ValueSome u ->
                             output.Insert(j, u)
                             inputPositions.Insert(j, p)
 
+                            // Elements at input positions >= p shifted +1; the
+                            // tail starts after the inserted position.
                             for k in j + 1 .. inputPositions.Count - 1 do
                                 inputPositions[k] <- inputPositions[k] + 1
 
                             out.Ops <- Collections.bufferAppend out.Ops (ListOp(ListOpKind.Insert, j, u, 0uy))
-                    | ValueNone ->
+                        | ValueNone ->
+                            // Elements at input positions >= p shifted +1 even when
+                            // the new element does not survive.
+                            for k in j .. inputPositions.Count - 1 do
+                                inputPositions[k] <- inputPositions[k] + 1
+
+                        inputCount <- inputCount + 1
+                    | ListOpKind.Remove ->
                         if present then
                             output.RemoveAt j
                             inputPositions.RemoveAt j
-
-                            for k in j .. inputPositions.Count - 1 do
-                                inputPositions[k] <- inputPositions[k] - 1
 
                             out.Ops <-
                                 Collections.bufferAppend
                                     out.Ops
                                     (ListOp(ListOpKind.Remove, j, Unchecked.defaultof<'U>, 0uy))
-                | _ -> ()
 
-                i <- i + 1
+                        // Elements at input positions > p shifted -1, whether or
+                        // not the removed element was in the output.
+                        for k in j .. inputPositions.Count - 1 do
+                            inputPositions[k] <- inputPositions[k] - 1
 
-            // Compaction markers: entries appended during processing (reentrant
-            // writes from the mapping) survive for the next drain.
-            let live = journal.Ops.Count
+                        inputCount <- inputCount - 1
+                    | ListOpKind.Update ->
+                        match mapping op.Value with
+                        | ValueSome u ->
+                            if present then
+                                output[j] <- u
+                                out.Ops <- Collections.bufferAppend out.Ops (ListOp(ListOpKind.Update, j, u, 0uy))
+                            else
+                                // An update never moves other elements' input
+                                // positions: the new output element takes
+                                // position p, the tail keeps its positions.
+                                output.Insert(j, u)
+                                inputPositions.Insert(j, p)
+                                out.Ops <- Collections.bufferAppend out.Ops (ListOp(ListOpKind.Insert, j, u, 0uy))
+                        | ValueNone ->
+                            if present then
+                                output.RemoveAt j
+                                inputPositions.RemoveAt j
 
-            if live > cnt then
-                Array.Copy(journal.Ops.Items, cnt, journal.Ops.Items, 0, live - cnt)
-                journal.Ops.Count <- live - cnt
-            else
-                journal.Ops.Count <- 0
+                                out.Ops <-
+                                    Collections.bufferAppend
+                                        out.Ops
+                                        (ListOp(ListOpKind.Remove, j, Unchecked.defaultof<'U>, 0uy))
+                    | _ -> ()
+
+                    i <- i + 1
+                    opsDone <- i
+            finally
+                // Compaction markers: entries appended during processing
+                // (reentrant writes from the mapping) and the op that threw
+                // survive for the next drain; consumed ops are dropped (double
+                // removes corrupt the list).
+                let live = journal.Ops.Count
+
+                if live > opsDone then
+                    Array.Copy(journal.Ops.Items, opsDone, journal.Ops.Items, 0, live - opsDone)
+                    journal.Ops.Count <- live - opsDone
+                else
+                    journal.Ops.Count <- 0
 
             if not out.IsEmpty then
                 version <- version + 1L
@@ -330,13 +334,14 @@ type AppendListNode<'T>(left: IAdaptiveList<'T>, right: IAdaptiveList<'T>) =
 
     member private this.EnsureInitialized() =
         if not initialized then
-            initialized <- true
+            // The flag is set last: an exception leaves the node uninitialized.
             let ls = ResizeArray<'T>(left.GetValue())
             let rs = ResizeArray<'T>(right.GetValue())
             this.Register()
             this.Load(ls, rs)
             leftVersion <- left.Version
             rightVersion <- right.Version
+            initialized <- true
 
     member private this.Drain() =
         if journalCount > 0 then

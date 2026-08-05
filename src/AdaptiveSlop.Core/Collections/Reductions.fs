@@ -157,8 +157,11 @@ type SetReduceNode<'a, 'b, 's, 'v when 'a: equality>
     /// pending delta, so the whole journal is consumed.
     member private this.Rebuild() =
         let mutable acc = reduction.seed
+        // The view is always a HashSet in this implementation; interface
+        // iteration would box the enumerator (measured 40 B per element).
+        let data = source.GetValue() :?> HashSet<'a>
 
-        for x in source.GetValue() do
+        for x in data do
             acc <- reduction.add acc (mapping x)
 
         red <- acc
@@ -172,45 +175,55 @@ type SetReduceNode<'a, 'b, 's, 'v when 'a: equality>
         let addStart = journal.Adds.Count
         let mutable i = 0
         let mutable rebuilt = false
+        // Consumed counts: applied entries must never be applied again; the
+        // entry that threw survives for the next drain.
+        let mutable remsDone = 0
+        let mutable addsDone = 0
 
-        while i < remStart do
-            if not rebuilt then
-                let x = journal.Rems.Items[i]
+        try
+            while i < remStart do
+                if not rebuilt then
+                    let x = journal.Rems.Items[i]
 
-                match reduction.sub red (mapping x) with
-                | ValueSome s -> red <- s
-                | ValueNone ->
-                    this.Rebuild()
-                    rebuilt <- true
+                    match reduction.sub red (mapping x) with
+                    | ValueSome s -> red <- s
+                    | ValueNone ->
+                        this.Rebuild()
+                        rebuilt <- true
 
-            i <- i + 1
+                i <- i + 1
+                remsDone <- i
 
-        i <- 0
+            i <- 0
 
-        while i < addStart do
-            if not rebuilt then
-                let x = journal.Adds.Items[i]
-                red <- reduction.add red (mapping x)
+            while i < addStart do
+                if not rebuilt then
+                    let x = journal.Adds.Items[i]
+                    red <- reduction.add red (mapping x)
 
-            i <- i + 1
-
-        if not rebuilt then
+                i <- i + 1
+                addsDone <- i
+        finally
+            // Compact in the finally: a throwing mapping must not make the next
+            // drain re-apply consumed entries (double subtract corrupts the
+            // reduction).
             let remLive = journal.Rems.Count
 
-            if remLive > remStart then
-                Array.Copy(journal.Rems.Items, remStart, journal.Rems.Items, 0, remLive - remStart)
-                journal.Rems.Count <- remLive - remStart
+            if remLive > remsDone then
+                Array.Copy(journal.Rems.Items, remsDone, journal.Rems.Items, 0, remLive - remsDone)
+                journal.Rems.Count <- remLive - remsDone
             else
                 journal.Rems.Count <- 0
 
             let addLive = journal.Adds.Count
 
-            if addLive > addStart then
-                Array.Copy(journal.Adds.Items, addStart, journal.Adds.Items, 0, addLive - addStart)
-                journal.Adds.Count <- addLive - addStart
+            if addLive > addsDone then
+                Array.Copy(journal.Adds.Items, addsDone, journal.Adds.Items, 0, addLive - addsDone)
+                journal.Adds.Count <- addLive - addsDone
             else
                 journal.Adds.Count <- 0
 
+        if not rebuilt then
             value <- reduction.view red
 
     interface ISetDeltaSink<'a> with
@@ -230,11 +243,12 @@ type SetReduceNode<'a, 'b, 's, 'v when 'a: equality>
                     invalidOp "This adaptive value has been disposed."
 
                 if not initialized then
-                    initialized <- true
                     // Snapshot first, register between (see MapSetNode.EnsureInitialized
                     // in SetNodes.fs): the mapping is user code that may write to
                     // the source, and the write must land in our journal. A dirty
                     // source draining during the snapshot read pushes to nobody.
+                    // The flag is set last: an exception leaves the node
+                    // uninitialized.
                     let snapshot = HashSet<'a>(source.GetValue())
                     this.Register()
                     let mutable acc = reduction.seed
@@ -245,6 +259,7 @@ type SetReduceNode<'a, 'b, 's, 'v when 'a: equality>
                     red <- acc
                     value <- reduction.view red
                     depVersions[0] <- source.Version
+                    initialized <- true
 
                 if source.Version <> depVersions[0] then
                     source.GetValue() |> ignore
@@ -283,7 +298,10 @@ type MapReduceNode<'k, 'a, 'b, 's, 'v when 'k: equality>
     let mutable edges = ParentEdges()
     let mutable depVersions = [| 0L |]
     let mutable journal = MapDelta<'k, 'a>.Create()
-    let mirror = Dictionary<'k, 'a>()
+    // Mirror of source values plus their mapped values: a Set on an existing
+    // key inverts with the stored mapped old value (the mapping runs once per
+    // journal element, not once per sub and once per add).
+    let mirror = Dictionary<'k, struct ('a * 'b)>()
     let mutable initialized = false
     let mutable disposed = false
     let mutable red = reduction.seed
@@ -304,77 +322,104 @@ type MapReduceNode<'k, 'a, 'b, 's, 'v when 'k: equality>
     member private this.Rebuild() =
         mirror.Clear()
         let mutable acc = reduction.seed
+        // The view is always a Dictionary in this implementation; interface
+        // iteration would box the enumerator (measured 48 B per entry).
+        let data = source.GetValue() :?> Dictionary<'k, 'a>
 
-        for KeyValue(k, v) in source.GetValue() do
-            mirror[k] <- v
-            acc <- reduction.add acc (mapping k v)
+        for KeyValue(k, v) in data do
+            let m = mapping k v
+            mirror[k] <- struct (v, m)
+            acc <- reduction.add acc m
 
         red <- acc
         value <- reduction.view red
         journal.Clear()
 
     /// Apply the journal to the reduction state. A Set on an existing key
-    /// subtracts the old mapped value, then adds the new one.
+    /// subtracts the stored mapped old value, then adds the new one; an equal
+    /// source value is skipped (no-op updates do not rebuild).
     member private this.Drain() =
         let remStart = journal.Rems.Count
         let setStart = journal.Sets.Count
         let mutable i = 0
         let mutable rebuilt = false
+        // Consumed counts: see the set reduction drain.
+        let mutable remsDone = 0
+        let mutable setsDone = 0
 
-        while i < remStart do
-            if not rebuilt then
-                let k = journal.Rems.Items[i]
-                let mutable old = Unchecked.defaultof<'a>
-
-                if mirror.TryGetValue(k, &old) then
-                    match reduction.sub red (mapping k old) with
-                    | ValueSome s -> red <- s
-                    | ValueNone ->
-                        this.Rebuild()
-                        rebuilt <- true
-
-                    if not rebuilt then
-                        mirror.Remove k |> ignore
-
-            i <- i + 1
-
-        i <- 0
-
-        while i < setStart do
-            if not rebuilt then
-                let struct (k, v) = journal.Sets.Items[i]
-                let mutable old = Unchecked.defaultof<'a>
-
-                if mirror.TryGetValue(k, &old) then
-                    match reduction.sub red (mapping k old) with
-                    | ValueSome s -> red <- s
-                    | ValueNone ->
-                        this.Rebuild()
-                        rebuilt <- true
-
+        try
+            while i < remStart do
                 if not rebuilt then
-                    red <- reduction.add red (mapping k v)
-                    mirror[k] <- v
+                    let k = journal.Rems.Items[i]
+                    let mutable old = Unchecked.defaultof<struct ('a * 'b)>
 
-            i <- i + 1
+                    if mirror.TryGetValue(k, &old) then
+                        let struct (_, mappedOld) = old
 
-        if not rebuilt then
+                        match reduction.sub red mappedOld with
+                        | ValueSome s -> red <- s
+                        | ValueNone ->
+                            this.Rebuild()
+                            rebuilt <- true
+
+                        if not rebuilt then
+                            mirror.Remove k |> ignore
+
+                i <- i + 1
+                remsDone <- i
+
+            i <- 0
+
+            while i < setStart do
+                if not rebuilt then
+                    let struct (k, v) = journal.Sets.Items[i]
+                    let mutable old = Unchecked.defaultof<struct ('a * 'b)>
+
+                    if mirror.TryGetValue(k, &old) then
+                        let struct (oldV, mappedOld) = old
+
+                        if EqualityComparer<'a>.Default.Equals(oldV, v) then
+                            // No-op update: nothing to invert, nothing to add.
+                            ()
+                        else
+                            match reduction.sub red mappedOld with
+                            | ValueSome s -> red <- s
+                            | ValueNone ->
+                                this.Rebuild()
+                                rebuilt <- true
+
+                            if not rebuilt then
+                                let m = mapping k v
+                                red <- reduction.add red m
+                                mirror[k] <- struct (v, m)
+                    else
+                        let m = mapping k v
+                        red <- reduction.add red m
+                        mirror[k] <- struct (v, m)
+
+                i <- i + 1
+                setsDone <- i
+        finally
+            // Compact in the finally: a throwing mapping must not make the next
+            // drain re-apply consumed entries (double subtract corrupts the
+            // reduction).
             let remLive = journal.Rems.Count
 
-            if remLive > remStart then
-                Array.Copy(journal.Rems.Items, remStart, journal.Rems.Items, 0, remLive - remStart)
-                journal.Rems.Count <- remLive - remStart
+            if remLive > remsDone then
+                Array.Copy(journal.Rems.Items, remsDone, journal.Rems.Items, 0, remLive - remsDone)
+                journal.Rems.Count <- remLive - remsDone
             else
                 journal.Rems.Count <- 0
 
             let setLive = journal.Sets.Count
 
-            if setLive > setStart then
-                Array.Copy(journal.Sets.Items, setStart, journal.Sets.Items, 0, setLive - setStart)
-                journal.Sets.Count <- setLive - setStart
+            if setLive > setsDone then
+                Array.Copy(journal.Sets.Items, setsDone, journal.Sets.Items, 0, setLive - setsDone)
+                journal.Sets.Count <- setLive - setsDone
             else
                 journal.Sets.Count <- 0
 
+        if not rebuilt then
             value <- reduction.view red
 
     interface IMapDeltaSink<'k, 'a> with
@@ -394,8 +439,9 @@ type MapReduceNode<'k, 'a, 'b, 's, 'v when 'k: equality>
                     invalidOp "This adaptive value has been disposed."
 
                 if not initialized then
-                    initialized <- true
                     // Snapshot first, register between (see the set reduction node).
+                    // The flag is set last: an exception leaves the node
+                    // uninitialized.
                     let snapshot = Dictionary<'k, 'a>()
 
                     for KeyValue(k, v) in source.GetValue() do
@@ -405,12 +451,14 @@ type MapReduceNode<'k, 'a, 'b, 's, 'v when 'k: equality>
                     let mutable acc = reduction.seed
 
                     for KeyValue(k, v) in snapshot do
-                        mirror[k] <- v
-                        acc <- reduction.add acc (mapping k v)
+                        let m = mapping k v
+                        mirror[k] <- struct (v, m)
+                        acc <- reduction.add acc m
 
                     red <- acc
                     value <- reduction.view red
                     depVersions[0] <- source.Version
+                    initialized <- true
 
                 if source.Version <> depVersions[0] then
                     source.GetValue() |> ignore

@@ -3530,11 +3530,251 @@ let ``transaction appends land in write order`` () =
 
     Assert.Equal<int list>([ 0; 1; 2; 3; 4; 5 ], AList.toList (CList.value s3))
 
-    // insert at the pre-transaction end is an append
+    // Positions are replay-relative (docs/ALIST-DESIGN.md §3.3): the second
+    // insertAt 2 targets the state after the first insert (the element 3),
+    // so it lands before it. An insert at the replay-time end is an append.
     let s4 = CList.ofList [ 1; 2 ]
 
     Transaction.run (fun () ->
         CList.insertAt 2 3 s4
         CList.insertAt 2 4 s4)
 
-    Assert.Equal<int list>([ 1; 2; 3; 4 ], AList.toList (CList.value s4))
+    Assert.Equal<int list>([ 1; 2; 4; 3 ], AList.toList (CList.value s4))
+
+    // A positional op that is valid against the pre-transaction list but not
+    // against the replay state throws at write time (all-or-nothing commit):
+    // removeAt 0 shrinks the replay, so removeAt 1 is out of range.
+    let s5 = CList.ofList [ 1; 2 ]
+
+    Assert.Throws<System.ArgumentOutOfRangeException>(fun () ->
+        Transaction.run (fun () ->
+            CList.removeAt 0 s5
+            CList.removeAt 1 s5)
+        |> ignore)
+    |> ignore
+
+    Assert.Equal<int list>([ 1; 2 ], AList.toList (CList.value s5))
+
+// =============================================================================
+// Hostile-review fixes (docs/2026-08-05-GLM_REVIEW_FINDINGS.md,
+// docs/2026-08-05-KIMI_REVIEW_FINDINGS.md) — regression tests
+// =============================================================================
+
+[<Fact>]
+let ``ASet ofAVal feeds derived nodes after the first read`` () =
+    // KIMI 1: OfAvalSetNode never advanced its version, so downstream nodes
+    // stopped re-pulling the source after the first read.
+    let v = CVal.create [| 1; 2; 3 |]
+    let mapped = ASet.map (fun x -> x * 10) (ASet.ofAVal (CVal.value v))
+    Assert.Equal<Set<_>>(Set.ofList [ 10; 20; 30 ], Set.ofSeq (ASet.force mapped))
+    CVal.set [| 3; 4 |] v
+    Assert.Equal<Set<_>>(Set.ofList [ 30; 40 ], Set.ofSeq (ASet.force mapped))
+    CVal.set [||] v
+    Assert.Equal<Set<int>>(Set.empty, Set.ofSeq (ASet.force mapped))
+
+[<Fact>]
+let ``AMap ofAVal feeds derived nodes after the first read`` () =
+    // KIMI 1, map side.
+    let v = CVal.create [ "a", 1 ]
+    let mapped = AMap.map (fun k x -> x * 10) (AMap.ofAVal (CVal.value v))
+
+    let view () =
+        Map.ofSeq (seq { for KeyValue(k, x) in AMap.force mapped -> k, x })
+
+    Assert.Equal<Map<string, int>>(Map.ofList [ "a", 10 ], view ())
+    CVal.set [ "b", 2 ] v
+    Assert.Equal<Map<string, int>>(Map.ofList [ "b", 20 ], view ())
+
+[<Fact>]
+let ``same-element add and remove in one batch net to nothing downstream`` () =
+    // KIMI 2: producers must deliver net deltas (one op per element per
+    // batch); consumers apply the buffers order-free.
+    // xor: both sides gain the element in one transaction -> absent before
+    // and after, so nothing may reach the downstream map.
+    let l = CSet.empty<int>
+    let r = CSet.empty<int>
+    let x = ASet.xor (CSet.value l) (CSet.value r)
+    let mapped = ASet.map (fun y -> y * 2) x
+
+    Transaction.run (fun () ->
+        CSet.add 1 l
+        CSet.add 1 r)
+
+    Assert.Equal<Set<int>>(Set.empty, Set.ofSeq (ASet.force mapped))
+    // custom: the compute adds and removes the same element every poll
+    // (adds apply first by convention) -> net nothing.
+    let c =
+        ASet.custom (fun _ d ->
+            d.Add 5
+            d.Remove 5)
+
+    let cm = ASet.map string c
+    Assert.Equal<Set<string>>(Set.empty, Set.ofSeq (ASet.force cm))
+
+[<Fact>]
+let ``AList filter keeps positions after an update that changes survival`` () =
+    // KIMI 3: the Update branch shifted inputPositions as if the input had
+    // grown or shrunk; later removes were then ignored.
+    let src = CList.ofList [ 1; 2; 3; 4 ]
+    let evens = AList.filter (fun x -> x % 2 = 0) (CList.value src)
+    Assert.Equal<int list>([ 2; 4 ], AList.toList evens)
+    // 2 -> 5 (stops surviving): the tail keeps its input positions.
+    CList.updateAt 1 5 src
+    Assert.Equal<int list>([ 4 ], AList.toList evens)
+    // Remove the element at input position 3 (the 4): must be seen.
+    CList.removeAt 3 src
+    Assert.Empty(AList.toList evens)
+
+[<Fact>]
+let ``AMap observe delivers the net of a set-then-rem batch`` () =
+    // KIMI 4: the reduceJournal counted +1/-1 per key and lost a key that was
+    // set and removed in one delivery (no callback, or a KeyNotFound).
+    let l = CMap.ofSeq [ "k", 1 ]
+    let r = CMap.empty<string, int>
+    let u = AMap.unionWith (fun _ a b -> a + b) (CMap.value l) (CMap.value r)
+    let delivered = ResizeArray<MapDelta<string, int>>()
+    use obs = AMap.observe (fun _ d -> delivered.Add d) u
+
+    Transaction.run (fun () ->
+        CMap.remove "k" l
+        CMap.addOrUpdate "k" 2 r)
+
+    // Net: the key is present with 2 -> exactly one delivery, a Set.
+    Assert.Single(delivered)
+    let d = delivered[0]
+    let entries = d.SetEntries.ToArray()
+    Assert.Single(entries)
+    Assert.Empty(d.RemovedKeys.ToArray())
+    let struct (k, v) = entries[0]
+    Assert.Equal("k", k)
+    Assert.Equal(2, v)
+
+[<Fact>]
+let ``ChangeableList transaction update equality checks the replay state`` () =
+    // KIMI 5: an update that restores the committed value of a position
+    // touched earlier in the batch must still journal.
+    let s = CList.ofList [ 2; 2; 3 ]
+
+    Transaction.run (fun () ->
+        CList.updateAt 0 5 s
+        CList.updateAt 0 2 s)
+
+    Assert.Equal<int list>([ 2; 2; 3 ], AList.toList (CList.value s))
+
+[<Fact>]
+let ``ReduceNode recomputes when a write lands mid-reduce`` () =
+    // GLM 1 / KIMI 6: ReduceNode.Recompute ignored checkedGen, so a write from
+    // user code inside the reduce callback was overwritten by Clean and the
+    // stale value was served as fresh. Observed node, so the flag is the only
+    // signal (the version walk is skipped for Clean nodes).
+    let a = CVal.create 1
+    let b = CVal.create 100
+    let mutable n = 0
+    // Writes to b on the first and third compute (b is read before the write,
+    // so the third compute's value is stale). The third write changes the
+    // value: an equal write would not move the generation.
+    let r =
+        AVal.reduce
+            0
+            (fun acc x ->
+                n <- n + 1
+
+                if n = 1 then
+                    CVal.set 200 b
+                elif n = 3 then
+                    CVal.set 300 b
+
+                acc + x)
+            [| CVal.value a; CVal.value b |]
+
+    use obs = AVal.observe (fun _ -> ()) r
+    // Compute 1 wrote b mid-compute (stale value 101); the next read must
+    // recompute: 201.
+    Assert.Equal(201, AVal.getValue r)
+    // Compute 3 writes b mid-compute again (stale value 210); the node must
+    // stay Dirty and recompute on the next read: 310.
+    CVal.set 10 a
+    Assert.Equal(310, AVal.getValue r)
+
+[<Fact>]
+let ``node initialization retries after a throwing mapping`` () =
+    // KIMI 7: initialized <- true ran before the work; a throw left the node
+    // permanently half-initialized (later reads returned partial state).
+    let s = CSet.ofSeq [ 1; 2 ]
+    let mutable calls = 0
+
+    let mapped =
+        ASet.map
+            (fun x ->
+                calls <- calls + 1
+
+                if calls = 1 then
+                    failwith "boom"
+
+                x * 10)
+            (CSet.value s)
+
+    Assert.Throws<System.Exception>(fun () -> ASet.force mapped |> ignore) |> ignore
+
+    Assert.Equal<Set<_>>(Set.ofList [ 10; 20 ], Set.ofSeq (ASet.force mapped))
+
+[<Fact>]
+let ``reduction drain does not re-apply consumed entries after a throw`` () =
+    // KIMI 8: a throwing mapping must not leave consumed journal entries for
+    // the next drain (double subtract corrupts the reduction). The entry that
+    // threw survives, so the reduction still converges after the mapping is
+    // fixed.
+    let s = CSet.ofSeq [ 1; 2 ]
+    let mutable fail = false
+
+    let sum = ASet.sumBy (fun x -> if fail then failwith "boom" else x) (CSet.value s)
+
+    Assert.Equal(3, AVal.getValue sum)
+    fail <- true
+
+    Transaction.run (fun () ->
+        CSet.remove 1 s
+        CSet.add 3 s)
+
+    Assert.Throws<System.Exception>(fun () -> AVal.getValue sum |> ignore) |> ignore
+
+    fail <- false
+    // {2,3} -> sum 5: the consumed Rem 1 is not re-applied (which would give
+    // 5 - 1 = 4 with a double subtract... the exact hazard: without compaction
+    // the Rem would apply twice, 5 - 1 - 1 = 3, and the Add twice, 3 + 3 = 6).
+    Assert.Equal(5, AVal.getValue sum)
+
+[<Fact>]
+let ``ChangeableSet.Set supersedes the whole batch`` () =
+    // KIMI 16: Set meant "replace first, later journaled ops apply" for set
+    // and map but "supersedes the whole batch" for list. Unified on the list
+    // semantic (docs/ALIST-DESIGN.md §3.3).
+    let s = CSet.ofSeq [ 1 ]
+
+    Transaction.run (fun () ->
+        CSet.set (Set.ofList [ 2; 3 ]) s
+        CSet.add 4 s)
+
+    Assert.Equal<Set<_>>(Set.ofList [ 2; 3 ], Set.ofSeq (ASet.force (CSet.value s)))
+
+    let m = CMap.ofSeq [ "a", 1 ]
+
+    Transaction.run (fun () ->
+        CMap.set (Map.ofList [ "b", 2 ]) m
+        CMap.addOrUpdate "c" 3 m)
+
+    let view () =
+        Map.ofSeq (seq { for KeyValue(k, v) in AMap.force (CMap.value m) -> k, v })
+
+    Assert.Equal<Map<string, int>>(Map.ofList [ "b", 2 ], view ())
+
+[<Fact>]
+let ``changeable dispose detaches sinks`` () =
+    // KIMI 14: Dispose was a no-op on all changeables; `use` silently leaked
+    // the derived graph.
+    let s = CSet.ofSeq [ 1; 2 ]
+    let mapped = ASet.map (fun x -> x * 10) (CSet.value s)
+    ASet.force mapped |> ignore
+    Assert.Equal(1, s.SinkCount)
+    (s :> IDisposable).Dispose()
+    Assert.Equal(0, s.SinkCount)
