@@ -196,11 +196,9 @@ type Choose2MapNode<'K, 'V1, 'V2, 'V3 when 'K: equality>
     let mutable disposed = false
 
     member private this.Register() =
-        leftSink <-
-            box (Collections.SideMapSink<'K, 'V1>(this, 0))
+        leftSink <- box (Collections.SideMapSink<'K, 'V1>(this, 0))
 
-        rightSink <-
-            box (Collections.SideMapSink<'K, 'V2>(this, 1))
+        rightSink <- box (Collections.SideMapSink<'K, 'V2>(this, 1))
 
         match box left with
         | :? IMapSinkRegistry as r -> r.AddMapSink(leftSink)

@@ -1,154 +1,104 @@
-# Bisect notes — choose2 / two-source zero-allocation failures (7.3)
+# Bisect notes — choose2 / two-source zero-allocation failures (7.3) — RESOLVED
 
-Session handoff. Active branch: `feature/collection-api` @ `0c0dd90` + uncommitted
-edits (Api.fs, MapNodes.fs, SetNodes.fs, Shared.fs, Tests.fs). Do not reset or revert
-anything.
+Final state: 140/140 tests pass, Debug and Release, after `dotnet fantomas .`.
+The two zero-allocation tests pass. The probe tests are removed. The choose2
+test is restored to 4 writes per iteration + `Assert.Equal(0L, allocated)`.
 
-## Status
+## Root causes (measured, IL-verified)
 
-- 140 tests, 138 pass. The 2 failures are the zero-allocation assertions:
-  - `choose2 node drains allocate zero in steady state` (Tests.fs ~line 2728)
-  - `two-source node drains allocate zero in steady state`
-- Tests.fs contains the temporary probe test `choose2 probe split` (fails by
-  design, prints the probe numbers). It now also prints `calib`, `pF`, `pD`,
-  `pE` and verifies the writes landed. Remove it and restore the real tests
-  (4 writes per iteration + final `Assert.Equal(0L, allocated)`) once the cause
-  is fixed.
-- Uncommitted changes this session (compile clean, behavior tests green):
-  - `applyChoose2Out` (Shared.fs ~line 1184) rewritten: the
-    `match newOut with | ValueSome v when ...` replaced by explicit
-    `if newOut.IsSome then let v = newOut.Value` form. Semantically
-    identical, MEASURED IDENTICAL (see pB/pD/pE below — no effect).
-    Keep or revert freely.
-  - Probe test extended: calibration allocation, `pF` (raw source), `pD`
-    (choose2 changed), `pE` (choose2 elided), write-landing check.
+### Cause 1 — reference tuple in the two-source mapping bodies (map side)
 
-## Measured facts (xUnit compiled, Debug, net8 — ground truth)
+`AMap.unionWith`, `AMap.intersect`, `AMap.intersectWith` wrapped the user
+function in `fun k lv rv -> match lv, rv with ...`. The two-value match
+compiles to a REFERENCE tuple: IL `newobj instance void class
+[System.Runtime]System.Tuple`2<voption<'V1>, voption<'V2>>::.ctor` in the
+closure `Invoke` (example: `intersectWith@392::Invoke`, IL offset 0x02).
 
-Single run, one probe test, all phases in order. `calib` = a known
-`Array.zeroCreate<int> 1000` allocation inside the same measurement style:
-4024 B, so the counter works. The writes were verified to land (maxVal >= 10000
-after P1). Reproduces exactly across runs and across sessions.
+Measured (isolated probe, one node per fresh graph, journals pre-grown):
+unionWith drain of 100 entries = 3200 B (32 B per mapping call = one Tuple).
+100 x (write + read) = 3200 B. This was the whole choose2-test failure.
 
-| Probe | Setup | Measurement |
-|---|---|---|
-| P1 | 100 writes, no drain | 1864 B |
-| P3 | 1 write + 100 reads | 32 B |
-| pA | 100w+1r, choose2 stub `fun _ _ _ -> ValueNone`, Out stays empty | 1864 B |
-| pB | 100w+1r, `AMap.union` (right-biased wrapper), output elided | 7136 B |
-| pD | 100w+1r, choose2 `fun _ lv _ -> lv`, output changes | 9920 B |
-| pE | 100w+1r, choose2 `fun _ _ rv -> rv`, output elided | 8056 B |
-| pF | 100w, raw CMap, NO derived nodes at all | 0 B |
-| OnSideDeltas no-op | ALL of P1/P3/pA/pB/pD/pE/pF | 0 B |
+Fix: `match struct (lv, rv) with` at the three sites (ValueTuple, no heap).
+After: drain = 0 B, cycles = 0 B.
 
-### Fact 1 — the delivery path is already zero-allocation
+### Cause 2 — generalized class-level lambda materialized per drain (set side)
 
-- pF = 0 B: the full source write path (`CMap.addOrUpdate` -> `ClaimOwner` ->
-  `ApplyAndFlush` -> `PushAndMark` -> `pushMapDelta` -> `MarkFrom` ->
-  `DeliverNotifications`) allocates nothing in steady state.
-- No-opping the `Choose2MapNode.OnSideDeltas` body (removing
-  `journalAppendMap` + `state.Version++` + `MarkFrom`) makes EVERY probe
-  measure 0 B, with writes verified to land.
-- Therefore the previous session's "~16 B/write delivery" was a
-  mis-attribution. P1 = pA = 1864 is: fresh-node journal growth
-  (JournalL.Sets 16 -> 32 -> 64 -> 128 = 1792 B for 100 single-entry appends
-  into a never-drained journal) + ~72 B total noise. The earlier note
-  "journal growth ~256 B" is wrong (256 B is only the 16 -> 32 step).
-- The source's own `outDelta` never grows in steady state: `PushAndMark`
-  calls `outDelta.Clear()` after every single write, so the count is 0 after
-  each write and the 16-slot buffer is never exceeded.
+`UnionSetNode<'T>` had `let identity = fun x -> ValueSome x` in the class
+body. The binding generalizes to `'a -> 'a voption`, so F# did not store it
+as a field: IL shows `newobj GetValue@234-1(this)` (24 B) inside
+`UnionSetNode.GetValue` at EVERY dirty drain.
 
-### Fact 2 — the real cost is in the drain, and only when `Out.TryGetValue` HITS
+Measured: 24 B per unionCount read cycle (sU = 2400 B per 100 iterations);
+the intersect path (`TwoSourceSetNode`, no lambda) measured 0 B.
 
-Drain-only cost = probe minus the 1864 B baseline (delivery + fresh-journal
-growth). pA is the control: same drain loop, but `Out` is empty so
-`applyChoose2Out`'s `Out.TryGetValue(k, &old)` misses and `newOut` is
-`ValueNone`.
+Fix: module-level `module private Id = let inline identityV x = ValueSome x`
+in SetNodes.fs.
 
-| Probe | Drain total | B/entry | `Out.TryGetValue` | elision check |
-|---|---|---|---|---|
-| pA | 0 B | 0 | MISS | not evaluated |
-| pB | 5272 B | 52.7 | HIT | evaluated, equal |
-| pE | 6192 B | 61.9 | HIT | evaluated, equal |
-| pD | 8056 B | 80.6 | HIT | evaluated, different |
+### Cause 3 — residual one-time 24 B
 
-pD includes +1792 B of fresh OutDelta growth (16 -> 128 for 100 entries),
-which accounts for ~17.9 B/entry of its 80.6; pD and pE share a ~62 B/entry
-base. pB/pE (elided) push NOTHING downstream (no out delta, no count-node
-delivery) yet still cost 52-62 B/entry.
+After causes 1+2, the two-source test still measured 24 B once. The Shared.fs
+drain/load functions took the mapping as a plain `FSharpFunc` parameter, so
+the lambda materialized a closure at the boundary. Making the drain/load
+functions `let inline` with `[<InlineIfLambda>]` on the mapping parameter
+(loadRefSet, loadPlainSet, loadMap, drainRefSet, drainPlainSet, drainMap,
+drainSetPush, drainPlainSetPush, drainMapPush, processChoose2Side,
+drainChoose2, drainChoose2Push, loadChoose2) inlines the lambda into the
+drain loop: no FSharpFunc object at all. After: 0 B, Debug and Release.
+Note: `let inline` with a `byref` parameter compiles on the current SDK —
+the old header comment in Shared.fs (FS0412) was stale; modern F# accepts it.
 
-### Fact 3 — the `when`-guard hypothesis is REFUTED
+## Discarded hypotheses (do not re-investigate)
 
-Rewriting `applyChoose2Out` from
-`match newOut with | ValueSome v when EqualityComparer<'V3>.Default.Equals(old, v) -> ()`
-to explicit `if newOut.IsSome then let v = newOut.Value` + `if Equals then ()`:
-pB=7136, pD=9920, pE=8056 — byte-for-byte identical. The match structure is
-not the cost.
+1. **The `when`-guard / match-structure hypothesis** (previous session).
+   REFUTED: rewriting `match newOut with | ValueSome v when ...` to explicit
+   ifs changed nothing (pB/pD/pE byte-identical).
+2. **The 24 B `match dict.TryGetValue key with | true, v ->` pattern.**
+   REFUTED: the pattern does not occur in any hot path; all call sites use
+   the out-param form.
+3. **"~16 B/write in the delivery path".** REFUTED: probe pF (raw source,
+   100 writes) = 0 B. `GC.GetAllocatedBytesForCurrentThread` calibration
+   confirmed the counter works (4024 B for a 1000-int array).
+4. **"Journal growth ~256 B".** Wrong: 16 -> 32 -> 64 -> 128 growth for 100
+   single-entry appends = 1792 B.
+5. **The pA-vs-pE candidate list** (`Out.TryGetValue` hit, `ValueSome` flow,
+   `EqualityComparer<'V3>.Default` evaluation). ALL REFUTED:
+   `applyChoose2Out` and `processChoose2Side` IL contain no `box` and no heap
+   `newobj`; the isolated probe shows the elided drain costs 0 B when the
+   mapping body has no reference tuple (`fun _ _ rv -> rv`: W=0 D=0 R=0 C=0).
+6. **"EqualityComparer.Default evaluation allocates".** REFUTED: IL clean
+   (cached singleton + virtual `Equals(int,int)`), and the ident-mapping
+   probe measured 0 B.
+7. **The old sequential-probe per-entry numbers (pB=7136, pD=9920, pE=8056).**
+   Contaminated methodology: every probe node stayed attached to the shared
+   source `a`, so later probes paid for earlier nodes. Per-entry costs
+   derived from them (52-80 B/entry) are invalid. Replaced by isolated
+   probes: one fresh graph per scenario.
 
-### Fact 4 — the 24 B `TryGetValue` match pattern is not present
+## Methodology that worked
 
-Audited every `TryGetValue` call site in Collections/*.fs and Library.fs: all
-use the explicit out-param form
-(`let mutable v = Unchecked.defaultof<_>; if dict.TryGetValue(k, &v) then`).
-The `match dict.TryGetValue key with | true, v ->` pattern does not occur in
-any hot path.
+- Isolated probes: fresh sources + ONE derived node per scenario, journals
+  and out-deltas pre-grown by a warm cycle, then W (writes only), D (one
+  drain + read), R (clean read), C (100 write+read cycles) measured
+  separately with `GC.GetAllocatedBytesForCurrentThread`.
+- IL verification with the local tool: `dotnet ilspycmd <dll> -o <dir> -il`,
+  then grep the method for `box ` and `newobj instance void class`.
+- The mapping call site uses `FSharpFunc.InvokeFast` (IL-verified): no
+  partial-application closures when the closure extends
+  `OptimizedClosures.FSharpFunc`N. The per-call cost was the tuple in the
+  body, not the dispatch.
 
-## What differs between the 0 B/entry case and the 52-80 B/entry cases
+## Rules confirmed by this bisect (keep)
 
-All four probes share: side journal loop, `Sides.TryGetValue` hit,
-`Sides[k] <- ...`, the mapping invocation, `applyChoose2Out` entry, `IsSome`
-test. pA (0 B) differs from pD/pE only in:
-
-1. `Out.TryGetValue(k, &old)` — MISS vs HIT (a hit returns the stored value).
-2. mapping result — `ValueNone` vs `ValueSome` (pD/pE bind `v`).
-3. `EqualityComparer<'V3>.Default.Equals(old, v)` — evaluated only in pD/pE
-   (both, regardless of branch taken).
-
-One or more of these three is the ~62 B/entry. `TryGetValue` itself cannot
-allocate on a hit (pure dictionary probing), which points at (2) the
-`ValueSome` value flow or (3) the generic `EqualityComparer<'V3>.Default`
-evaluation inside the generic function.
-
-## Next bisect steps (untested, in order)
-
-1. In `applyChoose2Out`, replace `EqualityComparer<'V3>.Default.Equals(old, v)`
-   with `old = v` (F# generic equality compiles to a different call shape).
-   - If pB/pE drop to ~0 extra: the generic comparer evaluation allocates.
-   - If unchanged: revert and go to step 2.
-2. Remove the elision entirely (always emit the delta, semantics broken, bisect
-   only): if pB/pE drop to pD's level, the comparison is the cost. If pD/pE
-   both stay ~62 B/entry, the cost is the `ValueSome` flow itself (IsSome/Value
-   or the mapping result construction at the call site in
-   `processChoose2Side`).
-3. If step 2 keeps the cost: hardcode `let v = newOut.Value` into a local at
-   the `processChoose2Side` call site and pass the plain value to
-   `applyChoose2Out` — this splits the `ValueSome` construction from the
-   function boundary.
-4. If still stuck, disassemble `applyChoose2Out` (no decompiler available in
-   the environment; use `dotnet fsi` + `System.Reflection.Metadata` or install
-   `ilspycmd`).
-5. After the cause is found and fixed: re-measure the two-source SET test
-   (24 B/iter with 2 count reads per iter — same class of problem, retest
-   with the same fix) and the remaining 7.3 closeout list below.
-
-## Remaining 7.3 closeout (after the two allocations are fixed)
-
-1. Remove the `choose2 probe split` test; restore the real failing tests
-   (4 writes per iteration, `Assert.Equal(0L, allocated)`).
-2. Run the full suite Debug + Release.
-3. `dotnet fantomas .` and commit on `feature/collection-api`.
-4. Update docs/PLAN.md Section 7.3 with the recorded FDA deviations:
-   static `unionMany` (FDA's is dynamic `aset<aset<'A>>`, needs 7.4 collect);
-   `ofHashMap` -> `ofMap` (no HashMap type here); `custom`/`ofReader` are
-   pull-based poll nodes (signatures recorded in Api.fs); `intersect` returns
-   a struct pair (collapses FDA intersect/intersectV); `choose2` is
-   voption-only (FDA's choose2V); `ofASetIgnoreDuplicates` is last-wins.
-5. Then 7.4 (bind/collect, dynamic unionMany), 7.5 (hardening, reentrant
-   write during drain investigation, benchmarks).
-
-## Working rules (do not forget)
-
-- Use the `edit` tool for file changes. NEVER sed/python/awk for edits.
+- No reference-tuple matches (`match a, b with`) in hot paths. Use
+  `match struct (a, b) with`.
+- No class-level `let f = fun ...` bindings used as function arguments in
+  hot paths: generalization materializes a closure per use. Module-level
+  (inline) functions only.
+- Drain/load functions that take a mapping: `let inline` + `[<InlineIfLambda>]`.
 - `[<InlineIfLambda>]` stays on stored lambdas (user directive).
-- Report in ASD-STE100 Simplified Technical English.
-- Benchmarks: `dotnet run -c Release` in benchmarks/AdaptiveSlop.Benchmarks.
+
+## Next (7.4, 7.5)
+
+- 7.4: `ASet.bind`/`AMap.bind` and `collect` (dynamic `unionMany`).
+- 7.5: hardening; reentrant write during drain investigation; benchmarks
+  (`cd benchmarks/AdaptiveSlop.Benchmarks && dotnet run -c Release`).

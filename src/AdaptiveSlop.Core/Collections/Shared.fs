@@ -103,7 +103,7 @@ type SetDelta<'T> =
     internal new(adds: DeltaBuffer<'T>, rems: DeltaBuffer<'T>) = { Adds = adds; Rems = rems }
 
     static member internal Create() =
-        SetDelta(DeltaBuffer.Create(), DeltaBuffer.Create())
+        SetDelta(DeltaBuffer<_>.Create(), DeltaBuffer<_>.Create())
 
     /// <summary>Gets whether this delta contains no operations.</summary>
     member this.IsEmpty = this.Adds.IsEmpty && this.Rems.IsEmpty
@@ -150,8 +150,8 @@ type SetDelta<'T> =
 /// passed by value would be copied and lost).
 /// </summary>
 type SetDeltaBuilder<'T>() =
-    let mutable adds = DeltaBuffer.Create()
-    let mutable rems = DeltaBuffer.Create()
+    let mutable adds = DeltaBuffer<_>.Create()
+    let mutable rems = DeltaBuffer<_>.Create()
 
     /// <summary>Appends an add operation.</summary>
     member _.Add(item: 'T) =
@@ -197,7 +197,7 @@ type MapDelta<'K, 'V> =
     internal new(sets: DeltaBuffer<struct ('K * 'V)>, rems: DeltaBuffer<'K>) = { Sets = sets; Rems = rems }
 
     static member internal Create() =
-        MapDelta(DeltaBuffer.Create(), DeltaBuffer.Create())
+        MapDelta(DeltaBuffer<_>.Create(), DeltaBuffer<_>.Create())
 
     /// <summary>Gets whether this delta contains no operations.</summary>
     member this.IsEmpty = this.Sets.IsEmpty && this.Rems.IsEmpty
@@ -241,8 +241,8 @@ type MapDelta<'K, 'V> =
 /// <see cref="SetDeltaBuilder&lt;'T&gt;"/> for the protocol.
 /// </summary>
 type MapDeltaBuilder<'K, 'V>() =
-    let mutable sets = DeltaBuffer.Create()
-    let mutable rems = DeltaBuffer.Create()
+    let mutable sets = DeltaBuffer<_>.Create()
+    let mutable rems = DeltaBuffer<_>.Create()
 
     /// <summary>Appends an upsert operation.</summary>
     member _.Set(key: 'K, value: 'V) =
@@ -345,8 +345,8 @@ type internal SetNodeState<'T, 'U when 'U: equality> =
             SinkList.Create(),
             Array.zeroCreate depCount,
             RefCountedSet.Create(),
-            SetDelta.Create(),
-            SetDelta.Create()
+            SetDelta<_>.Create(),
+            SetDelta<_>.Create()
         )
 
 /// <summary>
@@ -389,8 +389,8 @@ type internal MapNodeState<'K, 'V, 'U when 'K: equality> =
             SinkList.Create(),
             Array.zeroCreate depCount,
             Dictionary<'K, 'U>(),
-            MapDelta.Create(),
-            MapDelta.Create()
+            MapDelta<_, _>.Create(),
+            MapDelta<_, _>.Create()
         )
 
 // =============================================================================
@@ -572,7 +572,10 @@ module internal Collections =
     /// apply each pending delta to the state and collect the reduced output
     /// delta. Entries appended during processing (reentrant writes) survive.
     /// Returns the updated state and whether the state changed.
-    let drainRefSet (map: 'T -> 'U voption) (state: SetNodeState<'T, 'U>) : struct (SetNodeState<'T, 'U> * bool) =
+    let inline drainRefSet
+        ([<InlineIfLambda>] map: 'T -> 'U voption)
+        (state: SetNodeState<'T, 'U>)
+        : struct (SetNodeState<'T, 'U> * bool) =
         let mutable s = state
         let mutable changed = false
         let rems = s.Journal.Rems
@@ -634,7 +637,10 @@ module internal Collections =
 
     /// Drain the journal of a set node without refcounts (filter): plain
     /// membership. Returns the updated state and whether the state changed.
-    let drainPlainSet (map: 'T -> 'T voption) (state: SetNodeState<'T, 'T>) : struct (SetNodeState<'T, 'T> * bool) =
+    let inline drainPlainSet
+        ([<InlineIfLambda>] map: 'T -> 'T voption)
+        (state: SetNodeState<'T, 'T>)
+        : struct (SetNodeState<'T, 'T> * bool) =
         let mutable s = state
         let mutable changed = false
         let rems = s.Journal.Rems
@@ -688,8 +694,8 @@ module internal Collections =
     /// and collect the reduced output delta. The lambda returns ValueNone for
     /// elements to drop (filter). Returns the updated state and whether the
     /// state changed.
-    let drainMap
-        (map: 'K -> 'V -> 'U voption)
+    let inline drainMap
+        ([<InlineIfLambda>] map: 'K -> 'V -> 'U voption)
         (state: MapNodeState<'K, 'V, 'U>)
         : struct (MapNodeState<'K, 'V, 'U> * bool) =
         let mutable s = state
@@ -752,7 +758,7 @@ module internal Collections =
     /// Drain a set node and push the reduced output delta to its sinks, with
     /// notification delivery deferred (PLAN.md Section 6.5). The byref appears
     /// only at this top-level call site (a class field address: 0 allocation).
-    let drainSetPush (map: 'T -> 'U voption) (state: SetNodeState<'T, 'U> byref) =
+    let inline drainSetPush ([<InlineIfLambda>] map: 'T -> 'U voption) (state: SetNodeState<'T, 'U> byref) =
         let ctx = GraphContext.Default
         let wasActive = ctx.TxActive
         ctx.TxActive <- true
@@ -771,7 +777,7 @@ module internal Collections =
             ctx.DeliverNotifications()
 
     /// Drain a plain set node (filter) and push the reduced output delta.
-    let drainPlainSetPush (map: 'T -> 'T voption) (state: SetNodeState<'T, 'T> byref) =
+    let inline drainPlainSetPush ([<InlineIfLambda>] map: 'T -> 'T voption) (state: SetNodeState<'T, 'T> byref) =
         let ctx = GraphContext.Default
         let wasActive = ctx.TxActive
         ctx.TxActive <- true
@@ -791,7 +797,7 @@ module internal Collections =
 
     /// Drain a map node and push the reduced output delta to its sinks, with
     /// notification delivery deferred (PLAN.md Section 6.5).
-    let drainMapPush (map: 'K -> 'V -> 'U voption) (state: MapNodeState<'K, 'V, 'U> byref) =
+    let inline drainMapPush ([<InlineIfLambda>] map: 'K -> 'V -> 'U voption) (state: MapNodeState<'K, 'V, 'U> byref) =
         let ctx = GraphContext.Default
         let wasActive = ctx.TxActive
         ctx.TxActive <- true
@@ -811,7 +817,11 @@ module internal Collections =
 
     /// Initial load of a refcounted set node: read the source state and build
     /// the internal state. The source read also registers the dependency.
-    let loadRefSet (map: 'T -> 'U voption) (source: IAdaptiveSet<'T>) (state: SetNodeState<'T, 'U> byref) =
+    let inline loadRefSet
+        ([<InlineIfLambda>] map: 'T -> 'U voption)
+        (source: IAdaptiveSet<'T>)
+        (state: SetNodeState<'T, 'U> byref)
+        =
         for item in source.GetValue() do
             match map item with
             | ValueSome z ->
@@ -820,14 +830,22 @@ module internal Collections =
             | ValueNone -> ()
 
     /// Initial load of a plain set node (filter).
-    let loadPlainSet (map: 'T -> 'T voption) (source: IAdaptiveSet<'T>) (state: SetNodeState<'T, 'T> byref) =
+    let inline loadPlainSet
+        ([<InlineIfLambda>] map: 'T -> 'T voption)
+        (source: IAdaptiveSet<'T>)
+        (state: SetNodeState<'T, 'T> byref)
+        =
         for item in source.GetValue() do
             match map item with
             | ValueSome z -> state.Set.Data.Add z |> ignore
             | ValueNone -> ()
 
     /// Initial load of a map node.
-    let loadMap (map: 'K -> 'V -> 'U voption) (source: IAdaptiveMap<'K, 'V>) (state: MapNodeState<'K, 'V, 'U> byref) =
+    let inline loadMap
+        ([<InlineIfLambda>] map: 'K -> 'V -> 'U voption)
+        (source: IAdaptiveMap<'K, 'V>)
+        (state: MapNodeState<'K, 'V, 'U> byref)
+        =
         for KeyValue(k, v) in source.GetValue() do
             match map k v with
             | ValueSome u -> state.Data[k] <- u
@@ -917,9 +935,9 @@ module internal Collections =
                 RefCountedSet.Create(),
                 RefCountedSet.Create(),
                 HashSet<'T>(),
-                SetDelta.Create(),
-                SetDelta.Create(),
-                SetDelta.Create()
+                SetDelta<_>.Create(),
+                SetDelta<_>.Create(),
+                SetDelta<_>.Create()
             )
 
     /// <summary>
@@ -1170,9 +1188,9 @@ module internal Collections =
                 Array.zeroCreate depCount,
                 Dictionary<'K, struct ('V1 voption * 'V2 voption)>(),
                 Dictionary<'K, 'V3>(),
-                MapDelta.Create(),
-                MapDelta.Create(),
-                MapDelta.Create()
+                MapDelta<_, _>.Create(),
+                MapDelta<_, _>.Create(),
+                MapDelta<_, _>.Create()
             )
 
     /// <summary>
@@ -1217,8 +1235,8 @@ module internal Collections =
     /// when at least one side has a value (FDA parity). Returns the updated state
     /// and whether the output changed.
     /// </summary>
-    let processChoose2Side
-        (mapping: 'K -> 'V1 voption -> 'V2 voption -> 'V3 voption)
+    let inline processChoose2Side
+        ([<InlineIfLambda>] mapping: 'K -> 'V1 voption -> 'V2 voption -> 'V3 voption)
         (side: int)
         (s: Choose2State<'K, 'V1, 'V2, 'V3>)
         : struct (Choose2State<'K, 'V1, 'V2, 'V3> * bool) =
@@ -1361,8 +1379,8 @@ module internal Collections =
         struct (s, changed)
 
     /// <summary>Drain both journals of a choose2 node. Returns the updated state and whether the output changed.</summary>
-    let drainChoose2
-        (mapping: 'K -> 'V1 voption -> 'V2 voption -> 'V3 voption)
+    let inline drainChoose2
+        ([<InlineIfLambda>] mapping: 'K -> 'V1 voption -> 'V2 voption -> 'V3 voption)
         (s: Choose2State<'K, 'V1, 'V2, 'V3>)
         : struct (Choose2State<'K, 'V1, 'V2, 'V3> * bool) =
         let struct (s1, c1) = processChoose2Side mapping 0 s
@@ -1373,8 +1391,8 @@ module internal Collections =
     /// Drain a choose2 node and push the reduced output delta to its sinks, with
     /// notification delivery deferred (PLAN.md Section 6.5).
     /// </summary>
-    let drainChoose2Push
-        (mapping: 'K -> 'V1 voption -> 'V2 voption -> 'V3 voption)
+    let inline drainChoose2Push
+        ([<InlineIfLambda>] mapping: 'K -> 'V1 voption -> 'V2 voption -> 'V3 voption)
         (state: Choose2State<'K, 'V1, 'V2, 'V3> byref)
         =
         let ctx = GraphContext.Default
@@ -1395,8 +1413,8 @@ module internal Collections =
             ctx.DeliverNotifications()
 
     /// <summary>Initial load of a choose2 node: merge both source views through the mapping.</summary>
-    let loadChoose2
-        (mapping: 'K -> 'V1 voption -> 'V2 voption -> 'V3 voption)
+    let inline loadChoose2
+        ([<InlineIfLambda>] mapping: 'K -> 'V1 voption -> 'V2 voption -> 'V3 voption)
         (left: IAdaptiveMap<'K, 'V1>)
         (right: IAdaptiveMap<'K, 'V2>)
         (state: Choose2State<'K, 'V1, 'V2, 'V3> byref)

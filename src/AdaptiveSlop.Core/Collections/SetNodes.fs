@@ -14,6 +14,14 @@ open System.Collections.Frozen
 // FrozenSet. Disposal unregisters and stops all delta processing.
 // =============================================================================
 
+/// <summary>
+/// The identity mapping for union-style set drains. Module level and inline:
+/// a class-level <c>let f = fun x -> ValueSome x</c> gets generalized and
+/// materializes a fresh closure at every use site (measured 24 B per drain).
+/// </summary>
+module private Id =
+    let inline identityV x = ValueSome x
+
 /// <summary>An adaptive set over a fixed, immutable value. The value is computed once, at first read.</summary>
 type ConstantSet<'T>(create: unit -> FrozenSet<'T>) =
     let value = lazy create ()
@@ -181,7 +189,6 @@ type FilterSetNode<'T when 'T: equality>(source: IAdaptiveSet<'T>, [<InlineIfLam
 
 /// <summary>The union of two sets. One reference count per element across both sides.</summary>
 type UnionSetNode<'T when 'T: equality>(left: IAdaptiveSet<'T>, right: IAdaptiveSet<'T>) =
-    let identity = fun x -> ValueSome x
     let deps = [| left; right |]
     let mutable state = SetNodeState<'T, 'T>.Create(2)
     let mutable initialized = false
@@ -202,8 +209,8 @@ type UnionSetNode<'T when 'T: equality>(left: IAdaptiveSet<'T>, right: IAdaptive
             initialized <- true
             this.RegisterSide left
             this.RegisterSide right
-            Collections.loadRefSet identity left &state
-            Collections.loadRefSet identity right &state
+            Collections.loadRefSet Id.identityV left &state
+            Collections.loadRefSet Id.identityV right &state
             state.DepVersions[0] <- left.Version
             state.DepVersions[1] <- right.Version
 
@@ -231,7 +238,7 @@ type UnionSetNode<'T when 'T: equality>(left: IAdaptiveSet<'T>, right: IAdaptive
                         state.DepVersions[j] <- deps[j].Version
 
                 if not state.Journal.IsEmpty then
-                    Collections.drainSetPush identity &state
+                    Collections.drainSetPush Id.identityV &state
 
                 AdaptiveRuntime.addDependency (this :> IAdaptiveObject) state.Version
                 state.Set.Data :> IReadOnlySet<'T>

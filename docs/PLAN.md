@@ -487,13 +487,31 @@ transient-view reads; parity "where possible" excludes them).
 - Every option-returning operation has a voption counterpart (`V` suffix, per FDA:
   `tryFindV`, `findV`, `chooseV`, `choose2V`, `intersectV`, `ofSeqV`, ...).
 
-#### 7.3 Collection algebra
+#### 7.3 Collection algebra — DONE
 
 - Two-source delta nodes: `ASet.unionMany/difference/intersect/xor`,
   `AMap.union/unionWith/intersect/intersectWith/choose2` (+ `choose2V`).
 - Projections and construction: `AMap.ofASet/toASet/toASetValues`,
   `AMap.mapSet`, `ASet.ofAVal`/`AMap.ofAVal`, `ofArray/ofList/ofHashSet/ofHashMap`,
   `ofReader`, `constant`, `single`, `custom`.
+
+Recorded FDA deviations:
+
+- `unionMany` is static (`seq<IAdaptiveSet<'T>>` folded over `union`); FDA's is
+  the dynamic `aset<aset<'A>>` form — that needs `collect` (7.4).
+- `ofHashMap` is `ofMap` (no frozen HashMap type here; `ASet.ofHashSet` exists
+  over the BCL `HashSet`).
+- `custom`/`ofReader` are pull-based poll nodes (signatures in Api.fs).
+- `intersect` returns a struct pair (collapses FDA `intersect`/`intersectV`).
+- `choose2` is voption-only (FDA's `choose2V`; the option variant is not provided).
+- `ofASetIgnoreDuplicates` is last-wins.
+- Zero-allocation steady-state drains verified by permanent tests
+  (`* drains allocate zero in steady state`). Two root causes were found and
+  fixed (see BISECT-NOTES.md): reference tuples in the `unionWith`/`intersect`/
+  `intersectWith` wrapper mappings (32 B per call, now struct tuples), and a
+  generalized class-level identity lambda in `UnionSetNode` materialized per
+  drain (24 B, now a module-level inline function; the Shared.fs drain/load
+  functions are `inline` + `[<InlineIfLambda>]`).
 
 #### 7.4 Dynamic dependencies
 
