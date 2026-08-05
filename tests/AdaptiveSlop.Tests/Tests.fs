@@ -185,6 +185,219 @@ let ``ASet map and filter`` () =
     Assert.Equal<Set<int>>(expectedAfterRemove, ASet.toSet filtered)
 
 [<Fact>]
+let ``ASet mapA follows element avals and structural edits`` () =
+    let s = CSet.ofSeq [ 1; 2; 3 ]
+    let even = CVal.create 1
+    let odd = CVal.create 0
+
+    let result =
+        s
+        |> ASet.mapA (fun v ->
+            if v % 2 = 0 then AVal.map (fun e -> v * 10 + e) (even :> aval<int>)
+            else AVal.map (fun e -> v * 10 + e) (odd :> aval<int>))
+
+    // (1,10) (2,21) (3,30)
+    Assert.Equal<Set<int>>(Set.ofList [ 10; 21; 30 ], ASet.toSet result)
+
+    CVal.set 2 odd
+    // (1,12) (3,32)
+    Assert.Equal<Set<int>>(Set.ofList [ 12; 21; 32 ], ASet.toSet result)
+
+    s.Add 4
+    // (4,41)
+    Assert.Equal<Set<int>>(Set.ofList [ 12; 21; 32; 41 ], ASet.toSet result)
+
+    CVal.set 5 even
+    // (2,25) (4,45)
+    Assert.Equal<Set<int>>(Set.ofList [ 12; 25; 32; 45 ], ASet.toSet result)
+
+    s.Remove 2
+    Assert.Equal<Set<int>>(Set.ofList [ 12; 32; 45 ], ASet.toSet result)
+
+    CVal.set 1 even
+    CVal.set 0 odd
+    // element 2 was removed earlier: no 21
+    Assert.Equal<Set<int>>(Set.ofList [ 10; 30; 41 ], ASet.toSet result)
+
+[<Fact>]
+let ``ASet chooseA survival flips`` () =
+    let s = CSet.ofSeq [ 1; 2; 3 ]
+    let even = CVal.create (Some 1)
+    let odd = CVal.create (Some 0)
+
+    let result =
+        s
+        |> ASet.chooseA (fun v ->
+            if v % 2 = 0 then even :> aval<int option>
+            else odd :> aval<int option>)
+
+    // (1,0) (2,1) (3,0)
+    Assert.Equal<Set<int>>(Set.ofList [ 0; 1 ], ASet.toSet result)
+
+    CVal.set (Some 2) odd
+    // (1,2) (2,1) (3,2)
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2 ], ASet.toSet result)
+
+    CVal.set None even
+    // (2,None) (4 absent)
+    Assert.Equal<Set<int>>(Set.ofList [ 2 ], ASet.toSet result)
+
+    s.Add 4
+    // (4,None)
+    Assert.Equal<Set<int>>(Set.ofList [ 2 ], ASet.toSet result)
+
+    CVal.set (Some 5) even
+    // (2,5) (4,5)
+    Assert.Equal<Set<int>>(Set.ofList [ 2; 5 ], ASet.toSet result)
+
+[<Fact>]
+let ``ASet filterA flips with predicate avals`` () =
+    let takeEven = CVal.create true
+    let takeOdd = CVal.create true
+    let set = ASet.ofArray (Array.init 5 id)
+
+    let filtered =
+        set
+        |> ASet.filterA (fun i ->
+            if i % 2 = 0 then takeEven :> aval<bool>
+            else takeOdd :> aval<bool>)
+
+    Assert.Equal<Set<int>>(Set.ofList [ 0; 1; 2; 3; 4 ], ASet.toSet filtered)
+
+    CVal.set false takeEven
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 3 ], ASet.toSet filtered)
+
+    CVal.set false takeOdd
+    Assert.Equal<Set<int>>(Set.empty, ASet.toSet filtered)
+
+    CVal.set true takeOdd
+    CVal.set true takeEven
+    Assert.Equal<Set<int>>(Set.ofList [ 0; 1; 2; 3; 4 ], ASet.toSet filtered)
+
+[<Fact>]
+let ``ASet mapA counts duplicate mapped values`` () =
+    let s = CSet.ofSeq [ 1; 2; 3 ]
+    let v = CVal.create 0
+
+    let result = s |> ASet.mapA (fun _ -> v :> aval<int>)
+
+    Assert.Equal<Set<int>>(Set.ofList [ 0 ], ASet.toSet result)
+
+    CVal.set 1 v
+    Assert.Equal<Set<int>>(Set.ofList [ 1 ], ASet.toSet result)
+
+    s.Remove 1 // two occurrences of v remain
+    Assert.Equal<Set<int>>(Set.ofList [ 1 ], ASet.toSet result)
+
+    s.Remove 2
+    Assert.Equal<Set<int>>(Set.ofList [ 1 ], ASet.toSet result)
+
+    s.Remove 3 // last occurrence leaves: the output empties
+    Assert.Equal<Set<int>>(Set.empty, ASet.toSet result)
+
+[<Fact>]
+let ``ASet mapA delivers targeted deltas to observers`` () =
+    let s = CSet.ofSeq [ 1; 2; 3 ]
+    let even = CVal.create 1
+    let odd = CVal.create 0
+
+    let result =
+        s
+        |> ASet.mapA (fun v ->
+            if v % 2 = 0 then even :> aval<int>
+            else odd :> aval<int>)
+
+    let mutable lastAdds = Set.empty<int>
+    let mutable lastRems = Set.empty<int>
+
+    use _obs =
+        ASet.observe
+            (fun _ (d: SetDelta<int>) ->
+                lastAdds <- d.Added.ToArray() |> Set.ofArray
+                lastRems <- d.Removed.ToArray() |> Set.ofArray)
+            result
+
+    ASet.force result |> ignore
+
+    CVal.set 2 even // element 2: 1 -> 2
+    Assert.Equal<Set<int>>(Set.ofList [ 2 ], lastAdds)
+    Assert.Equal<Set<int>>(Set.ofList [ 1 ], lastRems)
+
+    CVal.set 5 even // element 2: 2 -> 5
+    Assert.Equal<Set<int>>(Set.ofList [ 5 ], lastAdds)
+    Assert.Equal<Set<int>>(Set.ofList [ 2 ], lastRems)
+
+    s.Remove 2 // the only 5 leaves
+    Assert.Equal<Set<int>>(Set.empty, lastAdds)
+    Assert.Equal<Set<int>>(Set.ofList [ 5 ], lastRems)
+
+    s.Add 4 // (4,5)
+    Assert.Equal<Set<int>>(Set.ofList [ 5 ], lastAdds)
+    Assert.Equal<Set<int>>(Set.empty, lastRems)
+
+[<Fact>]
+let ``ASet mapA: a mapping that writes to the source during load is applied`` () =
+    let s = CSet.ofSeq [ 1 ]
+    let mutable reenter = true
+
+    let result =
+        s
+        |> ASet.mapA (fun x ->
+            if reenter && x = 1 then
+                reenter <- false
+                s.Add 2 |> ignore
+                AVal.constant x
+            else
+                AVal.constant x)
+
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2 ], ASet.toSet result)
+    // The journal must be clean: the next write applies normally.
+    s.Add 3
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2; 3 ], ASet.toSet result)
+
+[<Fact>]
+let ``ASet mapA steady-state element writes allocate zero bytes`` () =
+    let s = CSet.ofSeq (List.init 1000 id)
+    let v = CVal.create 0
+    let result = s |> ASet.mapA (fun _ -> v :> aval<int>)
+    use _obs = ASet.observe (fun _ _ -> ()) result
+    ASet.getValue result |> ignore
+    // Warm up: the first write grows the shared mark stack and notification queue.
+    CVal.set 1 v
+    ASet.getValue result |> ignore
+
+    let before = GC.GetAllocatedBytesForCurrentThread()
+
+    for i in 1..1000 do
+        CVal.set (i % 2) v
+        ASet.getValue result |> ignore
+
+    let allocated = GC.GetAllocatedBytesForCurrentThread() - before
+    Assert.Equal(0L, allocated)
+
+[<Fact>]
+let ``ASet mapA disposal unregisters every element aval edge`` () =
+    let s = CSet.ofSeq [ 1; 2; 3 ]
+    let v1 = CVal.create 1
+    let v2 = CVal.create 2
+
+    let result =
+        s
+        |> ASet.mapA (fun x ->
+            if x % 2 = 0 then v1 :> aval<int>
+            else v2 :> aval<int>)
+
+    use _obs = ASet.observe (fun _ _ -> ()) result
+    ASet.force result |> ignore
+    let aval1 = v1 :> IEdgeTarget
+    let aval2 = v2 :> IEdgeTarget
+    Assert.Equal(1, aval1.EdgeCount)
+    Assert.Equal(2, aval2.EdgeCount)
+    (result :> IDisposable).Dispose()
+    Assert.Equal(0, aval1.EdgeCount)
+    Assert.Equal(0, aval2.EdgeCount)
+
+[<Fact>]
 let ``AMap map and filter`` () =
     let source = CMap.ofSeq [ 1, 10; 2, 20; 3, 30 ]
     let mapped = AMap.map (fun _ v -> v + 1) (CMap.value source)

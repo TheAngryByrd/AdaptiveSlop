@@ -520,6 +520,30 @@ type internal MapNodeState<'K, 'V, 'U when 'K: equality> =
             MapDelta<_, _>.Create()
         )
 
+/// <summary>
+/// Per-element cache entry of the <c>*A</c> nodes (mapA/chooseA/filterA,
+/// docs/2026-08-05-MAPA-DESIGN.md). Holds the element's aval, its version at
+/// the last force (the version read BEFORE the force: a mid-force write then
+/// leaves the stored version stale, so the next scan re-forces), its last
+/// contribution to the output, and the registration state with the aval's
+/// edge list. <see cref="Id"/> disambiguates <c>SetDepSlot</c> updates when
+/// the aval's edge list is reordered by another dependent.
+/// </summary>
+[<Struct>]
+type internal ElementEntry<'U> =
+    val mutable Aval: aval<'U voption>
+    val mutable Version: int64
+    val mutable Last: 'U voption
+    val mutable Id: int
+    val mutable EdgeIndex: int
+
+    new(aval: aval<'U voption>, version: int64, last: 'U voption, id: int, edgeIndex: int) =
+        { Aval = aval
+          Version = version
+          Last = last
+          Id = id
+          EdgeIndex = edgeIndex }
+
 // =============================================================================
 // Shared operations
 // =============================================================================

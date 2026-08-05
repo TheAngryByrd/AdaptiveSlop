@@ -61,6 +61,29 @@ module ASet =
     let inline filter ([<InlineIfLambda>] predicate: 'T -> bool) (set: aset<'T>) : aset<'T> =
         new FilterSetNode<'T>(set, predicate)
 
+    /// <summary>
+    /// Adaptively maps every element of the set to an adaptive value (FDA
+    /// <c>ASet.mapA</c> parity). The output follows the aval returned for
+    /// each element; writes to the avals deliver targeted deltas.
+    /// </summary>
+    let inline mapA ([<InlineIfLambda>] mapping: 'T -> aval<'U>) (set: aset<'T>) : aset<'U> =
+        new ElementSetNode<'T, 'U>(set, fun x -> AVal.map ValueSome (mapping x))
+
+    /// <summary>
+    /// Adaptively maps every element of the set to an adaptive value, keeping
+    /// only the elements whose aval holds <c>Some</c> (FDA
+    /// <c>ASet.chooseA</c> parity).
+    /// </summary>
+    let inline chooseA ([<InlineIfLambda>] mapping: 'T -> aval<'U option>) (set: aset<'T>) : aset<'U> =
+        new ElementSetNode<'T, 'U>(set, fun x -> AVal.map Option.toValueOption (mapping x))
+
+    /// <summary>
+    /// Adaptively keeps the elements whose predicate aval holds <c>true</c>
+    /// (FDA <c>ASet.filterA</c> parity).
+    /// </summary>
+    let inline filterA ([<InlineIfLambda>] predicate: 'T -> aval<bool>) (set: aset<'T>) : aset<'T> =
+        new ElementSetNode<'T, 'T>(set, fun x -> AVal.map (fun b -> if b then ValueSome x else ValueNone) (predicate x))
+
     /// <summary>The union of two sets.</summary>
     let inline union (left: aset<'T>) (right: aset<'T>) : aset<'T> = new UnionSetNode<'T>(left, right)
 
