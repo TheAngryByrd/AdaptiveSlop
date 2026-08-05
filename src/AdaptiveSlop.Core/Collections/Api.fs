@@ -882,6 +882,29 @@ module AList =
     let inline filter ([<InlineIfLambda>] predicate: 'T -> bool) (list: alist<'T>) : alist<'T> =
         new FilterMapListNode<'T, 'T>(list, fun x -> if predicate x then ValueSome x else ValueNone)
 
+    /// <summary>
+    /// Adaptively maps every element of the list to an adaptive value (FDA
+    /// <c>AList.mapA</c> parity). The output follows the aval returned for
+    /// each element; writes to the avals deliver targeted deltas.
+    /// </summary>
+    let inline mapA ([<InlineIfLambda>] mapping: 'T -> aval<'U>) (list: alist<'T>) : alist<'U> =
+        new ElementListNode<'T, 'U>(list, fun _ x -> AVal.map ValueSome (mapping x))
+
+    /// <summary>
+    /// Adaptively maps every element of the list to an adaptive value, keeping
+    /// only the elements whose aval holds <c>Some</c> (FDA
+    /// <c>AList.chooseA</c> parity).
+    /// </summary>
+    let inline chooseA ([<InlineIfLambda>] mapping: 'T -> aval<'U option>) (list: alist<'T>) : alist<'U> =
+        new ElementListNode<'T, 'U>(list, fun _ x -> AVal.map Option.toValueOption (mapping x))
+
+    /// <summary>
+    /// Adaptively keeps the elements whose predicate aval holds <c>true</c>
+    /// (FDA <c>AList.filterA</c> parity).
+    /// </summary>
+    let inline filterA ([<InlineIfLambda>] predicate: 'T -> aval<bool>) (list: alist<'T>) : alist<'T> =
+        new ElementListNode<'T, 'T>(list, fun _ x -> AVal.map (fun b -> if b then ValueSome x else ValueNone) (predicate x))
+
     /// <summary>The concatenation of two lists (FDA <c>AList.append</c> parity).</summary>
     let inline append (left: alist<'T>) (right: alist<'T>) : alist<'T> = new AppendListNode<'T>(left, right)
 

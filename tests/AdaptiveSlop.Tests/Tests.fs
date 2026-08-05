@@ -3634,6 +3634,176 @@ let ``AList map reflects changes`` () =
     Assert.Equal<int list>([], AList.toList mapped)
 
 [<Fact>]
+let ``AList mapA follows element avals and structural edits`` () =
+    let l = CList.ofList [ 1; 2; 3 ]
+    let even = CVal.create 1
+    let odd = CVal.create 0
+
+    let result =
+        l
+        |> AList.mapA (fun v ->
+            if v % 2 = 0 then even :> aval<int>
+            else odd :> aval<int>)
+
+    // (1,0) (2,1) (3,0)
+    Assert.Equal<int list>([ 0; 1; 0 ], AList.toList result)
+
+    CVal.set 2 odd
+    // (1,2) (2,1) (3,2)
+    Assert.Equal<int list>([ 2; 1; 2 ], AList.toList result)
+
+    CList.append 4 l
+    // (4,1)
+    Assert.Equal<int list>([ 2; 1; 2; 1 ], AList.toList result)
+
+    CVal.set 5 even
+    // (2,5) (4,5)
+    Assert.Equal<int list>([ 2; 5; 2; 5 ], AList.toList result)
+
+    CList.removeAt 0 l
+    // the first element leaves with its aval
+    Assert.Equal<int list>([ 5; 2; 5 ], AList.toList result)
+
+    CVal.set 1 even
+    CVal.set 0 odd
+    Assert.Equal<int list>([ 1; 0; 1 ], AList.toList result)
+
+[<Fact>]
+let ``AList chooseA survival flips`` () =
+    let l = CList.ofList [ 1; 2; 3 ]
+    let even = CVal.create (Some 1)
+    let odd = CVal.create (Some 0)
+
+    let result =
+        l
+        |> AList.chooseA (fun v ->
+            if v % 2 = 0 then even :> aval<int option>
+            else odd :> aval<int option>)
+
+    // (1,0) (2,1) (3,0)
+    Assert.Equal<int list>([ 0; 1; 0 ], AList.toList result)
+
+    CVal.set (Some 2) odd
+    Assert.Equal<int list>([ 2; 1; 2 ], AList.toList result)
+
+    CVal.set None even
+    // (2,None) (4 absent): the middle element leaves the output
+    Assert.Equal<int list>([ 2; 2 ], AList.toList result)
+
+    CList.append 4 l
+    // (4,None)
+    Assert.Equal<int list>([ 2; 2 ], AList.toList result)
+
+    CVal.set (Some 5) even
+    // (2,5) (4,5): both enter the output
+    Assert.Equal<int list>([ 2; 5; 2; 5 ], AList.toList result)
+
+[<Fact>]
+let ``AList filterA flips with predicate avals`` () =
+    let takeEven = CVal.create true
+    let takeOdd = CVal.create true
+    let l = CList.ofList [ 0; 1; 2; 3; 4 ]
+
+    let filtered =
+        l
+        |> AList.filterA (fun i ->
+            if i % 2 = 0 then takeEven :> aval<bool>
+            else takeOdd :> aval<bool>)
+
+    Assert.Equal<int list>([ 0; 1; 2; 3; 4 ], AList.toList filtered)
+
+    CVal.set false takeEven
+    Assert.Equal<int list>([ 1; 3 ], AList.toList filtered)
+
+    CVal.set false takeOdd
+    Assert.Equal<int list>([], AList.toList filtered)
+
+    CVal.set true takeOdd
+    CVal.set true takeEven
+    Assert.Equal<int list>([ 0; 1; 2; 3; 4 ], AList.toList filtered)
+
+[<Fact>]
+let ``AList mapA delivers targeted deltas to observers`` () =
+    let l = CList.ofList [ 1; 2; 3 ]
+    let even = CVal.create 1
+    let odd = CVal.create 0
+
+    let result =
+        l
+        |> AList.mapA (fun v ->
+            if v % 2 = 0 then even :> aval<int>
+            else odd :> aval<int>)
+
+    let mutable lastOps = []
+
+    use _obs =
+        AList.observe
+            (fun _ (d: ListDelta<int>) ->
+                lastOps <-
+                    d.Operations.ToArray()
+                    |> Array.map (fun op ->
+                        match op.Kind with
+                        | ListOpKind.Insert -> sprintf "I%d:%d" op.Position op.Value
+                        | ListOpKind.Remove -> sprintf "R%d" op.Position
+                        | ListOpKind.Update -> sprintf "U%d:%d" op.Position op.Value
+                        | _ -> "?")
+                    |> List.ofArray)
+            result
+
+    AList.force result |> ignore
+
+    CVal.set 2 odd // elements 0 and 2: 0 -> 2
+    Assert.Equal<string list>([ "U0:2"; "U2:2" ], lastOps)
+
+    CVal.set 5 even // element at position 1: 1 -> 5
+    Assert.Equal<string list>([ "U1:5" ], lastOps)
+
+    CList.append 4 l // (4,5)
+    Assert.Equal<string list>([ "I3:5" ], lastOps)
+
+[<Fact>]
+let ``AList mapA steady-state element writes allocate zero bytes`` () =
+    let l = CList.ofList (List.init 1000 id)
+    let v = CVal.create 0
+    let result = l |> AList.mapA (fun _ -> v :> aval<int>)
+    use _obs = AList.observe (fun _ _ -> ()) result
+    AList.getValue result |> ignore
+    // Warm up: the first write grows the shared mark stack and notification queue.
+    CVal.set 1 v
+    AList.getValue result |> ignore
+
+    let before = GC.GetAllocatedBytesForCurrentThread()
+
+    for i in 1..1000 do
+        CVal.set (i % 2) v
+        AList.getValue result |> ignore
+
+    let allocated = GC.GetAllocatedBytesForCurrentThread() - before
+    Assert.Equal(0L, allocated)
+
+[<Fact>]
+let ``AList mapA disposal unregisters every element aval edge`` () =
+    let l = CList.ofList [ 1; 2; 3 ]
+    let v1 = CVal.create 1
+    let v2 = CVal.create 2
+
+    let result =
+        l
+        |> AList.mapA (fun x ->
+            if x % 2 = 0 then v1 :> aval<int>
+            else v2 :> aval<int>)
+
+    use _obs = AList.observe (fun _ _ -> ()) result
+    AList.force result |> ignore
+    let aval1 = v1 :> IEdgeTarget
+    let aval2 = v2 :> IEdgeTarget
+    Assert.Equal(1, aval1.EdgeCount)
+    Assert.Equal(2, aval2.EdgeCount)
+    (result :> IDisposable).Dispose()
+    Assert.Equal(0, aval1.EdgeCount)
+    Assert.Equal(0, aval2.EdgeCount)
+
+[<Fact>]
 let ``AList filter and choose update semantics`` () =
     let src = CList.ofList [ 1; 2; 3; 4; 5 ]
     let evens = AList.filter (fun x -> x % 2 = 0) (CList.value src)
