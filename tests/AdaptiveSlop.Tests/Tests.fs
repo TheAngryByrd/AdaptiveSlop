@@ -415,6 +415,164 @@ let ``AMap map and filter`` () =
     Assert.Equal<Map<int, int>>(expectedAfterRemove, AMap.toMap filtered)
 
 [<Fact>]
+let ``AMap mapA follows entry avals and structural edits`` () =
+    let m = CMap.ofSeq [ "A", 1; "B", 2; "C", 3 ]
+    let flag = CVal.create true
+
+    let res =
+        m
+        |> AMap.mapA (fun _ v ->
+            flag
+            |> AVal.map (function
+                | true -> v
+                | false -> -1))
+
+    Assert.Equal<Map<string, int>>(Map.ofList [ "A", 1; "B", 2; "C", 3 ], AMap.toMap res)
+
+    CVal.set false flag
+    Assert.Equal<Map<string, int>>(Map.ofList [ "A", -1; "B", -1; "C", -1 ], AMap.toMap res)
+
+    CMap.set (Map.ofList [ "A", 2; "B", 4; "C", 6 ]) m
+    Assert.Equal<Map<string, int>>(Map.ofList [ "A", -1; "B", -1; "C", -1 ], AMap.toMap res)
+
+    CVal.set true flag
+    Assert.Equal<Map<string, int>>(Map.ofList [ "A", 2; "B", 4; "C", 6 ], AMap.toMap res)
+
+    CMap.remove "B" m
+    Assert.Equal<Map<string, int>>(Map.ofList [ "A", 2; "C", 6 ], AMap.toMap res)
+
+    CMap.addOrUpdate "D" 8 m
+    Assert.Equal<Map<string, int>>(Map.ofList [ "A", 2; "C", 6; "D", 8 ], AMap.toMap res)
+
+[<Fact>]
+let ``AMap chooseA survival flips`` () =
+    let m = CMap.ofSeq [ "A", 1; "B", 2; "C", 3 ]
+    let keep = CVal.create (Some true)
+
+    let res =
+        m
+        |> AMap.chooseA (fun _ v ->
+            keep
+            |> AVal.map (fun b ->
+                if b = Some true then Some(v * 10)
+                else None))
+
+    Assert.Equal<Map<string, int>>(Map.ofList [ "A", 10; "B", 20; "C", 30 ], AMap.toMap res)
+
+    CVal.set (Some false) keep
+    Assert.Equal<Map<string, int>>(Map.empty, AMap.toMap res)
+
+    CVal.set (Some true) keep
+    Assert.Equal<Map<string, int>>(Map.ofList [ "A", 10; "B", 20; "C", 30 ], AMap.toMap res)
+
+[<Fact>]
+let ``AMap filterA flips with predicate avals`` () =
+    let m = CMap.ofSeq [ "A", 1; "B", 2; "C", 3; "D", 4 ]
+    let takeEven = CVal.create true
+
+    let filtered =
+        m
+        |> AMap.filterA (fun _ v ->
+            if v % 2 = 0 then takeEven :> aval<bool>
+            else AVal.constant true)
+
+    Assert.Equal<Map<string, int>>(Map.ofList [ "A", 1; "B", 2; "C", 3; "D", 4 ], AMap.toMap filtered)
+
+    CVal.set false takeEven
+    Assert.Equal<Map<string, int>>(Map.ofList [ "A", 1; "C", 3 ], AMap.toMap filtered)
+
+    CVal.set true takeEven
+    Assert.Equal<Map<string, int>>(Map.ofList [ "A", 1; "B", 2; "C", 3; "D", 4 ], AMap.toMap filtered)
+
+[<Fact>]
+let ``AMap mapA delivers targeted deltas to observers`` () =
+    let m = CMap.ofSeq [ "A", 1; "B", 2 ]
+    let flag = CVal.create true
+
+    let res =
+        m
+        |> AMap.mapA (fun _ v ->
+            flag
+            |> AVal.map (function
+                | true -> v
+                | false -> -1))
+
+    let mutable lastSets = Map.empty<string, int>
+    let mutable lastRems = Set.empty<string>
+
+    use _obs =
+        AMap.observe
+            (fun _ (d: MapDelta<string, int>) ->
+                lastSets <-
+                    d.SetEntries.ToArray() |> Array.map (fun struct (k, v) -> k, v) |> Map.ofArray
+                lastRems <- d.RemovedKeys.ToArray() |> Set.ofArray)
+            res
+
+    AMap.force res |> ignore
+
+    CVal.set false flag // every entry: v -> -1
+    Assert.Equal<Map<string, int>>(Map.ofList [ "A", -1; "B", -1 ], lastSets)
+    Assert.Equal<Set<string>>(Set.empty, lastRems)
+
+    CMap.remove "A" m
+    Assert.Equal<Map<string, int>>(Map.empty, lastSets)
+    Assert.Equal<Set<string>>(Set.ofList [ "A" ], lastRems)
+
+    CMap.addOrUpdate "C" 3 m // (C,-1)
+    Assert.Equal<Map<string, int>>(Map.ofList [ "C", -1 ], lastSets)
+    Assert.Equal<Set<string>>(Set.empty, lastRems)
+
+[<Fact>]
+let ``AMap mapA steady-state entry writes allocate zero bytes`` () =
+    let m = CMap.ofSeq (List.init 1000 (fun i -> i, i))
+    let flag = CVal.create true
+
+    let res =
+        m
+        |> AMap.mapA (fun _ v ->
+            flag
+            |> AVal.map (function
+                | true -> v
+                | false -> -1))
+
+    use _obs = AMap.observe (fun _ _ -> ()) res
+    AMap.getValue res |> ignore
+    // Warm up: the first write grows the shared mark stack and notification queue.
+    CVal.set false flag
+    AMap.getValue res |> ignore
+
+    let before = GC.GetAllocatedBytesForCurrentThread()
+
+    for i in 1..1000 do
+        CVal.set (i % 2 = 0) flag
+        AMap.getValue res |> ignore
+
+    let allocated = GC.GetAllocatedBytesForCurrentThread() - before
+    Assert.Equal(0L, allocated)
+
+[<Fact>]
+let ``AMap mapA disposal unregisters every entry aval edge`` () =
+    let m = CMap.ofSeq [ "A", 1; "B", 2 ]
+    let v1 = CVal.create 1
+    let v2 = CVal.create 2
+
+    let res =
+        m
+        |> AMap.mapA (fun _ v ->
+            if v % 2 = 0 then v1 :> aval<int>
+            else v2 :> aval<int>)
+
+    use _obs = AMap.observe (fun _ _ -> ()) res
+    AMap.force res |> ignore
+    let aval1 = v1 :> IEdgeTarget
+    let aval2 = v2 :> IEdgeTarget
+    Assert.Equal(1, aval1.EdgeCount)
+    Assert.Equal(1, aval2.EdgeCount)
+    (res :> IDisposable).Dispose()
+    Assert.Equal(0, aval1.EdgeCount)
+    Assert.Equal(0, aval2.EdgeCount)
+
+[<Fact>]
 let ``Transaction defers ChangeableValue updates`` () =
     let value = CVal.create 1
 

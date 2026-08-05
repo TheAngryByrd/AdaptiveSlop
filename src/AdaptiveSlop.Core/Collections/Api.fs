@@ -608,6 +608,35 @@ module AMap =
         new FilterMapNode<'K, 'V>(mapValue, predicate)
 
     /// <summary>
+    /// Adaptively maps every entry of the map to an adaptive value (FDA
+    /// <c>AMap.mapA</c> parity). The output follows the aval returned for
+    /// each entry; writes to the avals deliver targeted deltas.
+    /// </summary>
+    let inline mapA ([<InlineIfLambda>] mapping: 'K -> 'V -> aval<'U>) (mapValue: amap<'K, 'V>) : amap<'K, 'U> =
+        new ElementMapNode<'K, 'V, 'U>(mapValue, fun k v -> AVal.map ValueSome (mapping k v))
+
+    /// <summary>
+    /// Adaptively maps every entry of the map to an adaptive value, keeping
+    /// only the entries whose aval holds <c>Some</c> (FDA
+    /// <c>AMap.chooseA</c> parity).
+    /// </summary>
+    let inline chooseA
+        ([<InlineIfLambda>] mapping: 'K -> 'V -> aval<'U option>)
+        (mapValue: amap<'K, 'V>)
+        : amap<'K, 'U> =
+        new ElementMapNode<'K, 'V, 'U>(mapValue, fun k v -> AVal.map Option.toValueOption (mapping k v))
+
+    /// <summary>
+    /// Adaptively keeps the entries whose predicate aval holds <c>true</c>
+    /// (FDA <c>AMap.filterA</c> parity).
+    /// </summary>
+    let inline filterA
+        ([<InlineIfLambda>] predicate: 'K -> 'V -> aval<bool>)
+        (mapValue: amap<'K, 'V>)
+        : amap<'K, 'V> =
+        new ElementMapNode<'K, 'V, 'V>(mapValue, fun k v -> AVal.map (fun b -> if b then ValueSome v else ValueNone) (predicate k v))
+
+    /// <summary>
     /// Registers a callback that receives the current view and the net delta
     /// after every batch that changes the map. The callback runs on the owner
     /// thread after the write, transaction, or pump completes. The view and
