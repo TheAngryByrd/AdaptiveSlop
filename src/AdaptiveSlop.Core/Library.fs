@@ -1559,6 +1559,103 @@ type Observation<'T>(target: IAdaptiveValue<'T>, [<InlineIfLambda>] callback: 'T
 /// </example>
 module AVal =
     /// <summary>
+    /// An adaptive value whose content is supplied by an external snapshot
+    /// function, re-read only when invalidated via the handle returned by
+    /// <see cref="AVal.ofExternal"/> (FDA <c>AVal.ofExternal</c> parity,
+    /// MAPA-DESIGN §1.1). Not invalidated → reads are O(1): no re-read, no
+    /// comparison, no allocation. The invalidate handle is O(1) to call and
+    /// thread-safe (a foreign-thread call posts to the owner context, the
+    /// <c>cval.Post</c> pattern); the re-read happens on the next read on the
+    /// owner thread.
+    /// </summary>
+    type ExternalValueNode<'T when 'T: equality>([<InlineIfLambda>] read: unit -> 'T) =
+        let mutable value = Unchecked.defaultof<'T>
+        let mutable hasValue = false
+        let mutable version = 0L
+        let mutable dirty = true
+        // Foreign-thread invalidation goes through the post ring (the
+        // cval.Post pattern): a queued flag, applied on the owner thread.
+        let mutable posted = 0
+        let edges = ParentEdges()
+        let ownerThread = Environment.CurrentManagedThreadId
+
+        /// <summary>
+        /// The invalidate handle implementation (returned by
+        /// <see cref="AVal.ofExternal"/>). Call this when the external source
+        /// changed; the re-read happens on the next read. Not for direct use.
+        /// </summary>
+        member this.Invalidate() =
+            if Environment.CurrentManagedThreadId = ownerThread then
+                // Owner thread: mark directly. MarkFrom bumps the write
+                // generation (the *A gate) and marks observers.
+                dirty <- true
+                GraphContext.Default.MarkFrom edges
+            else
+                if Interlocked.CompareExchange(&posted, 1, 0) = 0 then
+                    GraphContext.Default.PostRing.Enqueue(this :> obj)
+
+        member private this.Poll() =
+            if dirty then
+                dirty <- false
+                let next = read ()
+
+                if not hasValue || not (EqualityComparer<'T>.Default.Equals(value, next)) then
+                    value <- next
+                    hasValue <- true
+                    version <- version + 1L
+
+        interface IPostSource with
+            member this.ApplyPosted() =
+                // Clear the queued flag before marking: an invalidate that
+                // lands after the clear re-enqueues, so it cannot be lost.
+                Interlocked.Exchange(&posted, 0) |> ignore
+                this.Invalidate()
+
+        interface IAdaptiveValue<'T> with
+            member this.GetValue() =
+                let ctx = GraphContext.Default
+                ctx.ClaimOwner()
+
+                try
+                    this.Poll()
+                    AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                    value
+                finally
+                    ctx.ReleaseOwner()
+
+            member this.Version =
+                // Dirty indicator: version + 1 while invalidated but not yet
+                // re-read, so version-checking consumers recompute exactly
+                // once; the re-read at GetValue decides the real version.
+                if dirty then version + 1L else version
+
+        interface IEdgeTarget with
+            member _.EdgeCount = edges.Count
+            member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
+            member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
+
+    /// <summary>
+    /// Creates an adaptive value from an external snapshot function and an
+    /// invalidate handle (FDA <c>AVal.ofExternal</c> parity, MAPA-DESIGN §1.1).
+    /// The read function runs at most once per invalidate, on the next read;
+    /// when not invalidated, reads are O(1) and allocate nothing. The handle
+    /// is O(1) to call and thread-safe (a foreign-thread call is posted to the
+    /// owner context and applied at the next graph operation).
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// let mutable current = 0
+    /// let value, invalidate = AVal.ofExternal (fun () -> current)
+    /// current &lt;- 42
+    /// invalidate ()
+    /// printfn "%d" (AVal.getValue value)  // 42
+    /// </code>
+    /// </example>
+    let inline ofExternal ([<InlineIfLambda>] read: unit -> 'T) : aval<'T> * (unit -> unit) =
+        let node = ExternalValueNode<'T>(read)
+        (node :> aval<'T>, fun () -> node.Invalidate())
+
+    /// <summary>
     /// Creates a constant adaptive value that never changes.
     /// </summary>
     /// <param name="value">The constant value.</param>

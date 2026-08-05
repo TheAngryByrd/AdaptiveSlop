@@ -193,6 +193,28 @@ module ASet =
         new CustomSetNode<'T>(compute)
 
     /// <summary>
+    /// Creates an adaptive set from an external snapshot function and an
+    /// invalidate handle (FDA <c>ASet.ofExternal</c> parity, MAPA-DESIGN §1.1).
+    /// The snapshot runs at most once per invalidate, on the next read, and is
+    /// diffed against the previous snapshot; not invalidated → reads are
+    /// O(1) and allocate nothing. The handle is O(1) to call and thread-safe
+    /// (a foreign-thread call is posted to the owner context and applied at
+    /// the next graph operation).
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// let mutable current = HashSet [ 1; 2; 3 ]
+    /// let set, invalidate = ASet.ofExternal (fun () -&gt; current :&gt; IReadOnlySet&lt;_&gt;)
+    /// current &lt;- HashSet [ 1; 3 ]
+    /// invalidate ()
+    /// let forced = ASet.force set   // { 1; 3 }
+    /// </code>
+    /// </example>
+    let inline ofExternal ([<InlineIfLambda>] snapshot: unit -> IReadOnlySet<'T>) : aset<'T> * (unit -> unit) =
+        let node = new ExternalSetNode<'T>(snapshot)
+        (node :> aset<'T>, fun () -> node.Invalidate())
+
+    /// <summary>
     /// Registers a callback that receives the current view and the net delta
     /// after every batch that changes the set. The callback runs on the owner
     /// thread after the write, transaction, or pump completes. The view and
@@ -657,6 +679,30 @@ module AMap =
         : amap<'K, 'V> =
         new CustomMapNode<'K, 'V>(compute)
 
+    /// <summary>
+    /// Creates an adaptive map from an external snapshot function and an
+    /// invalidate handle (FDA <c>AMap.ofExternal</c> parity, MAPA-DESIGN §1.1).
+    /// The snapshot runs at most once per invalidate, on the next read, and is
+    /// diffed against the previous snapshot (equal values elided); not
+    /// invalidated → reads are O(1) and allocate nothing. The handle is O(1)
+    /// to call and thread-safe (a foreign-thread call is posted to the owner
+    /// context and applied at the next graph operation).
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// let mutable current = dict [ 1, "a" ]
+    /// let map, invalidate = AMap.ofExternal (fun () -&gt; current :&gt; IReadOnlyDictionary&lt;_, _&gt;)
+    /// current &lt;- dict [ 1, "a"; 2, "b" ]
+    /// invalidate ()
+    /// let forced = AMap.force map   // [ 1, "a"; 2, "b" ]
+    /// </code>
+    /// </example>
+    let inline ofExternal
+        ([<InlineIfLambda>] snapshot: unit -> IReadOnlyDictionary<'K, 'V>)
+        : amap<'K, 'V> * (unit -> unit) =
+        let node = new ExternalMapNode<'K, 'V>(snapshot)
+        (node :> amap<'K, 'V>, fun () -> node.Invalidate())
+
     /// <summary>Keeps the entries that satisfy the predicate.</summary>
     let inline filter ([<InlineIfLambda>] predicate: 'K -> 'V -> bool) (mapValue: amap<'K, 'V>) : amap<'K, 'V> =
         new FilterMapNode<'K, 'V>(mapValue, predicate)
@@ -1025,6 +1071,55 @@ module AList =
     /// <summary>Adaptively tests if the list is empty.</summary>
     let inline isEmpty (list: alist<'T>) : aval<bool> =
         AdaptiveNode<bool>(fun () -> list.GetValue().Count = 0)
+
+    /// <summary>
+    /// Creates an adaptive list from an external snapshot function and an
+    /// invalidate handle (FDA <c>AList.ofExternal</c> parity, MAPA-DESIGN
+    /// §1.1). The snapshot runs at most once per invalidate, on the next read,
+    /// and is diffed against the previous snapshot positionally (prefix/suffix,
+    /// the <c>ChangeableList.ApplyDiff</c> algorithm); not invalidated → reads
+    /// are O(1) and allocate nothing. The handle is O(1) to call and
+    /// thread-safe (a foreign-thread call is posted to the owner context and
+    /// applied at the next graph operation).
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// let mutable current = ResizeArray [ 1; 2; 3 ]
+    /// let list, invalidate = AList.ofExternal (fun () -&gt; current :&gt; IReadOnlyList&lt;_&gt;)
+    /// current.RemoveAt 0
+    /// invalidate ()
+    /// let forced = AList.force list   // [ 2; 3 ]
+    /// </code>
+    /// </example>
+    let inline ofExternal ([<InlineIfLambda>] snapshot: unit -> IReadOnlyList<'T>) : alist<'T> * (unit -> unit) =
+        let node = new ExternalListNode<'T>(snapshot)
+        (node :> alist<'T>, fun () -> node.Invalidate())
+
+    /// <summary>
+    /// An adaptive list driven by a compute function (FDA <c>AList.custom</c>
+    /// parity, MAPA-DESIGN §1.3, pull model). The compute receives the current
+    /// view and a delta builder; it appends the operations that describe the
+    /// change since the previous call (for example, consuming its own event
+    /// queue). The operations are positional and applied in order.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// let mutable offset = 0
+    /// let list =
+    ///     AList.custom (fun view delta -&gt;
+    ///         // rebuild the whole view on each poll (the simplest compute)
+    ///         if offset &lt;&gt; 0 then
+    ///             for i in view.Count - 1 .. -1 .. 0 do
+    ///                 delta.Remove i
+    ///
+    ///             for i in 0 .. view.Count - 1 do
+    ///                 delta.Insert(i, i + offset)
+    ///
+    ///             offset &lt;- 0)
+    /// </code>
+    /// </example>
+    let inline custom ([<InlineIfLambda>] compute: IReadOnlyList<'T> -> ListDeltaBuilder<'T> -> unit) : alist<'T> =
+        new CustomListNode<'T>(compute)
 
     /// <summary>
     /// Registers a callback that receives the current view and the ordered

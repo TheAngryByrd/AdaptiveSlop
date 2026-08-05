@@ -4577,3 +4577,270 @@ let ``sinks registered during delivery do not receive the current batch`` () =
     Assert.Equal<Set<_>>(Set.ofList [ 10 ], Set.ofSeq (ASet.force b))
     CSet.remove 1 src
     Assert.Equal<Set<int>>(Set.empty, Set.ofSeq (ASet.force b))
+
+// =============================================================================
+// Extension points (MAPA-DESIGN §1): ofExternal ×4, AList.custom.
+// Public API level only. Semantics per §1.1: the snapshot runs at most once
+// per invalidate, on the next read; not invalidated → zero cost.
+// =============================================================================
+
+[<Fact>]
+let ``AVal ofExternal: first read takes the snapshot; invalidate re-reads`` () =
+    let mutable current = 0
+    let value, invalidate = AVal.ofExternal (fun () -> current)
+
+    Assert.Equal(0, AVal.getValue value)
+
+    current <- 42
+    Assert.Equal(0, AVal.getValue value) // not invalidated: cached
+    invalidate ()
+    Assert.Equal(42, AVal.getValue value)
+
+[<Fact>]
+let ``AVal ofExternal: reads without invalidate do not re-run the function`` () =
+    let mutable calls = 0
+    let value, _ = AVal.ofExternal (fun () -> calls <- calls + 1; calls)
+
+    AVal.getValue value |> ignore
+    AVal.getValue value |> ignore
+    Assert.Equal(1, calls)
+
+[<Fact>]
+let ``AVal ofExternal: derived values recompute after invalidate`` () =
+    let mutable current = 1
+    let value, invalidate = AVal.ofExternal (fun () -> current)
+    let doubled = AVal.map (fun v -> v * 2) value
+
+    Assert.Equal(2, AVal.getValue doubled)
+
+    current <- 5
+    invalidate ()
+    Assert.Equal(10, AVal.getValue doubled)
+
+[<Fact>]
+let ``AVal ofExternal: observe fires only when the re-read changed the value`` () =
+    let mutable current = 1
+    let value, invalidate = AVal.ofExternal (fun () -> current)
+    let mutable callbacks = 0
+
+    use _obs = AVal.observe (fun _ -> callbacks <- callbacks + 1) value
+
+    invalidate () // same value: no callback
+    Assert.Equal(0, callbacks)
+
+    current <- 2
+    invalidate ()
+    Assert.Equal(1, callbacks)
+
+[<Fact>]
+let ``AVal ofExternal: foreign-thread invalidate applies at the next read`` () =
+    let mutable current = 1
+    let value, invalidate = AVal.ofExternal (fun () -> current)
+
+    Assert.Equal(1, AVal.getValue value)
+
+    current <- 7
+    Task.Run(fun () -> invalidate ()).Wait()
+    Assert.Equal(7, AVal.getValue value) // the post drains at the next graph op
+
+[<Fact>]
+let ``ASet mapA consumes an AVal ofExternal element source`` () =
+    // The invalidate moves the write generation, so the *A scan gate fires.
+    let s = CSet.ofSeq [ 1; 2; 3 ]
+    let mutable current = 0
+    let ext, invalidate = AVal.ofExternal (fun () -> current)
+    let mapped = s |> ASet.mapA (fun _ -> ext)
+
+    Assert.Equal<Set<int>>(Set.ofList [ 0 ], ASet.toSet mapped)
+
+    current <- 9
+    invalidate ()
+    Assert.Equal<Set<int>>(Set.ofList [ 9 ], ASet.toSet mapped)
+
+[<Fact>]
+let ``ASet ofExternal: materializes on first read and diffs on invalidate`` () =
+    let mutable current = HashSet<int>([ 1; 2; 3 ])
+    let s, invalidate = ASet.ofExternal (fun () -> current :> IReadOnlySet<int>)
+
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2; 3 ], ASet.toSet s)
+
+    current <- HashSet<int>([ 2; 3; 4 ])
+    invalidate ()
+    Assert.Equal<Set<int>>(Set.ofList [ 2; 3; 4 ], ASet.toSet s)
+
+    invalidate () // unchanged snapshot: no visible change
+    Assert.Equal<Set<int>>(Set.ofList [ 2; 3; 4 ], ASet.toSet s)
+
+[<Fact>]
+let ``ASet ofExternal: reads without invalidate do not re-run the snapshot`` () =
+    let mutable calls = 0
+
+    let s, _ =
+        ASet.ofExternal (fun () ->
+            calls <- calls + 1
+            HashSet<int>([ 1 ]) :> IReadOnlySet<int>)
+
+    ASet.force s |> ignore
+    ASet.force s |> ignore
+    Assert.Equal(1, calls)
+
+[<Fact>]
+let ``ASet ofExternal: observes receive the net delta after invalidate`` () =
+    let mutable current = HashSet<int>([ 1; 2; 3 ])
+    let s, invalidate = ASet.ofExternal (fun () -> current :> IReadOnlySet<int>)
+    let mutable lastAdds = Set.empty<int>
+    let mutable lastRems = Set.empty<int>
+
+    use _obs =
+        ASet.observe
+            (fun _ (d: SetDelta<int>) ->
+                lastAdds <- d.Added.ToArray() |> Set.ofArray
+                lastRems <- d.Removed.ToArray() |> Set.ofArray)
+            s
+
+    current <- HashSet<int>([ 3; 4 ])
+    invalidate ()
+    Assert.Equal<Set<int>>(Set.ofList [ 4 ], lastAdds)
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2 ], lastRems)
+
+[<Fact>]
+let ``AMap ofExternal: materializes on first read and diffs on invalidate`` () =
+    let mutable current = Dictionary<int, string>()
+    current[1] <- "a"
+    current[2] <- "b"
+
+    let m, invalidate = AMap.ofExternal (fun () -> current :> IReadOnlyDictionary<int, string>)
+
+    Assert.Equal<Map<int, string>>(Map.ofList [ 1, "a"; 2, "b" ], AMap.toMap m)
+
+    current[1] <- "a" // unchanged value: elided
+    current[3] <- "c"
+    invalidate ()
+    Assert.Equal<Map<int, string>>(Map.ofList [ 1, "a"; 2, "b"; 3, "c" ], AMap.toMap m)
+
+    current.Remove 2 |> ignore
+    invalidate ()
+    Assert.Equal<Map<int, string>>(Map.ofList [ 1, "a"; 3, "c" ], AMap.toMap m)
+
+[<Fact>]
+let ``AList ofExternal: materializes on first read and diffs positionally`` () =
+    let mutable current = ResizeArray [ 1; 2; 3 ]
+    let l, invalidate = AList.ofExternal (fun () -> current :> IReadOnlyList<int>)
+
+    Assert.Equal<int[]>([| 1; 2; 3 |], AList.toArray l)
+
+    current.RemoveAt 0 // [ 2; 3 ]
+    invalidate ()
+    Assert.Equal<int[]>([| 2; 3 |], AList.toArray l)
+
+    current.Insert(1, 9) // [ 2; 9; 3 ]
+    invalidate ()
+    Assert.Equal<int[]>([| 2; 9; 3 |], AList.toArray l)
+
+    current[0] <- 7 // [ 7; 9; 3 ]
+    invalidate ()
+    Assert.Equal<int[]>([| 7; 9; 3 |], AList.toArray l)
+
+[<Fact>]
+let ``AList ofExternal: reads without invalidate do not re-run the snapshot`` () =
+    let mutable calls = 0
+
+    let l, _ =
+        AList.ofExternal (fun () ->
+            calls <- calls + 1
+            ResizeArray [ 1 ] :> IReadOnlyList<int>)
+
+    AList.force l |> ignore
+    AList.force l |> ignore
+    Assert.Equal(1, calls)
+
+[<Fact>]
+let ``AList ofExternal: observes receive the ordered delta after invalidate`` () =
+    let mutable current = ResizeArray [ 1; 2; 3 ]
+    let l, invalidate = AList.ofExternal (fun () -> current :> IReadOnlyList<int>)
+    let mutable opCount = 0
+
+    use _obs =
+        AList.observe (fun _ (d: ListDelta<int>) -> opCount <- opCount + d.Operations.Length) l
+
+    current.Insert(0, 0) // [ 0; 1; 2; 3 ]
+    invalidate ()
+    Assert.Equal(1, opCount)
+    Assert.Equal<int[]>([| 0; 1; 2; 3 |], AList.toArray l)
+
+[<Fact>]
+let ``AList custom: the compute drains an event queue into the list`` () =
+    let events = ResizeArray<int>()
+
+    let list =
+        AList.custom (fun view (delta: ListDeltaBuilder<int>) ->
+            for i in 0 .. events.Count - 1 do
+                delta.Insert(view.Count + i, events[i])
+
+            events.Clear())
+
+    Assert.Equal<int[]>([||], AList.toArray list)
+
+    events.Add 1
+    events.Add 2
+    Assert.Equal<int[]>([| 1; 2 |], AList.toArray list) // one poll drains the queue
+
+    events.Add 3
+    Assert.Equal<int[]>([| 1; 2; 3 |], AList.toArray list)
+
+[<Fact>]
+let ``AList custom: observes receive the computed ops`` () =
+    let events = ResizeArray<int>()
+
+    let list =
+        AList.custom (fun view (delta: ListDeltaBuilder<int>) ->
+            for i in 0 .. events.Count - 1 do
+                delta.Insert(view.Count + i, events[i])
+
+            events.Clear())
+
+    let mutable opCount = 0
+
+    use _obs =
+        AList.observe (fun _ (d: ListDelta<int>) -> opCount <- opCount + d.Operations.Length) list
+
+    events.Add 5
+    events.Add 6
+    AList.force list |> ignore // the read polls; the delta wakes the observer
+    Assert.Equal(2, opCount)
+    Assert.Equal<int[]>([| 5; 6 |], AList.toArray list)
+
+[<Fact>]
+let ``ofExternal: reads without invalidate allocate nothing`` () =
+    let mutable current = 1
+    let v, invalidateV = AVal.ofExternal (fun () -> current)
+    let s, invalidateS = ASet.ofExternal (fun () -> HashSet<int>([ 1 ]) :> IReadOnlySet<int>)
+    let map = Dictionary<int, string>()
+    map[1] <- "a"
+    let m, invalidateM = AMap.ofExternal (fun () -> map :> IReadOnlyDictionary<int, string>)
+    let l, invalidateL = AList.ofExternal (fun () -> ResizeArray [ 1 ] :> IReadOnlyList<int>)
+
+    // Settle: first reads, an invalidate round, settled reads.
+    AVal.getValue v |> ignore
+    ASet.getValue s |> ignore
+    AMap.getValue m |> ignore
+    AList.getValue l |> ignore
+    invalidateV ()
+    invalidateS ()
+    invalidateM ()
+    invalidateL ()
+    AVal.getValue v |> ignore
+    ASet.getValue s |> ignore
+    AMap.getValue m |> ignore
+    AList.getValue l |> ignore
+
+    let before = GC.GetAllocatedBytesForCurrentThread()
+
+    for _ in 1..1000 do
+        AVal.getValue v |> ignore
+        ASet.getValue s |> ignore
+        AMap.getValue m |> ignore
+        AList.getValue l |> ignore
+
+    let allocated = GC.GetAllocatedBytesForCurrentThread() - before
+    Assert.Equal(0L, allocated)

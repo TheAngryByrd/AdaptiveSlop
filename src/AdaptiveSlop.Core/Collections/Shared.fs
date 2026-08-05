@@ -385,6 +385,29 @@ type ListDelta<'T> =
         this.Ops.Items[this.Ops.Count] <- ListOp(ListOpKind.Update, position, value, 0uy)
         this.Ops.Count <- this.Ops.Count + 1
 
+/// <summary>
+/// A class-based delta builder for <see cref="AList.custom"/> computes. The
+/// struct <see cref="ListDelta&lt;'T&gt;"/> is passed by value (its counter
+/// would be copied); this class keeps the appends visible to the node.
+/// </summary>
+type ListDeltaBuilder<'T>() =
+    let mutable delta = ListDelta<'T>.Create()
+
+    member internal _.IsEmpty = delta.IsEmpty
+
+    member internal this.Clear() = delta.Clear()
+
+    member internal this.Snapshot() = delta
+
+    /// <summary>Appends an insert operation. Positions refer to the state as of the previous operation.</summary>
+    member this.Insert(position: int, value: 'T) = delta.Insert(position, value)
+
+    /// <summary>Appends a remove operation. Positions refer to the state as of the previous operation.</summary>
+    member this.Remove(position: int) = delta.Remove(position)
+
+    /// <summary>Appends an update operation. Positions refer to the state as of the previous operation.</summary>
+    member this.Update(position: int, value: 'T) = delta.Update(position, value)
+
 /// <summary>Internal. Receives deltas from a list dependency.</summary>
 type internal IListDeltaSink<'T> =
     abstract member OnDeltas: ops: ListOp<'T>[] * opCount: int -> unit

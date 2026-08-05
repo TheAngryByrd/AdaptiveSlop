@@ -521,3 +521,79 @@ type ObserveListNode<'T>
                 match box target with
                 | :? IListSinkRegistry as r -> r.RemoveListSink(box (this :> IListDeltaSink<'T>))
                 | _ -> ()
+
+/// <summary>
+/// An adaptive list whose content is driven by a compute function (FDA
+/// <c>AList.custom</c> parity, MAPA-DESIGN §1.3). The compute receives the
+/// current view and a delta builder; it appends the operations that describe
+/// the change since the previous call (consuming its own event queue, for
+/// example). Called on every read (poll), like <see cref="CustomSetNode"/>.
+/// </summary>
+type CustomListNode<'T when 'T: equality>([<InlineIfLambda>] compute: IReadOnlyList<'T> -> ListDeltaBuilder<'T> -> unit) =
+    let mutable data = ResizeArray<'T>()
+    let builder = ListDeltaBuilder<'T>()
+    let mutable version = 0L
+    let mutable sinks = SinkList.Create()
+    let edges = ParentEdges()
+    let mutable disposed = false
+
+    member private this.Poll() =
+        if not disposed then
+            builder.Clear()
+            compute (data :> IReadOnlyList<'T>) builder
+
+            if not builder.IsEmpty then
+                let out = builder.Snapshot()
+
+                // Apply the ops to the local state in order (the delta
+                // semantics: each position refers to the state as of the
+                // previous op).
+                let ops = out.Ops
+
+                for i in 0 .. ops.Count - 1 do
+                    let op = ops.Items[i]
+
+                    match op.Kind with
+                    | ListOpKind.Insert -> data.Insert(op.Position, op.Value)
+                    | ListOpKind.Remove -> data.RemoveAt op.Position
+                    | _ -> data[op.Position] <- op.Value
+
+                version <- version + 1L
+                Collections.pushAndMarkList out &sinks edges
+                builder.Clear()
+
+    interface IAdaptiveList<'T> with
+        member this.GetValue() =
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
+
+            try
+                if disposed then
+                    invalidOp "This adaptive list has been disposed."
+
+                this.Poll()
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                data :> IReadOnlyList<'T>
+            finally
+                ctx.ReleaseOwner()
+
+        member this.Version =
+            this.Poll()
+            version
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                Collections.clearSinks &sinks
+
+    interface IListSinkRegistry with
+        member this.AddListSink(sink) = Collections.addSink &sinks sink
+
+        member this.RemoveListSink(sink) =
+            Collections.removeSink &sinks sink
+
+    interface IEdgeTarget with
+        member _.EdgeCount = edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
