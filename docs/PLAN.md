@@ -5,8 +5,8 @@ information necessary for the implementation. It has no external references.
 
 ## Status
 
-- Done: Phase 0, Phase 1, Phase 2, Phase 3, Phase 4 (2026-08-03).
-- Next: Phase 5 (cross-thread posting).
+- Done: Phase 0, Phase 1, Phase 2, Phase 3, Phase 4 (2026-08-03), Phase 5 (2026-08-04).
+- Next: Phase 6 (collections lifecycle).
 
 ## 1. Targets
 
@@ -228,6 +228,13 @@ Each slot carries a sequence number for synchronization.
 
 Duplicate posts to one source in one window collapse to one application. This is safe
 because no read occurs during the drain.
+
+Pumping is automatic: the outermost entry of any owner-thread graph operation drains the
+ring first, so pending posts apply at the next read or write, as one batch with one
+notification delivery. `Pump()` remains available as an explicit batch point for callers
+that want to choose the application boundary (for example, once per frame). The auto-drain
+never fires inside a nested operation or a transaction, so an evaluation never observes a
+mid-recompute application.
 
 ### 7.4 Multiple graphs
 

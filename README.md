@@ -11,8 +11,8 @@ focus on memory efficiency and tight-loop (game/simulation) workloads.
 - **Automatic dependency tracking** — no manual subscription management
 - **Lazy pull evaluation** — values recompute only when read and dirty
 - **Incremental collections** — adaptive sets/maps propagate element-level deltas
-- **Low allocation** — up to 14x less memory than FDA
-- **Thread-safe** — concurrent read/write via per-node locking
+- **Low allocation** — zero allocation on steady-state reads and writes
+- **Owner-thread confinement** — one thread per graph; foreign threads send changes with lock-free `Post`, applied automatically at the owner's next graph operation (optional explicit `Posting.pump()`)
 - **Transactions** — batch updates applied atomically at commit
 
 ## Installation
@@ -80,6 +80,33 @@ Transaction.run (fun () ->
 Note: changes inside a transaction are applied at commit — reads *inside* the transaction
 still see the pre-transaction values.
 
+### Cross-thread posting
+
+A graph belongs to one **owner thread**. Only the owner reads and writes the graph.
+Foreign threads send changes with `Post`; the owner's next graph operation applies them
+automatically:
+
+```fsharp
+// worker thread
+CVal.post (health - 1) health
+
+// owner thread: no pump call needed
+let h = AVal.getValue health
+```
+
+Posting rules:
+
+- `Post` is lock-free and allocates nothing. It writes a typed pending field and, if the
+  source is not queued yet, pushes the source onto a bounded preallocated ring.
+- Pending posts are applied automatically at the start of the next graph operation on
+  the owner thread, as one batch with one notification delivery. Several posts to one
+  source before the application collapse to one application of the last value.
+- The source equality check still applies at application: posting an equal value marks
+  nothing.
+- `Posting.pump()` is optional: it forces application at a chosen boundary (for
+  example, once per frame). It runs on the owner thread only and is cheap and
+  allocation-free when the queue is empty.
+
 ### Adaptive collections
 
 Sets and maps propagate **element-level deltas** (added/removed) instead of recomputing
@@ -99,11 +126,12 @@ scores.AddOrUpdate("Bob", 87)
 
 | Module | Functions |
 |--------|-----------|
-| `AVal` | `constant`, `map`, `map2`, `map3`, `map4`, `mapN`, `reduce`, `sum`, `bind`, `getValue` (+ `Task`/`ValueTask` variants) |
-| `CVal` | `create`, `value`, `set` |
+| `AVal` | `constant`, `map`, `map2`, `map3`, `map4`, `mapN`, `reduce`, `sum`, `bind`, `observe`, `getValue` (+ `Task`/`ValueTask` variants) |
+| `CVal` | `create`, `value`, `set`, `post` |
 | `CSet` / `CMap` | `empty`, `ofSeq`, `add` / `addOrUpdate`, `remove`, `set`, `value` |
 | `ASet` / `AMap` | `map`, `filter` (+ `union` for sets) |
 | `Transaction` | `run` |
+| `Posting` | `pump` |
 
 ## Performance
 
@@ -122,22 +150,21 @@ arrays, struct tuples on hot paths.
 
 ## Architecture
 
-- **Pull-based with version checking.** Each node caches its value plus a snapshot of its
-  dependencies' version numbers. `GetValue()` recomputes only when a dependency's version
-  has changed. Dependencies are re-discovered on every recompute, so dynamic graphs
-  (`bind`) stay correct.
+- **Push-mark, pull-evaluate.** Writes mark observed subgraphs dirty; reads recompute a
+  dirty node exactly once per change and return cached values otherwise. Unobserved
+  nodes fall back to dependency version checks.
+- **Lazy edges.** Dependencies are re-discovered on every recompute, so dynamic graphs
+  (`bind`) stay correct. Edge sets mutate only when they really change.
 - **Collections push deltas.** Changeable sets/maps journal added/removed elements and push
   them to derived nodes, which update per-element (with ref-counting for shared outputs).
-- **Thread safety** via per-node locks; transactions are thread-local.
-- Marking/push-invalidation machinery for *observation* scenarios exists but is not yet
-  active — see the roadmap.
+- **Owner-thread confinement.** One thread owns a graph. The core has no locks.
+  Cross-thread changes go through `Post` + `Posting.pump()` (see above).
+- **Observation.** `AVal.observe` registers a strong parent edge and delivers the callback
+  after a batch or a write. Dispose the observation to stop; edges are strong, so an
+  undropped observation keeps the subgraph alive.
 
 ## Known Limitations
 
-- **No observation API yet** (`IObservation` exists but `AVal.observe` is unimplemented) —
-  all recomputation is pull-driven.
-- **Async hazard**: `[<ThreadStatic>]` dependency tracking does not flow across `Task`
-  continuations; keep compute functions synchronous.
 - Derived collection nodes register with their source at construction and are retained by
   it (explicit lifecycle management is on the roadmap).
 - No incremental `bind` — switching the inner value recomputes it fully.
