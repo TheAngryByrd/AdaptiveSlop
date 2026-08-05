@@ -62,6 +62,9 @@ type IAdaptiveValue<'T> =
     /// <returns>The current computed value.</returns>
     abstract member GetValue: unit -> 'T
 
+/// <summary>An abbreviation for <see cref="IAdaptiveValue&lt;'T&gt;"/> (FDA <c>aval&lt;'T&gt;</c> parity).</summary>
+type aval<'T> = IAdaptiveValue<'T>
+
 /// <summary>
 /// Handle for an active observation of an adaptive value.
 /// Disposing removes parent links and stops dirty propagation for the observed subtree.
@@ -653,7 +656,25 @@ type ConstantValue<'T>(value: 'T) =
 
         member _.Version = 0L
 
-and AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
+type LazyConstantValue<'T>([<InlineIfLambda>] create: unit -> 'T) =
+    let mutable computed = false
+    let mutable value = Unchecked.defaultof<'T>
+
+    interface IAdaptiveValue<'T> with
+        member this.GetValue() =
+            AdaptiveRuntime.addDependency (this :> IAdaptiveObject) 0L
+
+            if computed then
+                value
+            else
+                let v = create ()
+                value <- v
+                computed <- true
+                v
+
+        member _.Version = 0L
+
+type AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
     let mutable version = 0L
     let mutable hasValue = false
     let mutable value = Unchecked.defaultof<'T>
@@ -877,7 +898,7 @@ and AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
             if edges.Count = 0 then
                 this.UnregisterFromDeps()
 
-and ChangeableValue<'T>(initial: 'T) =
+type ChangeableValue<'T>(initial: 'T) =
     let mutable value = initial
     let mutable version = 0L
     let edges = ParentEdges()
@@ -960,6 +981,34 @@ and ChangeableValue<'T>(initial: 'T) =
         else
             this.Apply(newValue)
 
+    /// <summary>
+    /// Gets or sets the current value (FDA <c>cval.Value</c> parity). The setter
+    /// routes through <see cref="Set"/>: inside a transaction the write is
+    /// deferred to commit. The getter returns the raw current value; it does not
+    /// register a dependency (use <see cref="GetValue"/> for that).
+    /// </summary>
+    member this.Value
+        with get () = value
+        and set newValue = this.Set newValue
+
+    /// <summary>
+    /// Gets the current value and registers a dependency for the calling
+    /// computation (FDA <c>cval.GetValue</c> parity; no token here).
+    /// </summary>
+    member this.GetValue() = (this :> IAdaptiveValue<_>).GetValue()
+
+    /// <summary>
+    /// Sets the current value and returns whether the value changed (FDA
+    /// <c>cval.UpdateTo</c> parity). A write with an equal value returns
+    /// <c>false</c> and marks nothing.
+    /// </summary>
+    member this.UpdateTo(newValue: 'T) : bool =
+        if EqualityComparer<'T>.Default.Equals(value, newValue) then
+            false
+        else
+            this.Set newValue
+            true
+
     interface IAdaptiveValue<'T> with
         member this.GetValue() =
             let ctx = GraphContext.Default
@@ -985,7 +1034,7 @@ and ChangeableValue<'T>(initial: 'T) =
     interface IPostSource with
         member this.ApplyPosted() = this.ApplyPostedValue()
 
-and MapNNode<'T, 'U>(deps: IAdaptiveValue<'T>[], [<InlineIfLambda>] compute: 'T[] -> 'U) =
+type MapNNode<'T, 'U>(deps: IAdaptiveValue<'T>[], [<InlineIfLambda>] compute: 'T[] -> 'U) =
     let mutable version = 0L
     let mutable hasValue = false
     let mutable value = Unchecked.defaultof<'U>
@@ -1153,7 +1202,7 @@ and MapNNode<'T, 'U>(deps: IAdaptiveValue<'T>[], [<InlineIfLambda>] compute: 'T[
 /// <strong>Internal implementation detail:</strong> Created via <see cref="AVal.reduce"/> or <see cref="AVal.sum"/>.
 /// </para>
 /// </remarks>
-and ReduceNode<'T>(deps: IAdaptiveValue<'T>[], init: 'T, [<InlineIfLambda>] reduce: 'T -> 'T -> 'T) =
+type ReduceNode<'T>(deps: IAdaptiveValue<'T>[], init: 'T, [<InlineIfLambda>] reduce: 'T -> 'T -> 'T) =
     let mutable version = 0L
     let mutable hasValue = false
     let mutable value = Unchecked.defaultof<'T>
@@ -1290,19 +1339,22 @@ and ReduceNode<'T>(deps: IAdaptiveValue<'T>[], init: 'T, [<InlineIfLambda>] redu
             if edges.Count = 0 then
                 this.UnregisterFromDeps()
 
+/// <summary>An abbreviation for <see cref="ChangeableValue&lt;'T&gt;"/> (FDA <c>cval&lt;'T&gt;</c> parity).</summary>
+type cval<'T> = ChangeableValue<'T>
+
 /// <summary>
-/// Internal. An active observation of an adaptive value. Registered as a parent
+/// An active observation of an adaptive value. Registered as a parent
 /// of the observed object. Marking enqueues it once per batch; delivery pulls the
 /// current value and invokes the callback when the version changed.
 /// </summary>
-type internal Observation<'T>(target: IAdaptiveValue<'T>, callback: 'T -> unit) as this =
+type Observation<'T>(target: IAdaptiveValue<'T>, [<InlineIfLambda>] callback: 'T -> unit) as this =
     let mutable active = true
     let mutable enqueued = false
     let mutable indexInTarget = -1
     let mutable lastVersion = -1L
 
     /// Force the initial read and register this observation as a parent.
-    member internal _.Attach() =
+    member _.Attach() =
         // Materialize the dependency subgraph before the cascade registers it.
         let _ = target.GetValue()
 
@@ -1394,7 +1446,25 @@ module AVal =
     /// let doubled = AVal.map (fun x -> x * 2.0) pi
     /// </code>
     /// </example>
-    let inline constant (value: 'T) : IAdaptiveValue<'T> = ConstantValue value
+    let inline constant (value: 'T) : aval<'T> = ConstantValue value
+
+    /// <summary>
+    /// Creates a constant adaptive value using the given create function (FDA
+    /// <c>AVal.delay</c> parity). The function runs at most once, on the first
+    /// read; later reads return the cached value.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// let v = AVal.delay (fun () -> expensiveComputation ())
+    /// </code>
+    /// </example>
+    let inline delay ([<InlineIfLambda>] create: unit -> 'T) : aval<'T> = LazyConstantValue create
+
+    /// <summary>
+    /// Creates a changeable value initially holding the given value (FDA
+    /// <c>AVal.init</c> parity; the same as <c>CVal.create</c>).
+    /// </summary>
+    let inline init (value: 'T) : cval<'T> = ChangeableValue value
 
     /// <summary>
     /// Transforms an adaptive value using a mapping function.
@@ -1412,7 +1482,7 @@ module AVal =
     /// let fahrenheit = AVal.map (fun c -> c * 9.0/5.0 + 32.0) (CVal.value celsius)
     /// </code>
     /// </example>
-    let inline map ([<InlineIfLambda>] f: 'T -> 'U) (value: IAdaptiveValue<'T>) : IAdaptiveValue<'U> =
+    let inline map ([<InlineIfLambda>] f: 'T -> 'U) (value: aval<'T>) : aval<'U> =
         AdaptiveNode(fun () -> f (value.GetValue()))
 
     /// <summary>
@@ -1432,11 +1502,7 @@ module AVal =
     /// let area = AVal.map2 (*) (CVal.value width) (CVal.value height)
     /// </code>
     /// </example>
-    let inline map2
-        ([<InlineIfLambda>] f: 'T -> 'U -> 'V)
-        (left: IAdaptiveValue<'T>)
-        (right: IAdaptiveValue<'U>)
-        : IAdaptiveValue<'V> =
+    let inline map2 ([<InlineIfLambda>] f: 'T -> 'U -> 'V) (left: aval<'T>) (right: aval<'U>) : aval<'V> =
         AdaptiveNode(fun () -> f (left.GetValue()) (right.GetValue()))
 
     /// <summary>
@@ -1457,12 +1523,7 @@ module AVal =
     ///                       (CVal.value r) (CVal.value g) (CVal.value b)
     /// </code>
     /// </example>
-    let inline map3
-        ([<InlineIfLambda>] f: 'A -> 'B -> 'C -> 'T)
-        (a: IAdaptiveValue<'A>)
-        (b: IAdaptiveValue<'B>)
-        (c: IAdaptiveValue<'C>)
-        : IAdaptiveValue<'T> =
+    let inline map3 ([<InlineIfLambda>] f: 'A -> 'B -> 'C -> 'T) (a: aval<'A>) (b: aval<'B>) (c: aval<'C>) : aval<'T> =
         AdaptiveNode(fun () -> f (a.GetValue()) (b.GetValue()) (c.GetValue()))
 
     /// <summary>
@@ -1487,11 +1548,11 @@ module AVal =
     /// </example>
     let inline map4
         ([<InlineIfLambda>] f: 'A -> 'B -> 'C -> 'D -> 'T)
-        (a: IAdaptiveValue<'A>)
-        (b: IAdaptiveValue<'B>)
-        (c: IAdaptiveValue<'C>)
-        (d: IAdaptiveValue<'D>)
-        : IAdaptiveValue<'T> =
+        (a: aval<'A>)
+        (b: aval<'B>)
+        (c: aval<'C>)
+        (d: aval<'D>)
+        : aval<'T> =
         AdaptiveNode(fun () -> f (a.GetValue()) (b.GetValue()) (c.GetValue()) (d.GetValue()))
 
     /// <summary>
@@ -1525,8 +1586,7 @@ module AVal =
     /// let average = AVal.mapN (fun values -> Array.average values) deps
     /// </code>
     /// </example>
-    let inline mapN ([<InlineIfLambda>] compute: 'T[] -> 'U) (deps: IAdaptiveValue<'T>[]) : IAdaptiveValue<'U> =
-        MapNNode(deps, compute)
+    let inline mapN ([<InlineIfLambda>] compute: 'T[] -> 'U) (deps: aval<'T>[]) : aval<'U> = MapNNode(deps, compute)
 
     /// <summary>
     /// Reduces N adaptive values using a binary operation and initial value.
@@ -1564,11 +1624,7 @@ module AVal =
     /// let maxPrice = AVal.reduce System.Double.MinValue max deps
     /// </code>
     /// </example>
-    let inline reduce
-        (init: 'T)
-        ([<InlineIfLambda>] reduce: 'T -> 'T -> 'T)
-        (deps: IAdaptiveValue<'T>[])
-        : IAdaptiveValue<'T> =
+    let inline reduce (init: 'T) ([<InlineIfLambda>] reduce: 'T -> 'T -> 'T) (deps: aval<'T>[]) : aval<'T> =
         ReduceNode(deps, init, reduce)
 
     /// <summary>
@@ -1595,8 +1651,7 @@ module AVal =
     /// printfn "Total: %d" (AVal.getValue totalScore)  // Total: 260
     /// </code>
     /// </example>
-    let inline sum (deps: IAdaptiveValue<int>[]) : IAdaptiveValue<int> =
-        ReduceNode(deps, 0, (+)) :> IAdaptiveValue<int>
+    let inline sum (deps: aval<int>[]) : aval<int> = ReduceNode(deps, 0, (+))
 
     /// <summary>
     /// Transforms an adaptive value using an async function that returns a Task.
@@ -1604,40 +1659,59 @@ module AVal =
     /// <param name="f">The async function to apply.</param>
     /// <param name="value">The source adaptive value.</param>
     /// <returns>An adaptive value containing Tasks of the result type.</returns>
-    let inline mapTask ([<InlineIfLambda>] f: 'T -> Task<'U>) (value: IAdaptiveValue<'T>) : IAdaptiveValue<Task<'U>> =
+    let inline mapTask ([<InlineIfLambda>] f: 'T -> Task<'U>) (value: aval<'T>) : aval<Task<'U>> =
         AdaptiveNode(fun () -> f (value.GetValue()))
 
-    let inline mapValueTask
-        ([<InlineIfLambda>] f: 'T -> ValueTask<'U>)
-        (value: IAdaptiveValue<'T>)
-        : IAdaptiveValue<ValueTask<'U>> =
+    let inline mapValueTask ([<InlineIfLambda>] f: 'T -> ValueTask<'U>) (value: aval<'T>) : aval<ValueTask<'U>> =
         AdaptiveNode(fun () -> f (value.GetValue()))
 
-    let inline bind ([<InlineIfLambda>] f: 'T -> IAdaptiveValue<'U>) (value: IAdaptiveValue<'T>) : IAdaptiveValue<'U> =
+    let inline bind ([<InlineIfLambda>] f: 'T -> aval<'U>) (value: aval<'T>) : aval<'U> =
         AdaptiveNode(fun () ->
             let inner = f (value.GetValue())
             inner.GetValue())
 
-    let inline bindTask ([<InlineIfLambda>] f: 'T -> Task<'U>) (value: IAdaptiveValue<'T>) : Task<'U> =
+    /// <summary>
+    /// Adaptively applies the mapping to the two values and adaptively depends
+    /// on the adaptive value the mapping returns (FDA <c>AVal.bind2</c> parity).
+    /// When an input changes, the previously returned inner value is dropped and
+    /// the mapping selects a new one.
+    /// </summary>
+    let inline bind2 ([<InlineIfLambda>] f: 'T -> 'U -> aval<'V>) (a: aval<'T>) (b: aval<'U>) : aval<'V> =
+        AdaptiveNode(fun () -> (f (a.GetValue()) (b.GetValue())).GetValue())
+
+    /// <summary>
+    /// Adaptively applies the mapping to the three values and adaptively depends
+    /// on the adaptive value the mapping returns (FDA <c>AVal.bind3</c> parity).
+    /// </summary>
+    let inline bind3
+        ([<InlineIfLambda>] f: 'T -> 'U -> 'V -> aval<'W>)
+        (a: aval<'T>)
+        (b: aval<'U>)
+        (c: aval<'V>)
+        : aval<'W> =
+        AdaptiveNode(fun () -> (f (a.GetValue()) (b.GetValue()) (c.GetValue())).GetValue())
+
+    /// <summary>
+    /// Creates a custom adaptive value using the given computation (FDA
+    /// <c>AVal.custom</c> parity; deviation: FDA passes an
+    /// <c>AdaptiveToken</c>, we have no token, so the computation takes unit).
+    /// Callers are responsible for removing inputs that are no longer needed.
+    /// </summary>
+    let inline custom ([<InlineIfLambda>] compute: unit -> 'T) : aval<'T> = AdaptiveNode(compute)
+
+    let inline bindTask ([<InlineIfLambda>] f: 'T -> Task<'U>) (value: aval<'T>) : Task<'U> = value.GetValue() |> f
+
+    let inline bindValueTask ([<InlineIfLambda>] f: 'T -> ValueTask<'U>) (value: aval<'T>) : ValueTask<'U> =
         value.GetValue() |> f
 
-    let inline bindValueTask ([<InlineIfLambda>] f: 'T -> ValueTask<'U>) (value: IAdaptiveValue<'T>) : ValueTask<'U> =
-        value.GetValue() |> f
-
-    let inline mapTaskResult
-        ([<InlineIfLambda>] f: 'T -> 'U)
-        (value: IAdaptiveValue<Task<'T>>)
-        : IAdaptiveValue<Task<'U>> =
+    let inline mapTaskResult ([<InlineIfLambda>] f: 'T -> 'U) (value: aval<Task<'T>>) : aval<Task<'U>> =
         AdaptiveNode(fun () ->
             task {
                 let! inner = value.GetValue()
                 return f inner
             })
 
-    let inline mapValueTaskResult
-        ([<InlineIfLambda>] f: 'T -> 'U)
-        (value: IAdaptiveValue<ValueTask<'T>>)
-        : IAdaptiveValue<ValueTask<'U>> =
+    let inline mapValueTaskResult ([<InlineIfLambda>] f: 'T -> 'U) (value: aval<ValueTask<'T>>) : aval<ValueTask<'U>> =
         AdaptiveNode(fun () ->
             ValueTask<'U>(
                 task {
@@ -1646,10 +1720,7 @@ module AVal =
                 }
             ))
 
-    let inline bindTaskResult
-        ([<InlineIfLambda>] f: 'T -> Task<'U>)
-        (value: IAdaptiveValue<Task<'T>>)
-        : IAdaptiveValue<Task<'U>> =
+    let inline bindTaskResult ([<InlineIfLambda>] f: 'T -> Task<'U>) (value: aval<Task<'T>>) : aval<Task<'U>> =
         AdaptiveNode(fun () ->
             task {
                 let! inner = value.GetValue()
@@ -1658,8 +1729,8 @@ module AVal =
 
     let inline bindValueTaskResult
         ([<InlineIfLambda>] f: 'T -> ValueTask<'U>)
-        (value: IAdaptiveValue<ValueTask<'T>>)
-        : IAdaptiveValue<ValueTask<'U>> =
+        (value: aval<ValueTask<'T>>)
+        : aval<ValueTask<'U>> =
         AdaptiveNode(fun () ->
             ValueTask<'U>(
                 task {
@@ -1668,7 +1739,10 @@ module AVal =
                 }
             ))
 
-    let inline getValue (value: IAdaptiveValue<'T>) = value.GetValue()
+    let inline getValue (value: aval<'T>) = value.GetValue()
+
+    /// <summary>Evaluates the given adaptive value and returns its current value (FDA <c>AVal.force</c> parity; the same as <c>getValue</c>).</summary>
+    let inline force (value: aval<'T>) = value.GetValue()
 
     /// <summary>
     /// Observes an adaptive value. Forces an initial read and registers the callback
@@ -1693,19 +1767,20 @@ module AVal =
     /// count.Set(1)  // prints "count: 1"
     /// </code>
     /// </example>
-    let observe (callback: 'T -> unit) (value: IAdaptiveValue<'T>) : IObservation =
+    let inline observe ([<InlineIfLambda>] callback: 'T -> unit) (value: aval<'T>) : IObservation =
         let observation = new Observation<_>(value, callback)
         observation.Attach()
-        observation :> IObservation
+        observation
 
-    let inline getValueTask (value: IAdaptiveValue<'T>) = Task.FromResult(value.GetValue())
+    let inline getValueTask (value: aval<'T>) = Task.FromResult(value.GetValue())
 
-    let inline getValueValueTask (value: IAdaptiveValue<'T>) = ValueTask<'T>(value.GetValue())
+    let inline getValueValueTask (value: aval<'T>) = ValueTask<'T>(value.GetValue())
 
 module CVal =
-    let inline create (value: 'T) = ChangeableValue value
+    /// <summary>Creates a changeable value initially holding the given value.</summary>
+    let inline create (value: 'T) : cval<'T> = ChangeableValue value
 
-    let inline set (value: 'T) (cval: ChangeableValue<'T>) = cval.Set value
+    let inline set (value: 'T) (cval: cval<'T>) = cval.Set value
 
     /// <summary>
     /// Posts a new value from any thread. The value is applied automatically at the
@@ -1720,6 +1795,7 @@ module CVal =
     /// let h = AVal.getValue health
     /// </code>
     /// </example>
-    let inline post (value: 'T) (cval: ChangeableValue<'T>) = cval.Post value
+    let inline post (value: 'T) (cval: cval<'T>) = cval.Post value
 
-    let inline value (cval: ChangeableValue<'T>) : IAdaptiveValue<'T> = cval
+    /// <summary>Views the changeable value as an adaptive value.</summary>
+    let inline value (cval: cval<'T>) : aval<'T> = cval
