@@ -815,38 +815,41 @@ module internal Collections =
         if not wasActive then
             ctx.DeliverNotifications()
 
-    /// Initial load of a refcounted set node: read the source state and build
-    /// the internal state. The source read also registers the dependency.
+    /// Initial load of a refcounted set node: build the internal state from a
+    /// snapshot of the source view. The node takes the snapshot and registers
+    /// its sink between the snapshot and this call, so user-code writes from
+    /// the mapping land in the journal instead of mutating the transient view
+    /// mid-iteration.
     let inline loadRefSet
         ([<InlineIfLambda>] map: 'T -> 'U voption)
-        (source: IAdaptiveSet<'T>)
+        (snapshot: HashSet<'T>)
         (state: SetNodeState<'T, 'U> byref)
         =
-        for item in source.GetValue() do
+        for item in snapshot do
             match map item with
             | ValueSome z ->
                 let struct (set2, _) = refAdd state.Set z
                 state.Set <- set2
             | ValueNone -> ()
 
-    /// Initial load of a plain set node (filter).
+    /// Initial load of a plain set node (filter). See <see cref="loadRefSet"/>.
     let inline loadPlainSet
         ([<InlineIfLambda>] map: 'T -> 'T voption)
-        (source: IAdaptiveSet<'T>)
+        (snapshot: HashSet<'T>)
         (state: SetNodeState<'T, 'T> byref)
         =
-        for item in source.GetValue() do
+        for item in snapshot do
             match map item with
             | ValueSome z -> state.Set.Data.Add z |> ignore
             | ValueNone -> ()
 
-    /// Initial load of a map node.
+    /// Initial load of a map node. See <see cref="loadRefSet"/>.
     let inline loadMap
         ([<InlineIfLambda>] map: 'K -> 'V -> 'U voption)
-        (source: IAdaptiveMap<'K, 'V>)
+        (snapshot: Dictionary<'K, 'V>)
         (state: MapNodeState<'K, 'V, 'U> byref)
         =
-        for KeyValue(k, v) in source.GetValue() do
+        for KeyValue(k, v) in snapshot do
             match map k v with
             | ValueSome u -> state.Data[k] <- u
             | ValueNone -> ()
@@ -1412,21 +1415,21 @@ module internal Collections =
         if not wasActive then
             ctx.DeliverNotifications()
 
-    /// <summary>Initial load of a choose2 node: merge both source views through the mapping.</summary>
+    /// <summary>Initial load of a choose2 node: merge both source snapshots through the mapping.</summary>
     let inline loadChoose2
         ([<InlineIfLambda>] mapping: 'K -> 'V1 voption -> 'V2 voption -> 'V3 voption)
-        (left: IAdaptiveMap<'K, 'V1>)
-        (right: IAdaptiveMap<'K, 'V2>)
+        (leftSnapshot: Dictionary<'K, 'V1>)
+        (rightSnapshot: Dictionary<'K, 'V2>)
         (state: Choose2State<'K, 'V1, 'V2, 'V3> byref)
         =
-        for KeyValue(k, v) in left.GetValue() do
+        for KeyValue(k, v) in leftSnapshot do
             state.Sides[k] <- struct (ValueSome v, ValueNone)
 
             match mapping k (ValueSome v) ValueNone with
             | ValueSome o -> state.Out[k] <- o
             | ValueNone -> ()
 
-        for KeyValue(k, v) in right.GetValue() do
+        for KeyValue(k, v) in rightSnapshot do
             let mutable cur = struct (ValueNone, ValueNone)
 
             if state.Sides.TryGetValue(k, &cur) then

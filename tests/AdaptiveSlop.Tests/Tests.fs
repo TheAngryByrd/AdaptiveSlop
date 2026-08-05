@@ -3058,3 +3058,35 @@ let ``collect drain allocates zero in steady state`` () =
 
     let allocated = GC.GetAllocatedBytesForCurrentThread() - before
     Assert.Equal(0L, allocated)
+
+[<Fact>]
+let ``write during a drain is deferred to the next read`` () =
+    // The mapping runs during the drain; a write to a source of the same node
+    // appends to the journal mid-processing. The compaction markers keep the
+    // reentrant entries for the next read: nothing is lost, nothing double-applies.
+    let src = CSet.ofSeq [ 1; 2 ]
+    let mutable reentrant = false
+
+    let u =
+        ASet.map
+            (fun x ->
+                if x = 2 && not reentrant then
+                    reentrant <- true
+                    CSet.add 3 src
+
+                x * 10)
+            (CSet.value src)
+
+    // The reentrant write lands in the journal during the first read's load;
+    // the first drain applies it before that read returns (the write is part
+    // of the read's execution). Later reads see it exactly once.
+    Assert.Equal<Set<int>>(Set.ofList [ 10; 20; 30 ], ASet.toSet u)
+    Assert.Equal<Set<int>>(Set.ofList [ 10; 20; 30 ], ASet.toSet u)
+
+    // And the removal works: no phantom refcounts.
+    CSet.remove 3 src
+    Assert.Equal<Set<int>>(Set.ofList [ 10; 20 ], ASet.toSet u)
+
+// NOTE: reading a node from inside its own mapping is out of contract
+// (undefined in FDA as well). Writes during a drain are supported: they
+// land in the journal via the compaction markers and apply exactly once.

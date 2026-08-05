@@ -224,18 +224,19 @@ type SetReduceNode<'a, 'b, 's, 'v when 'a: equality>
 
                 if not initialized then
                     initialized <- true
-                    // Read first, register after (see MapSetNode.EnsureInitialized
-                    // in SetNodes.fs): a dirty source draining during the initial
-                    // build would push its delta into the journal, and the
-                    // subsequent drain would double-count it.
+                    // Snapshot first, register between (see MapSetNode.EnsureInitialized
+                    // in SetNodes.fs): the mapping is user code that may write to
+                    // the source, and the write must land in our journal. A dirty
+                    // source draining during the snapshot read pushes to nobody.
+                    let snapshot = HashSet<'a>(source.GetValue())
+                    this.Register()
                     let mutable acc = reduction.seed
 
-                    for x in source.GetValue() do
+                    for x in snapshot do
                         acc <- reduction.add acc (mapping x)
 
                     red <- acc
                     value <- reduction.view red
-                    this.Register()
                     depVersions[0] <- source.Version
 
                 if source.Version <> depVersions[0] then
@@ -386,16 +387,21 @@ type MapReduceNode<'k, 'a, 'b, 's, 'v when 'k: equality>
 
                 if not initialized then
                     initialized <- true
-                    // Read first, register after (see the set reduction node).
-                    let mutable acc = reduction.seed
+                    // Snapshot first, register between (see the set reduction node).
+                    let snapshot = Dictionary<'k, 'a>()
 
                     for KeyValue(k, v) in source.GetValue() do
+                        snapshot[k] <- v
+
+                    this.Register()
+                    let mutable acc = reduction.seed
+
+                    for KeyValue(k, v) in snapshot do
                         mirror[k] <- v
                         acc <- reduction.add acc (mapping k v)
 
                     red <- acc
                     value <- reduction.view red
-                    this.Register()
                     depVersions[0] <- source.Version
 
                 if source.Version <> depVersions[0] then

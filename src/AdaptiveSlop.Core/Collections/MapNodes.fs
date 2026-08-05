@@ -47,12 +47,18 @@ type MapMapNode<'K, 'V, 'U when 'K: equality>(source: IAdaptiveMap<'K, 'V>, mapp
     member private this.EnsureInitialized() =
         if not initialized then
             initialized <- true
-            // Read first, register after (see MapSetNode.EnsureInitialized in
-            // SetNodes.fs: a dirty source draining during the load would
-            // otherwise push its delta into the journal, and the subsequent
-            // drain would double-apply it).
-            Collections.loadMap mapping source &state
+            // Snapshot first, register between, then run the mapping over the
+            // snapshot (see MapSetNode.EnsureInitialized in SetNodes.fs): the
+            // mapping is user code that may write to the source, and the write
+            // must land in our journal. A dirty source draining during the
+            // snapshot read pushes to nobody: no double-apply.
+            let snapshot = Dictionary<'K, 'V>()
+
+            for KeyValue(k, v) in source.GetValue() do
+                snapshot[k] <- v
+
             this.Register()
+            Collections.loadMap mapping snapshot &state
             state.DepVersions[0] <- source.Version
 
     interface IMapDeltaSink<'K, 'V> with
@@ -126,9 +132,14 @@ type FilterMapNode<'K, 'V when 'K: equality>
     member private this.EnsureInitialized() =
         if not initialized then
             initialized <- true
-            // Read first, register after (see MapMapNode.EnsureInitialized).
-            Collections.loadMap mapOpt source &state
+            // Snapshot first, register between (see MapMapNode.EnsureInitialized).
+            let snapshot = Dictionary<'K, 'V>()
+
+            for KeyValue(k, v) in source.GetValue() do
+                snapshot[k] <- v
+
             this.Register()
+            Collections.loadMap mapOpt snapshot &state
             state.DepVersions[0] <- source.Version
 
     interface IMapDeltaSink<'K, 'V> with
@@ -248,9 +259,19 @@ type Choose2MapNode<'K, 'V1, 'V2, 'V3 when 'K: equality>
     member private this.EnsureInitialized() =
         if not initialized then
             initialized <- true
-            // Read first, register after (see MapMapNode.EnsureInitialized).
-            Collections.loadChoose2 mapping left right &state
+            // Snapshot first, register between (see MapMapNode.EnsureInitialized).
+            let leftSnapshot = Dictionary<'K, 'V1>()
+
+            for KeyValue(k, v) in left.GetValue() do
+                leftSnapshot[k] <- v
+
+            let rightSnapshot = Dictionary<'K, 'V2>()
+
+            for KeyValue(k, v) in right.GetValue() do
+                rightSnapshot[k] <- v
+
             this.Register()
+            Collections.loadChoose2 mapping leftSnapshot rightSnapshot &state
             state.DepVersions[0] <- left.Version
             state.DepVersions[1] <- right.Version
 
@@ -366,13 +387,14 @@ type SetToMapNode<'K, 'V, 'T when 'K: equality>(source: IAdaptiveSet<'T>, toEntr
     member private this.EnsureInitialized() =
         if not initialized then
             initialized <- true
-            // Read first, register after (see MapMapNode.EnsureInitialized).
+            // Snapshot first, register between (see MapMapNode.EnsureInitialized).
+            let snapshot = HashSet<'T>(source.GetValue())
+            this.Register()
 
-            for item in source.GetValue() do
+            for item in snapshot do
                 let (k, v) = toEntry item
                 state.Data[k] <- v
 
-            this.Register()
             state.DepVersions[0] <- source.Version
 
     interface ISetDeltaSink<'T> with
@@ -569,9 +591,11 @@ type SetToMapKeepAllNode<'K, 'V, 'T when 'K: equality>(source: IAdaptiveSet<'T>,
     member private this.EnsureInitialized() =
         if not initialized then
             initialized <- true
-            // Read first, register after (see MapMapNode.EnsureInitialized).
+            // Snapshot first, register between (see MapMapNode.EnsureInitialized).
+            let snapshot = HashSet<'T>(source.GetValue())
+            this.Register()
 
-            for item in source.GetValue() do
+            for item in snapshot do
                 let (k, v) = toEntry item
                 let mutable set = Unchecked.defaultof<HashSet<'V>>
 
@@ -582,7 +606,6 @@ type SetToMapKeepAllNode<'K, 'V, 'T when 'K: equality>(source: IAdaptiveSet<'T>,
                     fresh.Add v |> ignore
                     state.Data[k] <- fresh
 
-            this.Register()
             state.DepVersions[0] <- source.Version
 
     interface ISetDeltaSink<'T> with
@@ -792,15 +815,20 @@ type MapToSetNode<'K, 'V, 'T when 'K: equality and 'T: equality>(source: IAdapti
     member private this.EnsureInitialized() =
         if not initialized then
             initialized <- true
-            // Read first, register after (see MapMapNode.EnsureInitialized).
+            // Snapshot first, register between (see MapMapNode.EnsureInitialized).
+            let snapshot = Dictionary<'K, 'V>()
 
             for KeyValue(k, v) in source.GetValue() do
+                snapshot[k] <- v
+
+            this.Register()
+
+            for KeyValue(k, v) in snapshot do
                 let t = select k v
                 state.Mirror[k] <- t
                 let struct (out2, _) = Collections.refAdd state.Out t
                 state.Out <- out2
 
-            this.Register()
             state.DepVersions[0] <- source.Version
 
     interface IMapDeltaSink<'K, 'V> with

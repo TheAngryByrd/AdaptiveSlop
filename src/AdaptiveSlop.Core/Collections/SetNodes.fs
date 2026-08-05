@@ -59,13 +59,15 @@ type MapSetNode<'T, 'U when 'U: equality>(source: IAdaptiveSet<'T>, mapping: 'T 
     member private this.EnsureInitialized() =
         if not initialized then
             initialized <- true
-            // Read first, register after: the view is complete, and the sink
-            // sees only deltas that follow. A dirty source draining during the
-            // load would otherwise push its delta into the journal, and the
-            // subsequent drain would double-apply it (measured phantom
-            // refcount; see the "dirty derived source at first read" test).
-            Collections.loadRefSet mapping source &state
+            // Snapshot first, register between, then run the mapping over the
+            // snapshot: the mapping is user code that may write to the source
+            // (the transient view must not be iterated while it is mutated),
+            // and the write must land in our journal (register before the
+            // mapping runs). A dirty source draining during the snapshot read
+            // pushes to nobody: no double-apply.
+            let snapshot = HashSet<'T>(source.GetValue())
             this.Register()
+            Collections.loadRefSet mapping snapshot &state
             state.DepVersions[0] <- source.Version
 
     interface ISetDeltaSink<'T> with
@@ -138,9 +140,10 @@ type FilterSetNode<'T when 'T: equality>(source: IAdaptiveSet<'T>, [<InlineIfLam
     member private this.EnsureInitialized() =
         if not initialized then
             initialized <- true
-            // Read first, register after (see MapSetNode.EnsureInitialized).
-            Collections.loadPlainSet mapOpt source &state
+            // Snapshot first, register between (see MapSetNode.EnsureInitialized).
+            let snapshot = HashSet<'T>(source.GetValue())
             this.Register()
+            Collections.loadPlainSet mapOpt snapshot &state
             state.DepVersions[0] <- source.Version
 
     interface ISetDeltaSink<'T> with
@@ -213,11 +216,14 @@ type UnionSetNode<'T when 'T: equality>(left: IAdaptiveSet<'T>, right: IAdaptive
     member private this.EnsureInitialized() =
         if not initialized then
             initialized <- true
-            // Read first, register after (see MapSetNode.EnsureInitialized).
-            Collections.loadRefSet Id.identityV left &state
-            Collections.loadRefSet Id.identityV right &state
+            // Snapshot first, register between (see MapSetNode.EnsureInitialized).
+            // The identity mapping cannot write; the snapshot is for uniformity.
+            let leftSnapshot = HashSet<'T>(left.GetValue())
+            let rightSnapshot = HashSet<'T>(right.GetValue())
             this.RegisterSide left
             this.RegisterSide right
+            Collections.loadRefSet Id.identityV leftSnapshot &state
+            Collections.loadRefSet Id.identityV rightSnapshot &state
             state.DepVersions[0] <- left.Version
             state.DepVersions[1] <- right.Version
 
@@ -604,11 +610,17 @@ type CollectSetNode<'T, 'U when 'T: equality and 'U: equality>
     member private this.EnsureInitialized() =
         if not initialized then
             initialized <- true
-            // Read the source view first; register the sink after (the view is
-            // complete, and the sink sees only deltas that follow this point).
-            let view = source.GetValue()
+            // Snapshot the source view first, then register, then run the
+            // mapping over the snapshot: the mapping is user code that may
+            // write to the source (the transient view must not be iterated
+            // while it is mutated), and the write must land in our journal.
+            let snapshot = HashSet<'T>(source.GetValue())
 
-            for x in view do
+            match box source with
+            | :? ISetSinkRegistry as r -> r.AddSetSink(box this)
+            | _ -> ()
+
+            for x in snapshot do
                 let inner = mapping x
                 let innerView = inner.GetValue()
                 let mutable entry = Collections.CollectEntry<'U>(inner)
@@ -628,10 +640,6 @@ type CollectSetNode<'T, 'U when 'T: equality and 'U: equality>
 
                 entry.Version <- inner.Version
                 state.Inner[x] <- entry
-
-            match box source with
-            | :? ISetSinkRegistry as r -> r.AddSetSink(box this)
-            | _ -> ()
 
             state.DepVersions[0] <- source.Version
 
