@@ -5303,3 +5303,100 @@ let ``AList mapUsei disposes the replaced value on update`` () =
 
     disp.Dispose()
     Assert.Equal(2, disposes)
+
+// =============================================================================
+// Bring list — AList bind/slices/concat group (gap sheet §5.2, §5.4, §5.1.5).
+// =============================================================================
+
+[<Fact>]
+let ``AList bind follows the value and the inner list`` () =
+    let selected = CVal.create 0
+    let lists = [| CList.ofSeq [ 1; 2 ]; CList.ofSeq [ 3 ] |]
+
+    let bound = AList.bind (fun i -> CList.value lists[i]) (CVal.value selected)
+
+    Assert.Equal<int[]>([| 1; 2 |], AList.toArray bound)
+
+    CList.append 9 (lists[0]) // the bound inner's changes propagate
+    Assert.Equal<int[]>([| 1; 2; 9 |], AList.toArray bound)
+
+    CVal.set 1 selected // swap to the second inner
+    Assert.Equal<int[]>([| 3 |], AList.toArray bound)
+
+    CList.append 8 (lists[0]) // the unbound inner no longer leaks
+    Assert.Equal<int[]>([| 3 |], AList.toArray bound)
+
+[<Fact>]
+let ``AList bind2 and bind3 remap when any input changes`` () =
+    let a = CVal.create 0
+    let b = CVal.create 0
+    let lists = [| CList.ofSeq [ 1 ]; CList.ofSeq [ 2 ]; CList.ofSeq [ 3 ] |]
+
+    let combined =
+        AList.bind2 (fun av bv -> CList.value lists[av + bv]) (CVal.value a) (CVal.value b)
+
+    Assert.Equal<int[]>([| 1 |], AList.toArray combined)
+
+    CVal.set 1 b
+    Assert.Equal<int[]>([| 2 |], AList.toArray combined)
+
+    CVal.set 1 a
+    Assert.Equal<int[]>([| 3 |], AList.toArray combined)
+
+    let c = CVal.create 0
+
+    let combined3 =
+        AList.bind3 (fun av bv cv -> CList.value lists[av + bv + cv]) (CVal.value a) (CVal.value b) (CVal.value c)
+
+    Assert.Equal<int[]>([| 3 |], AList.toArray combined3)
+
+    CVal.set 0 c // a+b+c = 2: the third list
+    CVal.set 0 a
+    Assert.Equal<int[]>([| 2 |], AList.toArray combined3)
+
+[<Fact>]
+let ``AList concat concatenates the inner lists`` () =
+    let a = CList.ofSeq [ 1; 2 ]
+    let b = CList.ofSeq [ 3 ]
+    let c = CList.ofSeq [ 4; 5 ]
+
+    let all = AList.concat [ CList.value a; CList.value b; CList.value c ]
+
+    Assert.Equal<int[]>([| 1; 2; 3; 4; 5 |], AList.toArray all)
+
+    CList.append 9 b
+    Assert.Equal<int[]>([| 1; 2; 3; 9; 4; 5 |], AList.toArray all)
+
+    CList.append 6 c
+    Assert.Equal<int[]>([| 1; 2; 3; 9; 4; 5; 6 |], AList.toArray all)
+
+[<Fact>]
+let ``AList take skip and sub follow adaptive bounds`` () =
+    let l = CList.ofSeq [ 0; 1; 2; 3; 4 ]
+
+    let t = AList.take 2 (CList.value l)
+    Assert.Equal<int[]>([| 0; 1 |], AList.toArray t)
+
+    let s = AList.skip 2 (CList.value l)
+    Assert.Equal<int[]>([| 2; 3; 4 |], AList.toArray s)
+
+    let sub = AList.sub 1 2 (CList.value l)
+    Assert.Equal<int[]>([| 1; 2 |], AList.toArray sub)
+
+    let count = CVal.create 2
+    let ta = AList.takeA (CVal.value count) (CList.value l)
+    Assert.Equal<int[]>([| 0; 1 |], AList.toArray ta)
+
+    CVal.set 4 count
+    Assert.Equal<int[]>([| 0; 1; 2; 3 |], AList.toArray ta)
+
+    let offset = CVal.create 1
+    let c = CVal.create 2
+    let sa = AList.subA (CVal.value offset) (CVal.value c) (CList.value l)
+    Assert.Equal<int[]>([| 1; 2 |], AList.toArray sa)
+
+    CVal.set 3 offset
+    Assert.Equal<int[]>([| 3; 4 |], AList.toArray sa)
+
+    CVal.set 1 c
+    Assert.Equal<int[]>([| 3 |], AList.toArray sa)

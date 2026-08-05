@@ -1376,6 +1376,84 @@ module AList =
         )
 
     /// <summary>
+    /// Adaptively maps over the given value and returns the resulting list
+    /// (FDA <c>AList.bind</c> parity). When the value changes, <c>mapping</c>
+    /// selects the new inner list; the output is rebuilt on any change (the
+    /// value's or the inner list's), emitting the positional diff.
+    /// </summary>
+    let inline bind ([<InlineIfLambda>] mapping: 'T -> alist<'U>) (value: aval<'T>) : alist<'U> =
+        new BindListNode<'T, 'U>(value, mapping)
+
+    /// <summary>
+    /// Adaptively maps over the two values and returns the resulting list
+    /// (FDA <c>AList.bind2</c> parity). Composed as one bind over the mapped
+    /// pair (the ASet lesson: nested binds miss the inner bind's swap, which
+    /// signals by version only, not by delta).
+    /// </summary>
+    let inline bind2
+        ([<InlineIfLambda>] mapping: 'A -> 'B -> alist<'C>)
+        (a: aval<'A>)
+        (b: aval<'B>)
+        : alist<'C> =
+        bind (fun (av, bv) -> mapping av bv) (AVal.map2 (fun av bv -> (av, bv)) a b)
+
+    /// <summary>
+    /// Adaptively maps over the three values and returns the resulting list
+    /// (FDA <c>AList.bind3</c> parity).
+    /// </summary>
+    let inline bind3
+        ([<InlineIfLambda>] mapping: 'A -> 'B -> 'C -> alist<'D>)
+        (a: aval<'A>)
+        (b: aval<'B>)
+        (c: aval<'C>)
+        : alist<'D> =
+        bind (fun (av, bv, cv) -> mapping av bv cv) (AVal.map3 (fun av bv cv -> (av, bv, cv)) a b c)
+
+    /// <summary>
+    /// Concatenates a fixed sequence of lists (FDA <c>AList.concat</c> parity,
+    /// poll node; generalizes <see cref="append"/>).
+    /// </summary>
+    let inline concat (lists: #seq<alist<'T>>) : alist<'T> =
+        new ConcatListNode<'T>(Seq.toArray lists)
+
+    /// <summary>
+    /// The window <c>[offset, offset + count)</c> of the list (FDA
+    /// <c>AList.subA</c> parity, poll node; the bounds are adaptive).
+    /// </summary>
+    let inline subA (offset: aval<int>) (count: aval<int>) (list: alist<'T>) : alist<'T> =
+        new PollListSourceNode<'T, 'T>(
+            list,
+            fun view ->
+                let o = max 0 (offset.GetValue())
+                let c = max 0 (count.GetValue())
+                let start = min o view.Count
+                let n = min c (view.Count - start)
+                let next = ResizeArray<'T>(n)
+
+                for i in start .. start + n - 1 do
+                    next.Add view[i]
+
+                next
+        )
+
+    /// <summary>The window <c>[offset, offset + count)</c> of the list (FDA <c>AList.sub</c> parity).</summary>
+    let inline sub (offset: int) (count: int) (list: alist<'T>) : alist<'T> =
+        subA (AVal.constant offset) (AVal.constant count) list
+
+    /// <summary>The first <c>count</c> elements (FDA <c>AList.takeA</c> parity).</summary>
+    let inline takeA (count: aval<int>) (list: alist<'T>) : alist<'T> = subA (AVal.constant 0) count list
+
+    /// <summary>The first <c>count</c> elements (FDA <c>AList.take</c> parity).</summary>
+    let inline take (count: int) (list: alist<'T>) : alist<'T> = takeA (AVal.constant count) list
+
+    /// <summary>All elements after the first <c>count</c> (FDA <c>AList.skipA</c> parity).</summary>
+    let inline skipA (count: aval<int>) (list: alist<'T>) : alist<'T> =
+        subA count (AVal.constant System.Int32.MaxValue) list
+
+    /// <summary>All elements after the first <c>count</c> (FDA <c>AList.skip</c> parity).</summary>
+    let inline skip (count: int) (list: alist<'T>) : alist<'T> = skipA (AVal.constant count) list
+
+    /// <summary>
     /// Sorts the list with the given comparison (FDA <c>AList.sortWith</c>
     /// parity, stable, poll node).
     /// </summary>

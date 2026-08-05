@@ -599,6 +599,150 @@ type CustomListNode<'T when 'T: equality>([<InlineIfLambda>] compute: IReadOnlyL
         member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
 
 /// <summary>
+/// An adaptive list bound to a scalar value (FDA <c>AList.bind</c> parity):
+/// <c>mapping value</c> selects the inner list; when the value or the inner
+/// list changes, the output is rebuilt and the positional diff is emitted.
+/// The mapping runs only when the value changed. Rebuild-on-change semantics:
+/// the deltas are full replaces (the inner list's own deltas are not streamed).
+/// </summary>
+type BindListNode<'T, 'U>
+    (value: IAdaptiveValue<'T>, [<InlineIfLambda>] mapping: 'T -> IAdaptiveList<'U>) =
+    let mutable data = ResizeArray<'U>()
+    let mutable out = ListDelta<'U>.Create()
+    let mutable version = 0L
+    let mutable sinks = SinkList.Create()
+    let edges = ParentEdges()
+    let mutable hasInner = false
+    let mutable current: 'T = Unchecked.defaultof<'T>
+    let mutable inner: IAdaptiveList<'U> = Unchecked.defaultof<IAdaptiveList<'U>>
+    let mutable lastValueVersion = -1L
+    let mutable lastInnerVersion = -1L
+    let mutable disposed = false
+
+    member private this.Poll() =
+        if not disposed then
+            let v = value.GetValue()
+
+            if not hasInner || not (EqualityComparer<'T>.Default.Equals(v, current)) then
+                current <- v
+                inner <- mapping v
+                hasInner <- true
+
+            let innerView = inner.GetValue()
+
+            if value.Version <> lastValueVersion || inner.Version <> lastInnerVersion then
+                lastValueVersion <- value.Version
+                lastInnerVersion <- inner.Version
+                let next = ResizeArray<'U>(innerView)
+
+                if Collections.rebuildListDiff next data &out then
+                    version <- version + 1L
+                    Collections.pushAndMarkList out &sinks edges
+
+                out.Clear()
+
+    interface IAdaptiveList<'U> with
+        member this.GetValue() =
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
+
+            try
+                if disposed then
+                    invalidOp "This adaptive list has been disposed."
+
+                this.Poll()
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                data :> IReadOnlyList<'U>
+            finally
+                ctx.ReleaseOwner()
+
+        member this.Version =
+            this.Poll()
+            version
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                Collections.clearSinks &sinks
+
+    interface IListSinkRegistry with
+        member this.AddListSink(sink) = Collections.addSink &sinks sink
+
+        member this.RemoveListSink(sink) =
+            Collections.removeSink &sinks sink
+
+    interface IEdgeTarget with
+        member _.EdgeCount = edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
+
+/// <summary>
+/// Concatenates a fixed sequence of lists (FDA <c>AList.concat</c> parity,
+/// poll node): every read re-reads all inner lists and emits the positional
+/// diff of the concatenation.
+/// </summary>
+type ConcatListNode<'T>(sources: IAdaptiveList<'T>[]) =
+    let mutable data = ResizeArray<'T>()
+    let mutable out = ListDelta<'T>.Create()
+    let mutable version = 0L
+    let mutable sinks = SinkList.Create()
+    let edges = ParentEdges()
+    let mutable disposed = false
+
+    member private this.Poll() =
+        if not disposed then
+            let next = ResizeArray<'T>()
+
+            for s in sources do
+                let view = s.GetValue()
+
+                for i in 0 .. view.Count - 1 do
+                    next.Add view[i]
+
+            if Collections.rebuildListDiff next data &out then
+                version <- version + 1L
+                Collections.pushAndMarkList out &sinks edges
+
+            out.Clear()
+
+    interface IAdaptiveList<'T> with
+        member this.GetValue() =
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
+
+            try
+                if disposed then
+                    invalidOp "This adaptive list has been disposed."
+
+                this.Poll()
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                data :> IReadOnlyList<'T>
+            finally
+                ctx.ReleaseOwner()
+
+        member this.Version =
+            this.Poll()
+            version
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                Collections.clearSinks &sinks
+
+    interface IListSinkRegistry with
+        member this.AddListSink(sink) = Collections.addSink &sinks sink
+
+        member this.RemoveListSink(sink) =
+            Collections.removeSink &sinks sink
+
+    interface IEdgeTarget with
+        member _.EdgeCount = edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
+
+/// <summary>
 /// An adaptive list over an adaptive value of a sequence (FDA
 /// <c>AList.ofAVal</c> parity). Every change of the value replaces the whole
 /// state and emits the positional diff as the delta. Poll model: the value is
