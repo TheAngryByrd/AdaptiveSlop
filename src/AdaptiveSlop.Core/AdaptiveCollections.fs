@@ -3,7 +3,6 @@ namespace AdaptiveSlop.Core
 open System
 open System.Buffers
 open System.Collections.Generic
-open System.Threading
 
 // =============================================================================
 // Constant adaptive collections
@@ -32,7 +31,6 @@ type ConstantMap<'K, 'V when 'K: comparison>(value: Map<'K, 'V>) =
 type MapSetNode<'T, 'U when 'T: comparison and 'U: comparison>
     (source: IAdaptiveSet<'T>, [<InlineIfLambda>] mapping: 'T -> 'U) as this =
 
-    let syncRoot = obj ()
     let mutable version = 0L
     let data = HashSet<'U>()
     let refcounts = Dictionary<'U, int>()
@@ -78,46 +76,36 @@ type MapSetNode<'T, 'U when 'T: comparison and 'U: comparison>
             | _ -> ()
 
     member internal this.AddSink(sink: ISetDeltaSink<'U>) =
-        Monitor.Enter syncRoot
+        if sinkCount = sinks.Length then
+            let next = Array.zeroCreate (sinks.Length * 2)
+            Array.Copy(sinks, next, sinks.Length)
+            sinks <- next
 
-        try
-            if sinkCount = sinks.Length then
-                let next = Array.zeroCreate (sinks.Length * 2)
-                Array.Copy(sinks, next, sinks.Length)
-                sinks <- next
-
-            sinks[sinkCount] <- box sink
-            sinkCount <- sinkCount + 1
-        finally
-            Monitor.Exit syncRoot
+        sinks[sinkCount] <- box sink
+        sinkCount <- sinkCount + 1
 
         if sinkCount = 1 then
             this.Register()
 
     member internal this.RemoveSink(sink: ISetDeltaSink<'U>) =
         let mutable becameZero = false
-        Monitor.Enter syncRoot
+        let mutable found = -1
+        let mutable i = 0
 
-        try
-            let mutable found = -1
-            let mutable i = 0
+        while found < 0 && i < sinkCount do
+            if obj.ReferenceEquals(sinks[i], box sink) then
+                found <- i
+            else
+                i <- i + 1
 
-            while found < 0 && i < sinkCount do
-                if obj.ReferenceEquals(sinks[i], box sink) then
-                    found <- i
-                else
-                    i <- i + 1
+        if found >= 0 then
+            sinkCount <- sinkCount - 1
 
-            if found >= 0 then
-                sinkCount <- sinkCount - 1
+            for j in found .. sinkCount - 1 do
+                sinks[j] <- sinks[j + 1]
 
-                for j in found .. sinkCount - 1 do
-                    sinks[j] <- sinks[j + 1]
-
-                sinks[sinkCount] <- null
-                becameZero <- sinkCount = 0
-        finally
-            Monitor.Exit syncRoot
+            sinks[sinkCount] <- null
+            becameZero <- sinkCount = 0
 
         if becameZero then
             this.Unregister()
@@ -125,17 +113,12 @@ type MapSetNode<'T, 'U when 'T: comparison and 'U: comparison>
     member private this.FlushDeltas(ver: int64, adds: 'U[], addCnt: int, rems: 'U[], remCnt: int) =
         if addCnt > 0 || remCnt > 0 then
             let sinksSnapshot =
-                Monitor.Enter syncRoot
-
-                try
-                    if sinkCount = 0 then
-                        [||]
-                    else
-                        let arr = Array.zeroCreate sinkCount
-                        Array.Copy(sinks, arr, sinkCount)
-                        arr
-                finally
-                    Monitor.Exit syncRoot
+                if sinkCount = 0 then
+                    [||]
+                else
+                    let arr = Array.zeroCreate sinkCount
+                    Array.Copy(sinks, arr, sinkCount)
+                    arr
 
             for i in 0 .. sinksSnapshot.Length - 1 do
                 (unbox<ISetDeltaSink<'U>> sinksSnapshot[i]).OnDeltas(ver, adds, addCnt, rems, remCnt)
@@ -156,41 +139,37 @@ type MapSetNode<'T, 'U when 'T: comparison and 'U: comparison>
 
             let mutable ownAddCnt = 0
             let mutable ownRemCnt = 0
-            Monitor.Enter syncRoot
 
-            try
-                for i in 0 .. remCnt - 1 do
-                    let y = mapping rems[i]
+            for i in 0 .. remCnt - 1 do
+                let y = mapping rems[i]
 
-                    match refcounts.TryGetValue y with
-                    | true, 1 ->
-                        refcounts.Remove y |> ignore
-                        data.Remove y |> ignore
-                        snapshot <- Set.remove y snapshot
-                        ownRems[ownRemCnt] <- y
-                        ownRemCnt <- ownRemCnt + 1
-                    | true, n -> refcounts[y] <- n - 1
-                    | _ -> ()
+                match refcounts.TryGetValue y with
+                | true, 1 ->
+                    refcounts.Remove y |> ignore
+                    data.Remove y |> ignore
+                    snapshot <- Set.remove y snapshot
+                    ownRems[ownRemCnt] <- y
+                    ownRemCnt <- ownRemCnt + 1
+                | true, n -> refcounts[y] <- n - 1
+                | _ -> ()
 
-                for i in 0 .. addCnt - 1 do
-                    let y = mapping adds[i]
+            for i in 0 .. addCnt - 1 do
+                let y = mapping adds[i]
 
-                    match refcounts.TryGetValue y with
-                    | true, n ->
-                        refcounts[y] <- n + 1
-                        ownAdds[ownAddCnt] <- y
-                        ownAddCnt <- ownAddCnt + 1
-                    | _ ->
-                        refcounts[y] <- 1
-                        data.Add y |> ignore
-                        snapshot <- Set.add y snapshot
-                        ownAdds[ownAddCnt] <- y
-                        ownAddCnt <- ownAddCnt + 1
+                match refcounts.TryGetValue y with
+                | true, n ->
+                    refcounts[y] <- n + 1
+                    ownAdds[ownAddCnt] <- y
+                    ownAddCnt <- ownAddCnt + 1
+                | _ ->
+                    refcounts[y] <- 1
+                    data.Add y |> ignore
+                    snapshot <- Set.add y snapshot
+                    ownAdds[ownAddCnt] <- y
+                    ownAddCnt <- ownAddCnt + 1
 
-                version <- ver
-                snapshotVersion <- ver
-            finally
-                Monitor.Exit syncRoot
+            version <- ver
+            snapshotVersion <- ver
 
             this.FlushDeltas(ver, ownAdds, ownAddCnt, ownRems, ownRemCnt)
             ArrayPool<'U>.Shared.Return(ownAdds, true)
@@ -198,16 +177,17 @@ type MapSetNode<'T, 'U when 'T: comparison and 'U: comparison>
 
     interface IAdaptiveSet<'U> with
         member this.GetValue() =
-            Monitor.Enter syncRoot
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
 
             try
                 this.DoInitialLoad()
                 AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
                 snapshot
             finally
-                Monitor.Exit syncRoot
+                ctx.ReleaseOwner()
 
-        member _.Version = Interlocked.Read &version
+        member _.Version = version
 
     interface ISetSinkRegistry with
         member this.AddSetSink(sink) =
@@ -219,7 +199,6 @@ type MapSetNode<'T, 'U when 'T: comparison and 'U: comparison>
 
 type FilterSetNode<'T when 'T: comparison>(source: IAdaptiveSet<'T>, [<InlineIfLambda>] predicate: 'T -> bool) as this =
 
-    let syncRoot = obj ()
     let mutable version = 0L
     let data = HashSet<'T>()
     let refcounts = Dictionary<'T, int>()
@@ -265,46 +244,36 @@ type FilterSetNode<'T when 'T: comparison>(source: IAdaptiveSet<'T>, [<InlineIfL
             | _ -> ()
 
     member internal this.AddSink(sink: ISetDeltaSink<'T>) =
-        Monitor.Enter syncRoot
+        if sinkCount = sinks.Length then
+            let next = Array.zeroCreate (sinks.Length * 2)
+            Array.Copy(sinks, next, sinks.Length)
+            sinks <- next
 
-        try
-            if sinkCount = sinks.Length then
-                let next = Array.zeroCreate (sinks.Length * 2)
-                Array.Copy(sinks, next, sinks.Length)
-                sinks <- next
-
-            sinks[sinkCount] <- box sink
-            sinkCount <- sinkCount + 1
-        finally
-            Monitor.Exit syncRoot
+        sinks[sinkCount] <- box sink
+        sinkCount <- sinkCount + 1
 
         if sinkCount = 1 then
             this.Register()
 
     member internal this.RemoveSink(sink: ISetDeltaSink<'T>) =
         let mutable becameZero = false
-        Monitor.Enter syncRoot
+        let mutable found = -1
+        let mutable i = 0
 
-        try
-            let mutable found = -1
-            let mutable i = 0
+        while found < 0 && i < sinkCount do
+            if obj.ReferenceEquals(sinks[i], box sink) then
+                found <- i
+            else
+                i <- i + 1
 
-            while found < 0 && i < sinkCount do
-                if obj.ReferenceEquals(sinks[i], box sink) then
-                    found <- i
-                else
-                    i <- i + 1
+        if found >= 0 then
+            sinkCount <- sinkCount - 1
 
-            if found >= 0 then
-                sinkCount <- sinkCount - 1
+            for j in found .. sinkCount - 1 do
+                sinks[j] <- sinks[j + 1]
 
-                for j in found .. sinkCount - 1 do
-                    sinks[j] <- sinks[j + 1]
-
-                sinks[sinkCount] <- null
-                becameZero <- sinkCount = 0
-        finally
-            Monitor.Exit syncRoot
+            sinks[sinkCount] <- null
+            becameZero <- sinkCount = 0
 
         if becameZero then
             this.Unregister()
@@ -312,17 +281,12 @@ type FilterSetNode<'T when 'T: comparison>(source: IAdaptiveSet<'T>, [<InlineIfL
     member private this.FlushDeltas(ver: int64, adds: 'T[], addCnt: int, rems: 'T[], remCnt: int) =
         if addCnt > 0 || remCnt > 0 then
             let sinksSnapshot =
-                Monitor.Enter syncRoot
-
-                try
-                    if sinkCount = 0 then
-                        [||]
-                    else
-                        let arr = Array.zeroCreate sinkCount
-                        Array.Copy(sinks, arr, sinkCount)
-                        arr
-                finally
-                    Monitor.Exit syncRoot
+                if sinkCount = 0 then
+                    [||]
+                else
+                    let arr = Array.zeroCreate sinkCount
+                    Array.Copy(sinks, arr, sinkCount)
+                    arr
 
             for i in 0 .. sinksSnapshot.Length - 1 do
                 (unbox<ISetDeltaSink<'T>> sinksSnapshot[i]).OnDeltas(ver, adds, addCnt, rems, remCnt)
@@ -343,42 +307,38 @@ type FilterSetNode<'T when 'T: comparison>(source: IAdaptiveSet<'T>, [<InlineIfL
 
             let mutable ownAddCnt = 0
             let mutable ownRemCnt = 0
-            Monitor.Enter syncRoot
 
-            try
-                for i in 0 .. remCnt - 1 do
-                    let x = rems[i]
+            for i in 0 .. remCnt - 1 do
+                let x = rems[i]
 
+                match refcounts.TryGetValue x with
+                | true, 1 ->
+                    refcounts.Remove x |> ignore
+                    data.Remove x |> ignore
+                    snapshot <- Set.remove x snapshot
+                    ownRems[ownRemCnt] <- x
+                    ownRemCnt <- ownRemCnt + 1
+                | true, n -> refcounts[x] <- n - 1
+                | _ -> ()
+
+            for i in 0 .. addCnt - 1 do
+                let x = adds[i]
+
+                if predicate x then
                     match refcounts.TryGetValue x with
-                    | true, 1 ->
-                        refcounts.Remove x |> ignore
-                        data.Remove x |> ignore
-                        snapshot <- Set.remove x snapshot
-                        ownRems[ownRemCnt] <- x
-                        ownRemCnt <- ownRemCnt + 1
-                    | true, n -> refcounts[x] <- n - 1
-                    | _ -> ()
+                    | true, n ->
+                        refcounts[x] <- n + 1
+                        ownAdds[ownAddCnt] <- x
+                        ownAddCnt <- ownAddCnt + 1
+                    | _ ->
+                        refcounts[x] <- 1
+                        data.Add x |> ignore
+                        snapshot <- Set.add x snapshot
+                        ownAdds[ownAddCnt] <- x
+                        ownAddCnt <- ownAddCnt + 1
 
-                for i in 0 .. addCnt - 1 do
-                    let x = adds[i]
-
-                    if predicate x then
-                        match refcounts.TryGetValue x with
-                        | true, n ->
-                            refcounts[x] <- n + 1
-                            ownAdds[ownAddCnt] <- x
-                            ownAddCnt <- ownAddCnt + 1
-                        | _ ->
-                            refcounts[x] <- 1
-                            data.Add x |> ignore
-                            snapshot <- Set.add x snapshot
-                            ownAdds[ownAddCnt] <- x
-                            ownAddCnt <- ownAddCnt + 1
-
-                version <- ver
-                snapshotVersion <- ver
-            finally
-                Monitor.Exit syncRoot
+            version <- ver
+            snapshotVersion <- ver
 
             this.FlushDeltas(ver, ownAdds, ownAddCnt, ownRems, ownRemCnt)
             ArrayPool<'T>.Shared.Return(ownAdds, true)
@@ -386,16 +346,17 @@ type FilterSetNode<'T when 'T: comparison>(source: IAdaptiveSet<'T>, [<InlineIfL
 
     interface IAdaptiveSet<'T> with
         member this.GetValue() =
-            Monitor.Enter syncRoot
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
 
             try
                 this.DoInitialLoad()
                 AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
                 snapshot
             finally
-                Monitor.Exit syncRoot
+                ctx.ReleaseOwner()
 
-        member _.Version = Interlocked.Read &version
+        member _.Version = version
 
     interface ISetSinkRegistry with
         member this.AddSetSink(sink) =
@@ -407,7 +368,6 @@ type FilterSetNode<'T when 'T: comparison>(source: IAdaptiveSet<'T>, [<InlineIfL
 
 type UnionSetNode<'T when 'T: comparison>(left: IAdaptiveSet<'T>, right: IAdaptiveSet<'T>) as this =
 
-    let syncRoot = obj ()
     let mutable version = 0L
     let data = HashSet<'T>()
     let refcounts = Dictionary<'T, int>()
@@ -460,22 +420,17 @@ type UnionSetNode<'T when 'T: comparison>(left: IAdaptiveSet<'T>, right: IAdapti
         | _ -> ()
 
     member internal this.AddSink(sink: ISetDeltaSink<'T>) =
-        Monitor.Enter syncRoot
+        if sinkCount = sinks.Length then
+            let next = Array.zeroCreate (sinks.Length * 2)
+            Array.Copy(sinks, next, sinks.Length)
+            sinks <- next
 
-        try
-            if sinkCount = sinks.Length then
-                let next = Array.zeroCreate (sinks.Length * 2)
-                Array.Copy(sinks, next, sinks.Length)
-                sinks <- next
+        sinks[sinkCount] <- box sink
+        sinkCount <- sinkCount + 1
 
-            sinks[sinkCount] <- box sink
-            sinkCount <- sinkCount + 1
-
-            if sinkCount = 1 then
-                regLeft <- true
-                regRight <- true
-        finally
-            Monitor.Exit syncRoot
+        if sinkCount = 1 then
+            regLeft <- true
+            regRight <- true
 
         if sinkCount = 1 then
             this.RegisterSide left
@@ -483,28 +438,23 @@ type UnionSetNode<'T when 'T: comparison>(left: IAdaptiveSet<'T>, right: IAdapti
 
     member internal this.RemoveSink(sink: ISetDeltaSink<'T>) =
         let mutable becameZero = false
-        Monitor.Enter syncRoot
+        let mutable found = -1
+        let mutable i = 0
 
-        try
-            let mutable found = -1
-            let mutable i = 0
+        while found < 0 && i < sinkCount do
+            if obj.ReferenceEquals(sinks[i], box sink) then
+                found <- i
+            else
+                i <- i + 1
 
-            while found < 0 && i < sinkCount do
-                if obj.ReferenceEquals(sinks[i], box sink) then
-                    found <- i
-                else
-                    i <- i + 1
+        if found >= 0 then
+            sinkCount <- sinkCount - 1
 
-            if found >= 0 then
-                sinkCount <- sinkCount - 1
+            for j in found .. sinkCount - 1 do
+                sinks[j] <- sinks[j + 1]
 
-                for j in found .. sinkCount - 1 do
-                    sinks[j] <- sinks[j + 1]
-
-                sinks[sinkCount] <- null
-                becameZero <- sinkCount = 0
-        finally
-            Monitor.Exit syncRoot
+            sinks[sinkCount] <- null
+            becameZero <- sinkCount = 0
 
         if becameZero then
             this.UnregisterSide left
@@ -513,17 +463,12 @@ type UnionSetNode<'T when 'T: comparison>(left: IAdaptiveSet<'T>, right: IAdapti
     member private this.FlushDeltas(ver: int64, adds: 'T[], addCnt: int, rems: 'T[], remCnt: int) =
         if addCnt > 0 || remCnt > 0 then
             let sinksSnapshot =
-                Monitor.Enter syncRoot
-
-                try
-                    if sinkCount = 0 then
-                        [||]
-                    else
-                        let arr = Array.zeroCreate sinkCount
-                        Array.Copy(sinks, arr, sinkCount)
-                        arr
-                finally
-                    Monitor.Exit syncRoot
+                if sinkCount = 0 then
+                    [||]
+                else
+                    let arr = Array.zeroCreate sinkCount
+                    Array.Copy(sinks, arr, sinkCount)
+                    arr
 
             for i in 0 .. sinksSnapshot.Length - 1 do
                 (unbox<ISetDeltaSink<'T>> sinksSnapshot[i]).OnDeltas(ver, adds, addCnt, rems, remCnt)
@@ -548,40 +493,35 @@ type UnionSetNode<'T when 'T: comparison>(left: IAdaptiveSet<'T>, right: IAdapti
             let mutable ownAddCnt = 0
             let mutable ownRemCnt = 0
 
-            Monitor.Enter syncRoot
+            for i in 0 .. remCnt - 1 do
+                let x = rems[i]
 
-            try
-                for i in 0 .. remCnt - 1 do
-                    let x = rems[i]
+                match refcounts.TryGetValue x with
+                | true, 1 ->
+                    refcounts.Remove x |> ignore
+                    data.Remove x |> ignore
+                    snapshot <- Set.remove x snapshot
+                    ownRems[ownRemCnt] <- x
+                    ownRemCnt <- ownRemCnt + 1
+                | true, n -> refcounts[x] <- n - 1
+                | _ -> ()
 
-                    match refcounts.TryGetValue x with
-                    | true, 1 ->
-                        refcounts.Remove x |> ignore
-                        data.Remove x |> ignore
-                        snapshot <- Set.remove x snapshot
-                        ownRems[ownRemCnt] <- x
-                        ownRemCnt <- ownRemCnt + 1
-                    | true, n -> refcounts[x] <- n - 1
-                    | _ -> ()
+            for i in 0 .. addCnt - 1 do
+                let x = adds[i]
 
-                for i in 0 .. addCnt - 1 do
-                    let x = adds[i]
+                match refcounts.TryGetValue x with
+                | true, n -> refcounts[x] <- n + 1
+                | _ ->
+                    refcounts[x] <- 1
+                    data.Add x |> ignore
+                    snapshot <- Set.add x snapshot
+                    ownAdds[ownAddCnt] <- x
+                    ownAddCnt <- ownAddCnt + 1
 
-                    match refcounts.TryGetValue x with
-                    | true, n -> refcounts[x] <- n + 1
-                    | _ ->
-                        refcounts[x] <- 1
-                        data.Add x |> ignore
-                        snapshot <- Set.add x snapshot
-                        ownAdds[ownAddCnt] <- x
-                        ownAddCnt <- ownAddCnt + 1
-
-                snapshotVersion <- version
-            finally
-                Monitor.Exit syncRoot
+            snapshotVersion <- version
 
             if ownAddCnt > 0 || ownRemCnt > 0 then
-                this.FlushDeltas(Interlocked.Read &version, ownAdds, ownAddCnt, ownRems, ownRemCnt)
+                this.FlushDeltas(version, ownAdds, ownAddCnt, ownRems, ownRemCnt)
 
             ArrayPool<'T>.Shared.Return(ownAdds, true)
             ArrayPool<'T>.Shared.Return(ownRems, true)
@@ -597,16 +537,17 @@ type UnionSetNode<'T when 'T: comparison>(left: IAdaptiveSet<'T>, right: IAdapti
 
     interface IAdaptiveSet<'T> with
         member this.GetValue() =
-            Monitor.Enter syncRoot
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
 
             try
                 this.DoInitialLoad()
                 AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
                 snapshot
             finally
-                Monitor.Exit syncRoot
+                ctx.ReleaseOwner()
 
-        member _.Version = Interlocked.Read &version
+        member _.Version = version
 
     interface ISetSinkRegistry with
         member this.AddSetSink(sink) =
@@ -623,7 +564,6 @@ type UnionSetNode<'T when 'T: comparison>(left: IAdaptiveSet<'T>, right: IAdapti
 type MapMapNode<'K, 'V, 'U when 'K: comparison>
     (source: IAdaptiveMap<'K, 'V>, [<InlineIfLambda>] mapping: 'K -> 'V -> 'U) as this =
 
-    let syncRoot = obj ()
     let mutable version = 0L
     let data = Dictionary<'K, 'U>()
     let mutable snapshot = Map.empty<'K, 'U>
@@ -663,46 +603,36 @@ type MapMapNode<'K, 'V, 'U when 'K: comparison>
             | _ -> ()
 
     member internal this.AddSink(sink: IMapDeltaSink<'K, 'U>) =
-        Monitor.Enter syncRoot
+        if sinkCount = sinks.Length then
+            let next = Array.zeroCreate (sinks.Length * 2)
+            Array.Copy(sinks, next, sinks.Length)
+            sinks <- next
 
-        try
-            if sinkCount = sinks.Length then
-                let next = Array.zeroCreate (sinks.Length * 2)
-                Array.Copy(sinks, next, sinks.Length)
-                sinks <- next
-
-            sinks[sinkCount] <- box sink
-            sinkCount <- sinkCount + 1
-        finally
-            Monitor.Exit syncRoot
+        sinks[sinkCount] <- box sink
+        sinkCount <- sinkCount + 1
 
         if sinkCount = 1 then
             this.Register()
 
     member internal this.RemoveSink(sink: IMapDeltaSink<'K, 'U>) =
         let mutable becameZero = false
-        Monitor.Enter syncRoot
+        let mutable found = -1
+        let mutable i = 0
 
-        try
-            let mutable found = -1
-            let mutable i = 0
+        while found < 0 && i < sinkCount do
+            if obj.ReferenceEquals(sinks[i], box sink) then
+                found <- i
+            else
+                i <- i + 1
 
-            while found < 0 && i < sinkCount do
-                if obj.ReferenceEquals(sinks[i], box sink) then
-                    found <- i
-                else
-                    i <- i + 1
+        if found >= 0 then
+            sinkCount <- sinkCount - 1
 
-            if found >= 0 then
-                sinkCount <- sinkCount - 1
+            for j in found .. sinkCount - 1 do
+                sinks[j] <- sinks[j + 1]
 
-                for j in found .. sinkCount - 1 do
-                    sinks[j] <- sinks[j + 1]
-
-                sinks[sinkCount] <- null
-                becameZero <- sinkCount = 0
-        finally
-            Monitor.Exit syncRoot
+            sinks[sinkCount] <- null
+            becameZero <- sinkCount = 0
 
         if becameZero then
             this.Unregister()
@@ -710,17 +640,12 @@ type MapMapNode<'K, 'V, 'U when 'K: comparison>
     member private this.FlushDeltas(ver: int64, sets: struct ('K * 'U)[], setCnt: int, rems: 'K[], remCnt: int) =
         if setCnt > 0 || remCnt > 0 then
             let sinksSnapshot =
-                Monitor.Enter syncRoot
-
-                try
-                    if sinkCount = 0 then
-                        [||]
-                    else
-                        let arr = Array.zeroCreate sinkCount
-                        Array.Copy(sinks, arr, sinkCount)
-                        arr
-                finally
-                    Monitor.Exit syncRoot
+                if sinkCount = 0 then
+                    [||]
+                else
+                    let arr = Array.zeroCreate sinkCount
+                    Array.Copy(sinks, arr, sinkCount)
+                    arr
 
             for i in 0 .. sinksSnapshot.Length - 1 do
                 (unbox<IMapDeltaSink<'K, 'U>> sinksSnapshot[i]).OnDeltas(ver, sets, setCnt, rems, remCnt)
@@ -742,29 +667,24 @@ type MapMapNode<'K, 'V, 'U when 'K: comparison>
             let mutable ownSetCnt = 0
             let mutable ownRemCnt = 0
 
-            Monitor.Enter syncRoot
+            for i in 0 .. remCnt - 1 do
+                let k = rems[i]
 
-            try
-                for i in 0 .. remCnt - 1 do
-                    let k = rems[i]
+                if data.Remove k then
+                    snapshot <- Map.remove k snapshot
+                    ownRems[ownRemCnt] <- k
+                    ownRemCnt <- ownRemCnt + 1
 
-                    if data.Remove k then
-                        snapshot <- Map.remove k snapshot
-                        ownRems[ownRemCnt] <- k
-                        ownRemCnt <- ownRemCnt + 1
+            for i in 0 .. setCnt - 1 do
+                let struct (k, v) = sets[i]
+                let u = mapping k v
+                data[k] <- u
+                snapshot <- Map.add k u snapshot
+                ownSets[ownSetCnt] <- struct (k, u)
+                ownSetCnt <- ownSetCnt + 1
 
-                for i in 0 .. setCnt - 1 do
-                    let struct (k, v) = sets[i]
-                    let u = mapping k v
-                    data[k] <- u
-                    snapshot <- Map.add k u snapshot
-                    ownSets[ownSetCnt] <- struct (k, u)
-                    ownSetCnt <- ownSetCnt + 1
-
-                version <- ver
-                snapshotVersion <- ver
-            finally
-                Monitor.Exit syncRoot
+            version <- ver
+            snapshotVersion <- ver
 
             this.FlushDeltas(ver, ownSets, ownSetCnt, ownRems, ownRemCnt)
             ArrayPool<struct ('K * 'U)>.Shared.Return(ownSets, true)
@@ -772,16 +692,17 @@ type MapMapNode<'K, 'V, 'U when 'K: comparison>
 
     interface IAdaptiveMap<'K, 'U> with
         member this.GetValue() =
-            Monitor.Enter syncRoot
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
 
             try
                 this.DoInitialLoad()
                 AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
                 snapshot
             finally
-                Monitor.Exit syncRoot
+                ctx.ReleaseOwner()
 
-        member _.Version = Interlocked.Read &version
+        member _.Version = version
 
     interface IMapSinkRegistry with
         member this.AddMapSink(sink) =
@@ -794,7 +715,6 @@ type MapMapNode<'K, 'V, 'U when 'K: comparison>
 type FilterMapNode<'K, 'V when 'K: comparison>
     (source: IAdaptiveMap<'K, 'V>, [<InlineIfLambda>] predicate: 'K -> 'V -> bool) as this =
 
-    let syncRoot = obj ()
     let mutable version = 0L
     let data = Dictionary<'K, 'V>()
     let mutable snapshot = Map.empty<'K, 'V>
@@ -839,46 +759,36 @@ type FilterMapNode<'K, 'V when 'K: comparison>
             | _ -> ()
 
     member internal this.AddSink(sink: IMapDeltaSink<'K, 'V>) =
-        Monitor.Enter syncRoot
+        if sinkCount = sinks.Length then
+            let next = Array.zeroCreate (sinks.Length * 2)
+            Array.Copy(sinks, next, sinks.Length)
+            sinks <- next
 
-        try
-            if sinkCount = sinks.Length then
-                let next = Array.zeroCreate (sinks.Length * 2)
-                Array.Copy(sinks, next, sinks.Length)
-                sinks <- next
-
-            sinks[sinkCount] <- box sink
-            sinkCount <- sinkCount + 1
-        finally
-            Monitor.Exit syncRoot
+        sinks[sinkCount] <- box sink
+        sinkCount <- sinkCount + 1
 
         if sinkCount = 1 then
             this.Register()
 
     member internal this.RemoveSink(sink: IMapDeltaSink<'K, 'V>) =
         let mutable becameZero = false
-        Monitor.Enter syncRoot
+        let mutable found = -1
+        let mutable i = 0
 
-        try
-            let mutable found = -1
-            let mutable i = 0
+        while found < 0 && i < sinkCount do
+            if obj.ReferenceEquals(sinks[i], box sink) then
+                found <- i
+            else
+                i <- i + 1
 
-            while found < 0 && i < sinkCount do
-                if obj.ReferenceEquals(sinks[i], box sink) then
-                    found <- i
-                else
-                    i <- i + 1
+        if found >= 0 then
+            sinkCount <- sinkCount - 1
 
-            if found >= 0 then
-                sinkCount <- sinkCount - 1
+            for j in found .. sinkCount - 1 do
+                sinks[j] <- sinks[j + 1]
 
-                for j in found .. sinkCount - 1 do
-                    sinks[j] <- sinks[j + 1]
-
-                sinks[sinkCount] <- null
-                becameZero <- sinkCount = 0
-        finally
-            Monitor.Exit syncRoot
+            sinks[sinkCount] <- null
+            becameZero <- sinkCount = 0
 
         if becameZero then
             this.Unregister()
@@ -886,17 +796,12 @@ type FilterMapNode<'K, 'V when 'K: comparison>
     member private this.FlushDeltas(ver: int64, sets: struct ('K * 'V)[], setCnt: int, rems: 'K[], remCnt: int) =
         if setCnt > 0 || remCnt > 0 then
             let sinksSnapshot =
-                Monitor.Enter syncRoot
-
-                try
-                    if sinkCount = 0 then
-                        [||]
-                    else
-                        let arr = Array.zeroCreate sinkCount
-                        Array.Copy(sinks, arr, sinkCount)
-                        arr
-                finally
-                    Monitor.Exit syncRoot
+                if sinkCount = 0 then
+                    [||]
+                else
+                    let arr = Array.zeroCreate sinkCount
+                    Array.Copy(sinks, arr, sinkCount)
+                    arr
 
             for i in 0 .. sinksSnapshot.Length - 1 do
                 (unbox<IMapDeltaSink<'K, 'V>> sinksSnapshot[i]).OnDeltas(ver, sets, setCnt, rems, remCnt)
@@ -918,34 +823,29 @@ type FilterMapNode<'K, 'V when 'K: comparison>
             let mutable ownSetCnt = 0
             let mutable ownRemCnt = 0
 
-            Monitor.Enter syncRoot
+            for i in 0 .. remCnt - 1 do
+                let k = rems[i]
 
-            try
-                for i in 0 .. remCnt - 1 do
-                    let k = rems[i]
+                if data.Remove k then
+                    snapshot <- Map.remove k snapshot
+                    ownRems[ownRemCnt] <- k
+                    ownRemCnt <- ownRemCnt + 1
 
-                    if data.Remove k then
-                        snapshot <- Map.remove k snapshot
-                        ownRems[ownRemCnt] <- k
-                        ownRemCnt <- ownRemCnt + 1
+            for i in 0 .. setCnt - 1 do
+                let struct (k, v) = sets[i]
 
-                for i in 0 .. setCnt - 1 do
-                    let struct (k, v) = sets[i]
+                if predicate k v then
+                    data[k] <- v
+                    snapshot <- Map.add k v snapshot
+                    ownSets[ownSetCnt] <- struct (k, v)
+                    ownSetCnt <- ownSetCnt + 1
+                elif data.Remove k then
+                    snapshot <- Map.remove k snapshot
+                    ownRems[ownRemCnt] <- k
+                    ownRemCnt <- ownRemCnt + 1
 
-                    if predicate k v then
-                        data[k] <- v
-                        snapshot <- Map.add k v snapshot
-                        ownSets[ownSetCnt] <- struct (k, v)
-                        ownSetCnt <- ownSetCnt + 1
-                    elif data.Remove k then
-                        snapshot <- Map.remove k snapshot
-                        ownRems[ownRemCnt] <- k
-                        ownRemCnt <- ownRemCnt + 1
-
-                version <- ver
-                snapshotVersion <- ver
-            finally
-                Monitor.Exit syncRoot
+            version <- ver
+            snapshotVersion <- ver
 
             this.FlushDeltas(ver, ownSets, ownSetCnt, ownRems, ownRemCnt)
             ArrayPool<struct ('K * 'V)>.Shared.Return(ownSets, true)
@@ -953,16 +853,17 @@ type FilterMapNode<'K, 'V when 'K: comparison>
 
     interface IAdaptiveMap<'K, 'V> with
         member this.GetValue() =
-            Monitor.Enter syncRoot
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
 
             try
                 this.DoInitialLoad()
                 AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
                 snapshot
             finally
-                Monitor.Exit syncRoot
+                ctx.ReleaseOwner()
 
-        member _.Version = Interlocked.Read &version
+        member _.Version = version
 
 // =============================================================================
 // Module functions
