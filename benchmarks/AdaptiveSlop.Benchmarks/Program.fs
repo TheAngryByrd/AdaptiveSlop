@@ -464,6 +464,154 @@ type MapTransformBenchmarks() =
             ()
 
 // =============================================================================
+// List Benchmarks (docs/ALIST-DESIGN.md)
+//
+// The write/read benchmark mirrors FDA's CollectionUpdate.CList_Map_GetValue
+// (100 appends in one transaction, then force the mapped list). The transform
+// and append benchmarks mirror the set benchmarks above. FDA's IndexList/
+// Index/ListDelta benchmarks do not apply: those measure the persistent
+// structures we deliberately do not have (docs/ALIST-DESIGN.md §2).
+// =============================================================================
+
+[<MemoryDiagnoser>]
+type ListWriteReadBenchmarks() =
+    let mutable slopList: AdaptiveSlop.Core.ChangeableList<int> = Unchecked.defaultof<_>
+
+    let mutable slopMapped: AdaptiveSlop.Core.IAdaptiveList<int> =
+        Unchecked.defaultof<_>
+
+    let mutable fdaList: clist<int> = Unchecked.defaultof<_>
+    let mutable fdaMapped: alist<int> = Unchecked.defaultof<_>
+
+    [<Params(0, 1000, 10000, 100000)>]
+    member val Count = 0 with get, set
+
+    // FDA's CollectionUpdate rebuilds per iteration: the measured op must be
+    // stationary (our first run grew the list by 101 appends per iteration,
+    // so the force array grew unbounded and the allocation column was
+    // meaningless).
+    [<IterationSetup>]
+    member this.Setup() =
+        let data = Array.init this.Count (fun i -> i)
+        slopList <- AdaptiveSlop.Core.CList.ofArray data
+
+        slopMapped <- AdaptiveSlop.Core.AList.map (fun i -> i * 2) (AdaptiveSlop.Core.CList.value slopList)
+
+        AdaptiveSlop.Core.AList.force slopMapped |> ignore
+        fdaList <- clist data
+        fdaMapped <- AList.map (fun i -> i * 2) fdaList
+        AList.force fdaMapped |> ignore
+
+    [<Benchmark(Baseline = true)>]
+    member this.AdaptiveSlop() =
+        AdaptiveSlop.Core.Transaction.run (fun () ->
+            for i in 0..100 do
+                slopList.Append(i) |> ignore)
+
+        AdaptiveSlop.Core.AList.force slopMapped |> ignore
+
+    [<Benchmark>]
+    member this.FSharpDataAdaptive() =
+        transact (fun () ->
+            for i in 0..100 do
+                fdaList.Append(i) |> ignore)
+
+        AList.force fdaMapped |> ignore
+
+[<MemoryDiagnoser>]
+type ListTransformBenchmarks() =
+    let mutable slopList: AdaptiveSlop.Core.ChangeableList<int> = Unchecked.defaultof<_>
+
+    let mutable slopFiltered: AdaptiveSlop.Core.IAdaptiveList<int> =
+        Unchecked.defaultof<_>
+
+    let mutable fdaList: clist<int> = Unchecked.defaultof<_>
+    let mutable fdaFiltered: alist<int> = Unchecked.defaultof<_>
+
+    [<Params(500)>]
+    member val Iterations = 0 with get, set
+
+    [<GlobalSetup>]
+    member _.Setup() =
+        slopList <- AdaptiveSlop.Core.CList.ofSeq (seq { 1..100 })
+
+        let mapped =
+            AdaptiveSlop.Core.AList.map (fun v -> v * 2) (AdaptiveSlop.Core.CList.value slopList)
+
+        slopFiltered <- AdaptiveSlop.Core.AList.filter (fun v -> v % 4 = 0) mapped
+
+        fdaList <- clist (seq { 1..100 })
+        let fdaMapped = AList.map (fun v -> v * 2) fdaList
+        fdaFiltered <- AList.filter (fun v -> v % 4 = 0) fdaMapped
+
+    [<Benchmark(Baseline = true)>]
+    member this.AdaptiveSlop() =
+        for i in 1 .. this.Iterations do
+            AdaptiveSlop.Core.CList.append (1000 + i) slopList
+            AdaptiveSlop.Core.CList.removeAt 0 slopList
+            let _ = AdaptiveSlop.Core.AList.getValue slopFiltered
+            ()
+
+    [<Benchmark>]
+    member this.FSharpDataAdaptive() =
+        for i in 1 .. this.Iterations do
+            transact (fun () ->
+                fdaList.Append(1000 + i) |> ignore
+                fdaList.RemoveAt(0) |> ignore)
+
+            let _ = AList.force fdaFiltered
+            ()
+
+[<MemoryDiagnoser>]
+type ListAppendBenchmarks() =
+    let mutable slopLeft: AdaptiveSlop.Core.ChangeableList<int> = Unchecked.defaultof<_>
+
+    let mutable slopRight: AdaptiveSlop.Core.ChangeableList<int> =
+        Unchecked.defaultof<_>
+
+    let mutable slopAppended: AdaptiveSlop.Core.IAdaptiveList<int> =
+        Unchecked.defaultof<_>
+
+    let mutable fdaLeft: clist<int> = Unchecked.defaultof<_>
+    let mutable fdaRight: clist<int> = Unchecked.defaultof<_>
+    let mutable fdaAppended: alist<int> = Unchecked.defaultof<_>
+
+    [<Params(500)>]
+    member val Iterations = 0 with get, set
+
+    [<GlobalSetup>]
+    member _.Setup() =
+        slopLeft <- AdaptiveSlop.Core.CList.ofSeq (seq { 1..50 })
+        slopRight <- AdaptiveSlop.Core.CList.ofSeq (seq { 51..100 })
+
+        slopAppended <-
+            AdaptiveSlop.Core.AList.append
+                (AdaptiveSlop.Core.CList.value slopLeft)
+                (AdaptiveSlop.Core.CList.value slopRight)
+
+        fdaLeft <- clist (seq { 1..50 })
+        fdaRight <- clist (seq { 51..100 })
+        fdaAppended <- AList.append fdaLeft fdaRight
+
+    [<Benchmark(Baseline = true)>]
+    member this.AdaptiveSlop() =
+        for i in 1 .. this.Iterations do
+            AdaptiveSlop.Core.CList.append (1000 + i) slopLeft
+            AdaptiveSlop.Core.CList.removeAt 0 slopLeft
+            let _ = AdaptiveSlop.Core.AList.getValue slopAppended
+            ()
+
+    [<Benchmark>]
+    member this.FSharpDataAdaptive() =
+        for i in 1 .. this.Iterations do
+            transact (fun () ->
+                fdaLeft.Append(1000 + i) |> ignore
+                fdaLeft.RemoveAt(0) |> ignore)
+
+            let _ = AList.force fdaAppended
+            ()
+
+// =============================================================================
 // Large Collection Benchmark
 // =============================================================================
 

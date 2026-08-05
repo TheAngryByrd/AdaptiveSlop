@@ -3241,3 +3241,300 @@ let ``AMap constant and delay compute the creator once`` () =
     Assert.Equal(0, count2)
     Assert.Equal(0, d.GetValue().Count)
     Assert.Equal(1, count2)
+
+// =============================================================================
+// AList prototype (docs/ALIST-DESIGN.md §7)
+// =============================================================================
+
+[<Fact>]
+let ``AList map reflects changes`` () =
+    let src = CList.ofList [ 1; 2; 3 ]
+    let mapped = AList.map (fun x -> x * 10) (CList.value src)
+    Assert.Equal<int list>([ 10; 20; 30 ], AList.toList mapped)
+    CList.append 4 src
+    Assert.Equal<int list>([ 10; 20; 30; 40 ], AList.toList mapped)
+    CList.insertAt 0 0 src
+    Assert.Equal<int list>([ 0; 10; 20; 30; 40 ], AList.toList mapped)
+    CList.updateAt 2 99 src
+    Assert.Equal<int list>([ 0; 10; 990; 30; 40 ], AList.toList mapped)
+    CList.removeAt 0 src
+    Assert.Equal<int list>([ 10; 990; 30; 40 ], AList.toList mapped)
+    CList.clear src
+    Assert.Equal<int list>([], AList.toList mapped)
+
+[<Fact>]
+let ``AList filter and choose update semantics`` () =
+    let src = CList.ofList [ 1; 2; 3; 4; 5 ]
+    let evens = AList.filter (fun x -> x % 2 = 0) (CList.value src)
+    Assert.Equal<int list>([ 2; 4 ], AList.toList evens)
+    CList.prepend 0 src
+    Assert.Equal<int list>([ 0; 2; 4 ], AList.toList evens)
+    // update of a filtered-out element that now passes -> inserted
+    CList.updateAt 3 6 src
+    Assert.Equal<int list>([ 0; 2; 6; 4 ], AList.toList evens)
+    // update of a passing element that now fails -> removed
+    CList.updateAt 3 7 src
+    Assert.Equal<int list>([ 0; 2; 4 ], AList.toList evens)
+    // remove of a filtered-out element -> the later survivors shift position
+    CList.removeAt 1 src
+    Assert.Equal<int list>([ 0; 2; 4 ], AList.toList evens)
+    // update of a surviving element -> update in place (4 at position 3 -> 6)
+    CList.updateAt 3 6 src
+    Assert.Equal<int list>([ 0; 2; 6 ], AList.toList evens)
+
+    let chosen =
+        AList.choose (fun x -> if x % 2 = 0 then Some(x * 100) else None) (CList.value src)
+
+    Assert.Equal<int list>([ 0; 200; 600 ], AList.toList chosen)
+
+[<Fact>]
+let ``AList append concatenates with cross-source ordering`` () =
+    let l = CList.ofList [ 1; 2 ]
+    let r = CList.ofList [ 3; 4 ]
+    let all = AList.append (CList.value l) (CList.value r)
+    Assert.Equal<int list>([ 1; 2; 3; 4 ], AList.toList all)
+
+    // The tricky case: a right insert and a left append in ONE batch. The ops
+    // arrive in write order; the right op's absolute position uses leftCount
+    // at its application point (docs/ALIST-DESIGN.md §3.4).
+    Transaction.run (fun () ->
+        CList.insertAt 0 9 r
+        CList.append 5 l)
+
+    Assert.Equal<int list>([ 1; 2; 5; 9; 3; 4 ], AList.toList all)
+
+    // left removal shifts the right base offset
+    CList.removeAt 0 l
+    Assert.Equal<int list>([ 2; 5; 9; 3; 4 ], AList.toList all)
+
+    Transaction.run (fun () ->
+        CList.append 6 l
+        CList.removeAt 0 r)
+
+    Assert.Equal<int list>([ 2; 5; 6; 3; 4 ], AList.toList all)
+
+[<Fact>]
+let ``ChangeableList transactions replay in order`` () =
+    let src = CList.ofList [ 1; 2; 3 ]
+    let mutable deliveries = 0
+    use obs = AList.observe (fun _ _ -> deliveries <- deliveries + 1) (CList.value src)
+
+    Transaction.run (fun () ->
+        CList.append 4 src
+        CList.removeAt 0 src)
+
+    Assert.Equal<int list>([ 2; 3; 4 ], AList.toList (CList.value src))
+    Assert.Equal(1, deliveries) // one batch, one notification
+
+[<Fact>]
+let ``ChangeableList Set and Clear inside transactions`` () =
+    let src = CList.ofList [ 1; 2; 3 ]
+
+    // Set is last-wins over the whole batch.
+    Transaction.run (fun () ->
+        CList.append 4 src
+        CList.set [ 9; 8 ] src)
+
+    Assert.Equal<int list>([ 9; 8 ], AList.toList (CList.value src))
+
+    // Set then Clear -> empty.
+    Transaction.run (fun () ->
+        CList.set [ 1 ] src
+        CList.clear src)
+
+    Assert.Equal<int list>([], AList.toList (CList.value src))
+
+    // Clear then Set -> the set value.
+    Transaction.run (fun () ->
+        CList.clear src
+        CList.set [ 5; 6 ] src)
+
+    Assert.Equal<int list>([ 5; 6 ], AList.toList (CList.value src))
+
+    // Appends after the Set are superseded (last-wins, docs/ALIST-DESIGN.md §3.3).
+    Transaction.run (fun () ->
+        CList.set [ 7 ] src
+        CList.append 8 src)
+
+    Assert.Equal<int list>([ 7 ], AList.toList (CList.value src))
+
+[<Fact>]
+let ``ChangeableList no-op writes do not mark`` () =
+    let src = CList.ofList [ 1; 2 ]
+    let mutable deliveries = 0
+    use obs = AList.observe (fun _ _ -> deliveries <- deliveries + 1) (CList.value src)
+    CList.updateAt 0 1 src // equal value
+    CList.remove 99 src // absent
+    Assert.Equal(0, deliveries)
+    CList.updateAt 0 2 src
+    Assert.Equal(1, deliveries)
+
+[<Fact>]
+let ``AList observe receives ordered deltas`` () =
+    let src = CList.ofList [ 1; 2; 3 ]
+    let mutable ops: struct (ListOpKind * int * int) list = []
+
+    use obs =
+        AList.observe
+            (fun _ delta ->
+                ops <-
+                    delta.Operations.ToArray()
+                    |> Array.map (fun op -> struct (op.Kind, op.Position, op.Value))
+                    |> Array.toList)
+            (CList.value src)
+
+    Assert.Equal<struct (ListOpKind * int * int) list>([], ops) // no callback on attach
+
+    Transaction.run (fun () ->
+        CList.append 4 src
+        CList.removeAt 0 src)
+
+    Assert.Equal<struct (ListOpKind * int * int) list>(
+        [ struct (ListOpKind.Insert, 3, 4); struct (ListOpKind.Remove, 0, 0) ],
+        ops
+    )
+
+[<Fact>]
+let ``AList count and isEmpty`` () =
+    let src = CList.ofList [ 1; 2; 3 ]
+    let c = AList.count (CList.value src)
+    let e = AList.isEmpty (CList.value src)
+    Assert.Equal(3, AVal.getValue c)
+    Assert.False(AVal.getValue e)
+    CList.append 4 src
+    Assert.Equal(4, AVal.getValue c)
+    CList.clear src
+    Assert.Equal(0, AVal.getValue c)
+    Assert.True(AVal.getValue e)
+
+[<Fact>]
+let ``AList constructors`` () =
+    Assert.Equal<int list>([], AList.toList (AList.empty: alist<int>))
+    Assert.Equal<int list>([ 1 ], AList.toList (AList.single 1))
+    Assert.Equal<int list>([ 1; 2; 3 ], AList.toList (AList.ofSeq [ 1; 2; 3 ]))
+    Assert.Equal<int list>([ 1; 2 ], AList.toList (AList.ofArray [| 1; 2 |]))
+    Assert.Equal<int list>([ 1; 2 ], AList.toList (AList.ofList [ 1; 2 ]))
+    Assert.Equal<int list>([ 1; 2 ], AList.toList (AList.ofResizeArray (ResizeArray [ 1; 2 ])))
+    Assert.Equal<int[]>([| 1; 2 |], AList.force (AList.ofSeq [ 1; 2 ]))
+
+    let mutable count = 0
+
+    let c =
+        AList.constant (fun () ->
+            count <- count + 1
+            ResizeArray [ 1 ])
+
+    Assert.Equal(0, count)
+    Assert.Equal<int list>([ 1 ], AList.toList c)
+    Assert.Equal(1, count)
+    Assert.Equal<int list>([ 1 ], AList.toList c)
+    Assert.Equal(1, count) // computed once
+
+[<Fact>]
+let ``dirty derived list at first read does not double-apply`` () =
+    let src = CList.ofList [ 1; 2; 3 ]
+    let doubled = AList.map (fun x -> x * 2) (CList.value src)
+
+    // Write to the source BEFORE doubled is ever read: the write cannot reach
+    // its journal (registration is lazy), so the load must see it exactly once.
+    CList.append 4 src
+
+    let filtered = AList.filter (fun x -> x > 5) doubled
+    Assert.Equal<int list>([ 6; 8 ], AList.toList filtered)
+
+    // Now doubled is registered: writes push through the chain.
+    CList.append 5 src
+    Assert.Equal<int list>([ 6; 8; 10 ], AList.toList filtered)
+
+[<Fact>]
+let ``AList derived node disposal unregisters`` () =
+    let src = CList.ofList [ 1; 2; 3 ]
+    let mapped = AList.map id (CList.value src)
+    Assert.Equal(0, src.SinkCount) // registration is lazy until the first read
+    Assert.Equal<int list>([ 1; 2; 3 ], AList.toList mapped)
+    Assert.Equal(1, src.SinkCount)
+    (mapped :> IDisposable).Dispose()
+    Assert.Equal(0, src.SinkCount)
+    CList.append 4 src // no throw, no delivery to the disposed node
+    Assert.Equal(0, src.SinkCount)
+
+[<Fact>]
+let ``AList drains allocate zero in steady state`` () =
+    // Permanent allocation test (ALIST-DESIGN.md §7): an N-op batch
+    // (write + drain + delivery) allocates 0 bytes after warmup.
+    //
+    // Chain-depth semantics match the set world: the version check in a node
+    // read reaches its direct source only (depth 2 works; deeper unobserved
+    // chains are not drained by a single read). The read here targets
+    // `filtered` (depth 2), which drains the chain; the observe on `appended`
+    // then receives the deltas through that read.
+    //
+    // The filter predicate passes every value (mapped = x*2 is always even),
+    // so every write produces an output delta. The read each iteration drains
+    // both writes as one batch: one delivery per iteration (100).
+    let src = CList.ofList [ for i in 1..100 -> i ]
+    let mapped = AList.map (fun x -> x * 2) (CList.value src)
+    let filtered = AList.filter (fun x -> x % 2 = 0) mapped
+    let right = CList.ofList [ -1; -2 ]
+    let appended = AList.append filtered (CList.value right)
+    let mutable delivered = 0
+    use obs = AList.observe (fun _ _ -> delivered <- delivered + 1) appended
+
+    // Warm up: read once (registers the chain and grows every buffer).
+    AList.toList appended |> ignore
+
+    let step () =
+        for i in 1..100 do
+            CList.append i src
+            CList.removeAt 0 src
+            AList.getValue filtered |> ignore
+
+    step ()
+    delivered <- 0
+    let before = GC.GetAllocatedBytesForCurrentThread()
+    step ()
+    let allocated = GC.GetAllocatedBytesForCurrentThread() - before
+    Assert.Equal(0L, allocated)
+    Assert.Equal(100, delivered)
+
+[<Fact>]
+let ``transaction appends land in write order`` () =
+    // Regression: several appends in one transaction journaled the same
+    // pre-transaction position; the sequential replay reversed them.
+    let s = CList.ofList [ 1; 2; 3 ]
+
+    Transaction.run (fun () ->
+        CList.append 4 s
+        CList.append 5 s
+        CList.append 6 s)
+
+    Assert.Equal<int list>([ 1; 2; 3; 4; 5; 6 ], AList.toList (CList.value s))
+
+    // append after a clear inside a transaction
+    let s2 = CList.ofList [ 1; 2; 3 ]
+
+    Transaction.run (fun () ->
+        CList.clear s2
+        CList.append 7 s2
+        CList.append 8 s2)
+
+    Assert.Equal<int list>([ 7; 8 ], AList.toList (CList.value s2))
+
+    // append and prepend interleaved in one transaction
+    let s3 = CList.ofList [ 1; 2; 3 ]
+
+    Transaction.run (fun () ->
+        CList.prepend 0 s3
+        CList.append 4 s3
+        CList.append 5 s3)
+
+    Assert.Equal<int list>([ 0; 1; 2; 3; 4; 5 ], AList.toList (CList.value s3))
+
+    // insert at the pre-transaction end is an append
+    let s4 = CList.ofList [ 1; 2 ]
+
+    Transaction.run (fun () ->
+        CList.insertAt 2 3 s4
+        CList.insertAt 2 4 s4)
+
+    Assert.Equal<int list>([ 1; 2; 3; 4 ], AList.toList (CList.value s4))
