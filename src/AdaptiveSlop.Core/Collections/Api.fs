@@ -773,3 +773,167 @@ module CMap =
 
     /// <summary>Materializes the F# <c>Map</c> counterpart.</summary>
     let inline toMap (mapValue: cmap<'K, 'V>) : Map<'K, 'V> = AMap.toMap mapValue
+
+/// <summary>Operations on adaptive lists (docs/ALIST-DESIGN.md §4).</summary>
+module AList =
+    /// <summary>An empty adaptive list (FDA <c>AList.empty</c> parity).</summary>
+    let empty<'T> : alist<'T> = new ConstantList<'T>(fun () -> Array.empty)
+
+    /// <summary>An adaptive list over fixed, immutable items.</summary>
+    let inline ofSeq (items: seq<'T>) : alist<'T> =
+        new ConstantList<'T>(fun () -> Seq.toArray items)
+
+    /// <summary>An adaptive list over a fixed array.</summary>
+    let inline ofArray (items: 'T[]) : alist<'T> = new ConstantList<'T>(fun () -> items)
+
+    /// <summary>An adaptive list over a fixed list.</summary>
+    let inline ofList (items: 'T list) : alist<'T> =
+        new ConstantList<'T>(fun () -> List.toArray items)
+
+    /// <summary>An adaptive list over a fixed ResizeArray.</summary>
+    let inline ofResizeArray (items: ResizeArray<'T>) : alist<'T> =
+        new ConstantList<'T>(fun () -> items.ToArray())
+
+    /// <summary>A constant list with a single element.</summary>
+    let inline single (value: 'T) : alist<'T> =
+        new ConstantList<'T>(fun () -> [| value |])
+
+    /// <summary>
+    /// An adaptive list whose content is fixed but computed lazily, once, at
+    /// first read (FDA parity: the create function runs at most once).
+    /// </summary>
+    let inline constant (create: unit -> ResizeArray<'T>) : alist<'T> =
+        new ConstantList<'T>(fun () -> create().ToArray())
+
+    /// <summary>Alias of <see cref="constant"/> (FDA parity: delay is constant).</summary>
+    let inline delay ([<InlineIfLambda>] create: unit -> ResizeArray<'T>) : alist<'T> = constant create
+
+    /// <summary>Maps every element of the list.</summary>
+    let inline map ([<InlineIfLambda>] f: 'T -> 'U) (list: alist<'T>) : alist<'U> =
+        new FilterMapListNode<'T, 'U>(list, fun x -> ValueSome(f x))
+
+    /// <summary>Maps every element, keeping only the ones the mapping returns a value for.</summary>
+    let inline choose ([<InlineIfLambda>] f: 'T -> 'U option) (list: alist<'T>) : alist<'U> =
+        new FilterMapListNode<'T, 'U>(
+            list,
+            fun x ->
+                match f x with
+                | Some u -> ValueSome u
+                | None -> ValueNone
+        )
+
+    /// <summary>Maps every element, keeping only the ones the mapping returns a value for (voption form).</summary>
+    let inline chooseV ([<InlineIfLambda>] f: 'T -> 'U voption) (list: alist<'T>) : alist<'U> =
+        new FilterMapListNode<'T, 'U>(list, f)
+
+    /// <summary>Keeps the elements that satisfy the predicate.</summary>
+    let inline filter ([<InlineIfLambda>] predicate: 'T -> bool) (list: alist<'T>) : alist<'T> =
+        new FilterMapListNode<'T, 'T>(list, fun x -> if predicate x then ValueSome x else ValueNone)
+
+    /// <summary>The concatenation of two lists (FDA <c>AList.append</c> parity).</summary>
+    let inline append (left: alist<'T>) (right: alist<'T>) : alist<'T> = new AppendListNode<'T>(left, right)
+
+    /// <summary>
+    /// Returns a transient view of the current state. Valid only until the next
+    /// write on the owner thread; do not retain or mutate it. Use
+    /// <see cref="force"/> to materialize a snapshot that is safe to retain.
+    /// </summary>
+    let inline getValue (list: alist<'T>) = list.GetValue()
+
+    /// <summary>
+    /// Materializes the current state as a fresh array. This is the only list
+    /// operation that allocates; the result is safe to retain and the library
+    /// never touches it again. Runs the pending delta processing (drain) first.
+    /// There is no <c>FrozenList</c> in <c>System.Collections.Frozen</c> on
+    /// net8/net10, so the array is the retain boundary (docs/ALIST-DESIGN.md
+    /// §3.3).
+    /// </summary>
+    let inline force (list: alist<'T>) : 'T[] = Seq.toArray (list.GetValue())
+
+    /// <summary>Materializes the F# <c>list</c> counterpart.</summary>
+    let inline toList (list: alist<'T>) : 'T list = List.ofSeq (list.GetValue())
+
+    /// <summary>Materializes the array counterpart.</summary>
+    let inline toArray (list: alist<'T>) : 'T[] = Seq.toArray (list.GetValue())
+
+    /// <summary>Adaptively gets the number of elements.</summary>
+    let inline count (list: alist<'T>) : aval<int> =
+        AdaptiveNode<int>(fun () -> list.GetValue().Count)
+
+    /// <summary>Adaptively tests if the list is empty.</summary>
+    let inline isEmpty (list: alist<'T>) : aval<bool> =
+        AdaptiveNode<bool>(fun () -> list.GetValue().Count = 0)
+
+    /// <summary>
+    /// Registers a callback that receives the current view and the ordered
+    /// delta after every batch that changes the list. The callback runs on the
+    /// owner thread after the write, transaction, or pump completes. The view
+    /// and the delta are transient: valid only during the callback. Disposing
+    /// the returned observation stops delivery.
+    /// </summary>
+    /// <remarks>
+    /// Parity: FDA <c>AddCallback(state, delta)</c> on collection readers.
+    /// The delta operations are positional and applied in order; a batch that
+    /// removes and reinserts at one position delivers remove+insert (no
+    /// netting, docs/ALIST-DESIGN.md §3.1).
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// let items = CList.empty&lt;int&gt;
+    /// use obs = AList.observe (fun view delta -&gt;
+    ///     printfn "ops: %d count: %d" delta.Operations.Length view.Count)
+    ///     (CList.value items)
+    /// CList.append 1 items   // prints "ops: 1 count: 1"
+    /// </code>
+    /// </example>
+    let inline observe (callback: IReadOnlyList<'T> -> ListDelta<'T> -> unit) (list: alist<'T>) : IObservation =
+        let node = new ObserveListNode<'T>(list, callback)
+        node.Attach()
+        node
+
+/// <summary>Operations on changeable lists.</summary>
+module CList =
+    /// <summary>An empty changeable list.</summary>
+    let inline empty<'T> : clist<'T> = new ChangeableList<'T>(Seq.empty)
+
+    /// <summary>A changeable list with the given items.</summary>
+    let inline ofSeq (items: seq<'T>) : clist<'T> = new ChangeableList<'T>(items)
+
+    /// <summary>A changeable list with the given items.</summary>
+    let inline ofArray (items: 'T[]) : clist<'T> = new ChangeableList<'T>(items)
+
+    /// <summary>A changeable list with the given items.</summary>
+    let inline ofList (items: 'T list) : clist<'T> = new ChangeableList<'T>(items)
+
+    /// <summary>Appends an element at the end of the list.</summary>
+    let inline append (value: 'T) (list: clist<'T>) = list.Append value
+
+    /// <summary>Inserts an element at the start of the list.</summary>
+    let inline prepend (value: 'T) (list: clist<'T>) = list.Prepend value
+
+    /// <summary>Inserts an element before the element currently at the position.</summary>
+    let inline insertAt (position: int) (value: 'T) (list: clist<'T>) = list.InsertAt(position, value)
+
+    /// <summary>Removes the element currently at the position.</summary>
+    let inline removeAt (position: int) (list: clist<'T>) = list.RemoveAt position
+
+    /// <summary>Replaces the element currently at the position.</summary>
+    let inline updateAt (position: int) (value: 'T) (list: clist<'T>) = list.UpdateAt(position, value)
+
+    /// <summary>Removes the first occurrence of the value. No-op when absent.</summary>
+    let inline remove (value: 'T) (list: clist<'T>) = list.Remove value
+
+    /// <summary>Removes all elements.</summary>
+    let inline clear (list: clist<'T>) = list.Clear()
+
+    /// <summary>Replaces the whole list. Last-wins over the whole batch inside a transaction.</summary>
+    let inline set (values: seq<'T>) (list: clist<'T>) = list.Set values
+
+    /// <summary>Views the changeable list as an adaptive list.</summary>
+    let inline value (list: clist<'T>) : alist<'T> = list
+
+    /// <summary>Materializes the current state as an immutable array snapshot.</summary>
+    let inline force (list: clist<'T>) : 'T[] = AList.force list
+
+    /// <summary>Materializes the F# <c>list</c> counterpart.</summary>
+    let inline toList (list: clist<'T>) : 'T list = AList.toList list

@@ -71,6 +71,21 @@ type internal IMapSinkRegistry =
     abstract member AddMapSink: sink: obj -> unit
     abstract member RemoveMapSink: sink: obj -> unit
 
+/// <summary>
+/// An adaptive list: either a changeable source or a derived node. See
+/// <see cref="IAdaptiveSet&lt;'T&gt;"/> for the view and disposal contracts.
+/// Positions in list operations are 0-based and refer to the state as of the
+/// previous operation in the same delta; deltas are applied in order
+/// (docs/ALIST-DESIGN.md §3).
+/// </summary>
+type IAdaptiveList<'T> =
+    inherit IAdaptiveObject
+    inherit IDisposable
+    abstract member GetValue: unit -> IReadOnlyList<'T>
+
+/// <summary>An abbreviation for <see cref="IAdaptiveList&lt;'T&gt;"/> (FDA <c>alist&lt;'T&gt;</c> parity).</summary>
+type alist<'T> = IAdaptiveList<'T>
+
 // =============================================================================
 // Struct state holders (PLAN.md Section 6.9, shared code)
 //
@@ -281,6 +296,104 @@ type MapDeltaBuilder<'K, 'V>() =
 
     member internal this.Snapshot() = MapDelta(sets, rems)
 
+/// <summary>The kind of a list operation (docs/ALIST-DESIGN.md §3.1).</summary>
+/// <remarks>
+/// <c>Clear</c> is used only in changeable-source transaction journals as a
+/// marker for a full clear; it is never part of a delivered delta (the source
+/// expands it into descending removes).
+/// </remarks>
+type ListOpKind =
+    /// Insert before the element currently at <c>Position</c>; <c>Position = count</c> appends.
+    | Insert = 0
+    /// Remove the element currently at <c>Position</c>.
+    | Remove = 1
+    /// Replace the element currently at <c>Position</c>.
+    | Update = 2
+    /// Internal transaction-journal marker only; never delivered.
+    | Clear = 3
+
+/// <summary>
+/// One list operation. Positions are 0-based and refer to the state as of the
+/// previous operation in the same delta; a delta is applied in order.
+/// </summary>
+/// <remarks>
+/// <c>Source</c> is internal machinery for multi-source nodes (0 = primary or
+/// left, 1 = right); delivered deltas always carry 0.
+/// </remarks>
+[<Struct>]
+type ListOp<'T> =
+    val Kind: ListOpKind
+    val Position: int
+    val Value: 'T
+    val Source: byte
+
+    new(kind: ListOpKind, position: int, value: 'T, source: byte) =
+        { Kind = kind
+          Position = position
+          Value = value
+          Source = source }
+
+/// <summary>
+/// A list delta: ordered operations since the previous delivery. Passed to
+/// <see cref="AList.observe"/> callbacks. The buffer is transient: valid only
+/// during the callback that received the delta. Order is the semantics: apply
+/// the operations sequentially (docs/ALIST-DESIGN.md §3.2).
+/// </summary>
+[<Struct>]
+type ListDelta<'T> =
+    val mutable internal Ops: DeltaBuffer<ListOp<'T>>
+
+    internal new(ops: DeltaBuffer<ListOp<'T>>) = { Ops = ops }
+
+    static member internal Create() = ListDelta(DeltaBuffer<_>.Create())
+
+    /// <summary>Gets whether this delta contains no operations.</summary>
+    member this.IsEmpty = this.Ops.Count = 0
+
+    member internal this.Clear() = this.Ops.Count <- 0
+
+    /// <summary>The operations, in application order. Transient: valid during the callback only.</summary>
+    member this.Operations = this.Ops.Items.AsMemory(0, this.Ops.Count)
+
+    /// <summary>Appends an insert operation. For <see cref="AList.custom"/> computes.</summary>
+    member this.Insert(position: int, value: 'T) =
+        if this.Ops.Count = this.Ops.Items.Length then
+            let next = Array.zeroCreate (this.Ops.Items.Length * 2)
+            Array.Copy(this.Ops.Items, next, this.Ops.Items.Length)
+            this.Ops.Items <- next
+
+        this.Ops.Items[this.Ops.Count] <- ListOp(ListOpKind.Insert, position, value, 0uy)
+        this.Ops.Count <- this.Ops.Count + 1
+
+    /// <summary>Appends a remove operation. For <see cref="AList.custom"/> computes.</summary>
+    member this.Remove(position: int) =
+        if this.Ops.Count = this.Ops.Items.Length then
+            let next = Array.zeroCreate (this.Ops.Items.Length * 2)
+            Array.Copy(this.Ops.Items, next, this.Ops.Items.Length)
+            this.Ops.Items <- next
+
+        this.Ops.Items[this.Ops.Count] <- ListOp(ListOpKind.Remove, position, Unchecked.defaultof<'T>, 0uy)
+        this.Ops.Count <- this.Ops.Count + 1
+
+    /// <summary>Appends an update operation. For <see cref="AList.custom"/> computes.</summary>
+    member this.Update(position: int, value: 'T) =
+        if this.Ops.Count = this.Ops.Items.Length then
+            let next = Array.zeroCreate (this.Ops.Items.Length * 2)
+            Array.Copy(this.Ops.Items, next, this.Ops.Items.Length)
+            this.Ops.Items <- next
+
+        this.Ops.Items[this.Ops.Count] <- ListOp(ListOpKind.Update, position, value, 0uy)
+        this.Ops.Count <- this.Ops.Count + 1
+
+/// <summary>Internal. Receives deltas from a list dependency.</summary>
+type internal IListDeltaSink<'T> =
+    abstract member OnDeltas: ops: ListOp<'T>[] * opCount: int -> unit
+
+/// <summary>Internal. Register/unregister a list delta sink with a dependency.</summary>
+type internal IListSinkRegistry =
+    abstract member AddListSink: sink: obj -> unit
+    abstract member RemoveListSink: sink: obj -> unit
+
 /// <summary>
 /// Registered consumers of a collection node. Passed by value to the push
 /// operations, so reentrant sink growth during delivery is safe.
@@ -458,8 +571,14 @@ module internal Collections =
         Array.Copy(rems, 0, journal.Rems.Items, journal.Rems.Count, remCnt)
         journal.Rems.Count <- journal.Rems.Count + remCnt
 
+    /// Append a delta to a list journal (called at write time by the pusher).
+    let inline journalAppendList (journal: ListDelta<'T> byref) (ops: ListOp<'T>[]) (opCnt: int) =
+        ensureCapacity &journal.Ops.Items (journal.Ops.Count + opCnt)
+        Array.Copy(ops, 0, journal.Ops.Items, journal.Ops.Count, opCnt)
+        journal.Ops.Count <- journal.Ops.Count + opCnt
+
     /// Register a sink. Returns nothing; the caller decides when to unregister.
-    let addSink (sinks: SinkList byref) (sink: obj) =
+    let inline addSink (sinks: SinkList byref) (sink: obj) =
         ensureCapacity &sinks.Sinks (sinks.Count + 1)
         sinks.Sinks[sinks.Count] <- sink
         sinks.Count <- sinks.Count + 1
@@ -484,7 +603,7 @@ module internal Collections =
             sinks.Sinks[sinks.Count] <- null
 
     /// Drop all sinks (disposal): releases the downstream references.
-    let clearSinks (sinks: SinkList byref) =
+    let inline clearSinks (sinks: SinkList byref) =
         Array.Clear(sinks.Sinks, 0, sinks.Count)
         sinks.Count <- 0
 
@@ -568,6 +687,30 @@ module internal Collections =
 
         try
             pushMapDelta sinks delta
+            ctx.MarkFrom(edges)
+        finally
+            ctx.TxActive <- wasActive
+
+        if not wasActive then
+            ctx.DeliverNotifications()
+
+    /// Push a list delta to every registered sink.
+    let pushListDelta (sinks: SinkList) (delta: ListDelta<'T>) =
+        let ops = delta.Ops.Items
+        let opCnt = delta.Ops.Count
+
+        for i in 0 .. sinks.Count - 1 do
+            (unbox<IListDeltaSink<'T>> sinks.Sinks[i]).OnDeltas(ops, opCnt)
+
+    /// Push a delta and mark the scalar parents of a source, with notification
+    /// delivery deferred to the end of the operation (PLAN.md Section 6.5).
+    let pushAndMarkList (delta: ListDelta<'T>) (sinks: SinkList) (edges: ParentEdges) =
+        let ctx = GraphContext.Default
+        let wasActive = ctx.TxActive
+        ctx.TxActive <- true
+
+        try
+            pushListDelta sinks delta
             ctx.MarkFrom(edges)
         finally
             ctx.TxActive <- wasActive
