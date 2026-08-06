@@ -4368,10 +4368,10 @@ let ``AMap observe delivers the net of a set-then-rem batch`` () =
         CMap.addOrUpdate "k" 2 r)
 
     // Net: the key is present with 2 -> exactly one delivery, a Set.
-    Assert.Single(delivered)
+    Assert.Single(delivered) |> ignore
     let d = delivered[0]
     let entries = d.SetEntries.ToArray()
-    Assert.Single(entries)
+    Assert.Single(entries) |> ignore
     Assert.Empty(d.RemovedKeys.ToArray())
     let struct (k, v) = entries[0]
     Assert.Equal("k", k)
@@ -5515,3 +5515,94 @@ let ``AList tryMin tryMax sum average`` () =
     Assert.Equal(ValueNone, AVal.getValue (AList.tryMin (CList.value l)))
     Assert.Equal(ValueNone, AVal.getValue (AList.tryMax (CList.value l)))
     Assert.Equal(0, AVal.getValue (AList.sum (CList.value l)))
+
+// =============================================================================
+// Bring list — Changeables group (gap sheet §6): cset UpdateTo/Perform/
+// UnionWith/ExceptWith/IntersectWith; cmap ContainsKey/TryGetValue/Item/
+// UpdateTo/Perform/Clear; clist UpdateTo/Perform/AddRange.
+// =============================================================================
+
+[<Fact>]
+let ``CSet updateTo and perform`` () =
+    let s = CSet.ofSeq [ 1; 2; 3 ]
+
+    Assert.Equal(true, CSet.updateTo (seq [ 2; 3; 4 ]) s)
+    Assert.Equal<Set<int>>(Set.ofList [ 2; 3; 4 ], CSet.toSet s)
+
+    Assert.Equal(false, CSet.updateTo (seq [ 2; 3; 4 ]) s) // equal: no-op
+    Assert.Equal<Set<int>>(Set.ofList [ 2; 3; 4 ], CSet.toSet s)
+
+    let delta = SetDeltaBuilder<int>()
+    delta.Add 5
+    delta.Remove 2
+    CSet.perform delta s
+    Assert.Equal<Set<int>>(Set.ofList [ 3; 4; 5 ], CSet.toSet s)
+
+[<Fact>]
+let ``CSet unionWith exceptWith intersectWith are atomic batches`` () =
+    let s = CSet.ofSeq [ 1; 2; 3 ]
+    let mutable deliveries = 0
+
+    use _obs = ASet.observe (fun _ _ -> deliveries <- deliveries + 1) (CSet.value s)
+
+    CSet.unionWith (seq [ 3; 4 ]) s
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2; 3; 4 ], CSet.toSet s)
+    Assert.Equal(1, deliveries) // one batch, one delivery
+
+    CSet.exceptWith (seq [ 1; 5 ]) s
+    Assert.Equal<Set<int>>(Set.ofList [ 2; 3; 4 ], CSet.toSet s)
+
+    CSet.intersectWith (seq [ 2; 9; 4 ]) s
+    Assert.Equal<Set<int>>(Set.ofList [ 2; 4 ], CSet.toSet s)
+
+[<Fact>]
+let ``CMap containsKey tryGetValue item`` () =
+    let m = CMap.ofSeq [ 1, "a"; 2, "b" ]
+
+    Assert.Equal(true, CMap.containsKey 1 m)
+    Assert.Equal(false, CMap.containsKey 3 m)
+    Assert.Equal(ValueSome "a", CMap.tryGetValue 1 m)
+    Assert.Equal(ValueNone, CMap.tryGetValue 3 m)
+    Assert.Equal("b", CMap.item 2 m)
+
+    CMap.remove 1 m
+    Assert.Equal(false, CMap.containsKey 1 m)
+    Assert.Equal(ValueNone, CMap.tryGetValue 1 m)
+
+[<Fact>]
+let ``CMap updateTo perform and clear`` () =
+    let m = CMap.ofSeq [ 1, "a"; 2, "b" ]
+
+    Assert.Equal(true, CMap.updateTo (seq [ 2, "B"; 3, "c" ]) m)
+    Assert.Equal<Map<int, string>>(Map.ofList [ 2, "B"; 3, "c" ], CMap.toMap m)
+
+    Assert.Equal(false, CMap.updateTo (seq [ 2, "B"; 3, "c" ]) m) // equal: no-op
+
+    let delta = MapDeltaBuilder<int, string>()
+    delta.Set(4, "d")
+    delta.Set(2, "b2")
+    delta.Remove 3
+    CMap.perform delta m
+    Assert.Equal<Map<int, string>>(Map.ofList [ 2, "b2"; 4, "d" ], CMap.toMap m)
+
+    CMap.clear m
+    Assert.Equal<Map<int, string>>(Map.empty, CMap.toMap m)
+
+[<Fact>]
+let ``CList updateTo perform and addRange`` () =
+    let l = CList.ofSeq [ 1; 2; 3 ]
+
+    Assert.Equal(true, CList.updateTo [| 2; 3; 4 |] l)
+    Assert.Equal<int[]>([| 2; 3; 4 |], CList.force l)
+
+    Assert.Equal(false, CList.updateTo [| 2; 3; 4 |] l) // equal: no-op
+
+    let delta = ListDeltaBuilder<int>()
+    delta.Remove 0
+    delta.Insert(1, 9)
+    delta.Update(2, 8)
+    CList.perform delta l // [ 3; 9; 8 ]
+    Assert.Equal<int[]>([| 3; 9; 8 |], CList.force l)
+
+    CList.addRange (seq [ 5; 6 ]) l
+    Assert.Equal<int[]>([| 3; 9; 8; 5; 6 |], CList.force l)

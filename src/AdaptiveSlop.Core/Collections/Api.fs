@@ -210,7 +210,7 @@ module ASet =
     /// rebuilt when either bound changes; the bounds are inclusive.
     /// </summary>
     let inline range (min: aval<^T>) (max: aval<^T>) : aset<^T> =
-        ofAVal (AVal.map2 (fun lo hi -> { lo .. hi }) min max)
+        ofAVal (AVal.map2 (fun lo hi -> seq { lo .. hi }) min max)
 
     /// <summary>
     /// Adaptively maps over the two values and returns the resulting set (FDA
@@ -523,6 +523,67 @@ module CSet =
 
     /// <summary>Replaces the whole set.</summary>
     let inline set (value: Set<'T>) (set: cset<'T>) = set.Set value
+
+    /// <summary>
+    /// Replaces the whole set and returns whether the content changed (FDA
+    /// <c>cset.UpdateTo</c> parity). An equal target marks nothing.
+    /// </summary>
+    let inline updateTo (target: seq<'T>) (set: cset<'T>) : bool =
+        let targetSet = HashSet<'T>(target)
+        let view = ASet.getValue set
+        let mutable changed = view.Count <> targetSet.Count
+
+        if not changed then
+            for x in view do
+                if not (targetSet.Contains x) then
+                    changed <- true
+
+        if changed then
+            set.Set target
+
+        changed
+
+    /// <summary>
+    /// Applies a batch of set operations (FDA <c>cset.Perform</c> parity). The
+    /// batch is applied atomically: observers receive one net delta. Adding and
+    /// removing the same element within the batch cancels.
+    /// </summary>
+    let perform (delta: SetDeltaBuilder<'T>) (set: cset<'T>) : unit =
+        let d = delta.Snapshot()
+
+        if not d.IsEmpty then
+            Transaction.run (fun () ->
+                let adds = d.Added
+
+                for i in 0 .. adds.Length - 1 do
+                    set.Add adds.Span[i] |> ignore
+
+                let rems = d.Removed
+
+                for i in 0 .. rems.Length - 1 do
+                    set.Remove rems.Span[i] |> ignore)
+
+    /// <summary>Adds all the given elements (FDA <c>cset.UnionWith</c> parity; one atomic batch).</summary>
+    let inline unionWith (other: seq<'T>) (set: cset<'T>) : unit =
+        Transaction.run (fun () ->
+            for x in other do
+                set.Add x |> ignore)
+
+    /// <summary>Removes all the given elements (FDA <c>cset.ExceptWith</c> parity; one atomic batch).</summary>
+    let inline exceptWith (other: seq<'T>) (set: cset<'T>) : unit =
+        Transaction.run (fun () ->
+            for x in other do
+                set.Remove x |> ignore)
+
+    /// <summary>Keeps only the elements also present in <c>other</c> (FDA <c>cset.IntersectWith</c> parity; one atomic batch).</summary>
+    let inline intersectWith (other: seq<'T>) (set: cset<'T>) : unit =
+        Transaction.run (fun () ->
+            let otherSet = HashSet<'T>(other)
+            let view = ASet.getValue set
+
+            for x in view do
+                if not (otherSet.Contains x) then
+                    set.Remove x |> ignore)
 
     /// <summary>Views the changeable set as an adaptive set.</summary>
     let inline value (set: cset<'T>) : aset<'T> = set
@@ -1107,6 +1168,76 @@ module CMap =
     /// <summary>Replaces the whole map.</summary>
     let inline set (value: Map<'K, 'V>) (mapValue: cmap<'K, 'V>) = mapValue.Set(Map.toSeq value)
 
+    /// <summary>Tests whether the key is present (FDA <c>cmap.ContainsKey</c> parity).</summary>
+    let inline containsKey (key: 'K) (mapValue: cmap<'K, 'V>) : bool = (AMap.getValue mapValue).ContainsKey key
+
+    /// <summary>Gets the value for the key, or <c>ValueNone</c> when absent (FDA <c>cmap.TryGetValue</c> parity).</summary>
+    let inline tryGetValue (key: 'K) (mapValue: cmap<'K, 'V>) : 'V voption =
+        let view = AMap.getValue mapValue
+        let mutable v = Unchecked.defaultof<'V>
+
+        if view.TryGetValue(key, &v) then
+            ValueSome v
+        else
+            ValueNone
+
+    /// <summary>Gets the value for the key (FDA <c>cmap.Item</c> parity; <see cref="KeyNotFoundException"/> when absent).</summary>
+    let inline item (key: 'K) (mapValue: cmap<'K, 'V>) : 'V = (AMap.getValue mapValue).[key]
+
+    /// <summary>
+    /// Replaces the whole map and returns whether the content changed (FDA
+    /// <c>cmap.UpdateTo</c> parity; deviation: FDA merges with init/update, we
+    /// replace, matching <see cref="set"/>). An equal target marks nothing.
+    /// </summary>
+    let inline updateTo (target: seq<'K * 'V>) (mapValue: cmap<'K, 'V>) : bool =
+        let targetMap = Dictionary<'K, 'V>()
+
+        for k, v in target do
+            targetMap[k] <- v
+
+        let view = AMap.getValue mapValue
+        let mutable changed = view.Count <> targetMap.Count
+
+        if not changed then
+            for KeyValue(k, v) in view do
+                let mutable t = Unchecked.defaultof<'V>
+
+                if not (targetMap.TryGetValue(k, &t)) || not (EqualityComparer<'V>.Default.Equals(t, v)) then
+                    changed <- true
+
+        if changed then
+            mapValue.Set target
+
+        changed
+
+    /// <summary>
+    /// Applies a batch of map operations (FDA <c>cmap.Perform</c> parity). The
+    /// batch is applied atomically: observers receive one net delta.
+    /// </summary>
+    let perform (delta: MapDeltaBuilder<'K, 'V>) (mapValue: cmap<'K, 'V>) : unit =
+        let d = delta.Snapshot()
+
+        if not d.IsEmpty then
+            Transaction.run (fun () ->
+                let sets = d.SetEntries
+
+                for i in 0 .. sets.Length - 1 do
+                    let struct (k, v) = sets.Span[i]
+                    mapValue.AddOrUpdate k v |> ignore
+
+                let rems = d.RemovedKeys
+
+                for i in 0 .. rems.Length - 1 do
+                    mapValue.Remove rems.Span[i] |> ignore)
+
+    /// <summary>Removes all entries (FDA <c>cmap.Clear</c> parity; one atomic batch).</summary>
+    let inline clear (mapValue: cmap<'K, 'V>) : unit =
+        Transaction.run (fun () ->
+            let view = AMap.getValue mapValue
+
+            for KeyValue(k, _) in view do
+                mapValue.Remove k |> ignore)
+
     /// <summary>Views the changeable map as an adaptive map.</summary>
     let inline value (mapValue: cmap<'K, 'V>) : amap<'K, 'V> = mapValue
 
@@ -1422,7 +1553,7 @@ module AList =
     /// The list is rebuilt when either bound changes; the bounds are inclusive.
     /// </summary>
     let inline range (min: aval<^T>) (max: aval<^T>) : alist<^T> =
-        ofAVal (AVal.map2 (fun lo hi -> { lo .. hi }) min max)
+        ofAVal (AVal.map2 (fun lo hi -> seq { lo .. hi }) min max)
 
     /// <summary>
     /// Adaptively looks up the element at the given position (FDA
@@ -1764,6 +1895,54 @@ module CList =
 
     /// <summary>Replaces the whole list. Last-wins over the whole batch inside a transaction.</summary>
     let inline set (values: seq<'T>) (list: clist<'T>) = list.Set values
+
+    /// <summary>
+    /// Replaces the whole list and returns whether the content changed (FDA
+    /// <c>clist.UpdateTo</c> parity). An equal target marks nothing.
+    /// </summary>
+    let inline updateTo (target: 'T[]) (list: clist<'T>) : bool =
+        let view = AList.getValue list
+        let mutable changed = view.Count <> target.Length
+
+        if not changed then
+            let mutable i = 0
+
+            while not changed && i < target.Length do
+                if not (EqualityComparer<'T>.Default.Equals(view[i], target[i])) then
+                    changed <- true
+
+                i <- i + 1
+
+        if changed then
+            list.Set target
+
+        changed
+
+    /// <summary>
+    /// Applies a batch of list operations (FDA <c>clist.Perform</c> parity). The
+    /// operations are positional and applied in order; the batch is atomic
+    /// (observers receive one delta).
+    /// </summary>
+    let perform (delta: ListDeltaBuilder<'T>) (list: clist<'T>) : unit =
+        let d = delta.Snapshot()
+
+        if not d.IsEmpty then
+            Transaction.run (fun () ->
+                let ops = d.Operations
+
+                for i in 0 .. ops.Length - 1 do
+                    let op = ops.Span[i]
+
+                    match op.Kind with
+                    | ListOpKind.Insert -> list.InsertAt(op.Position, op.Value)
+                    | ListOpKind.Remove -> list.RemoveAt op.Position
+                    | _ -> list.UpdateAt(op.Position, op.Value))
+
+    /// <summary>Appends all the given elements (FDA <c>clist.AddRange</c> parity; one atomic batch).</summary>
+    let inline addRange (items: seq<'T>) (list: clist<'T>) : unit =
+        Transaction.run (fun () ->
+            for x in items do
+                list.Append x |> ignore)
 
     /// <summary>Views the changeable list as an adaptive list.</summary>
     let inline value (list: clist<'T>) : alist<'T> = list
