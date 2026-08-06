@@ -599,6 +599,218 @@ type CustomListNode<'T when 'T: equality>([<InlineIfLambda>] compute: IReadOnlyL
         member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
 
 /// <summary>
+/// An adaptive set of a list's elements, deduplicated (FDA
+/// <c>AList.toASet</c> parity). The list deltas are converted to set deltas
+/// with a per-value occurrence count: an element leaves the output only when
+/// its last occurrence leaves. The mirror is aligned with the input positions.
+/// </summary>
+type ToSetListNode<'T when 'T: equality>(source: IAdaptiveList<'T>) =
+    let mutable version = 0L
+    let mutable edges = ParentEdges()
+    let mutable sinks = SinkList.Create()
+    let mutable depVersion = 0L
+    let mutable initialized = false
+    let mutable disposed = false
+    let mutable output = HashSet<'T>()
+    let mutable mirror = ResizeArray<'T>()
+    let mutable refs = Dictionary<'T, int>()
+    let mutable journal = ListDelta<'T>.Create()
+    let mutable out = SetDelta<'T>.Create()
+
+    member private this.Register() =
+        match box source with
+        | :? IListSinkRegistry as r -> r.AddListSink(box (this :> IListDeltaSink<'T>))
+        | _ -> ()
+
+    member private this.Unregister() =
+        match box source with
+        | :? IListSinkRegistry as r -> r.RemoveListSink(box (this :> IListDeltaSink<'T>))
+        | _ -> ()
+
+    member private this.EnsureInitialized() =
+        if not initialized then
+            let snapshot = ResizeArray<'T>(source.GetValue())
+            this.Register()
+
+            for v in snapshot do
+                mirror.Add v
+
+                match refs.TryGetValue v with
+                | true, r -> refs[v] <- r + 1
+                | false, _ ->
+                    refs[v] <- 1
+                    output.Add v |> ignore
+
+            depVersion <- source.Version
+            initialized <- true
+
+    member private this.Drain() =
+        if not journal.IsEmpty then
+            out.Clear()
+            let ops = journal.Ops.Items
+            let cnt = journal.Ops.Count
+
+            for i in 0 .. cnt - 1 do
+                let op = ops[i]
+                let p = op.Position
+
+                match op.Kind with
+                | ListOpKind.Insert ->
+                    mirror.Insert(p, op.Value)
+
+                    match refs.TryGetValue op.Value with
+                    | true, r -> refs[op.Value] <- r + 1
+                    | false, _ ->
+                        refs[op.Value] <- 1
+                        output.Add op.Value |> ignore
+                        out.Adds <- Collections.bufferAppend out.Adds op.Value
+                | ListOpKind.Remove ->
+                    let v = mirror[p]
+                    mirror.RemoveAt p
+                    let r = refs[v] - 1
+
+                    if r = 0 then
+                        refs.Remove v |> ignore
+                        output.Remove v |> ignore
+                        out.Rems <- Collections.bufferAppend out.Rems v
+                    else
+                        refs[v] <- r
+                | _ -> // Update
+                    let old = mirror[p]
+
+                    if not (EqualityComparer<'T>.Default.Equals(old, op.Value)) then
+                        let r = refs[old] - 1
+
+                        if r = 0 then
+                            refs.Remove old |> ignore
+                            output.Remove old |> ignore
+                            out.Rems <- Collections.bufferAppend out.Rems old
+                        else
+                            refs[old] <- r
+
+                        match refs.TryGetValue op.Value with
+                        | true, r2 -> refs[op.Value] <- r2 + 1
+                        | false, _ ->
+                            refs[op.Value] <- 1
+                            output.Add op.Value |> ignore
+                            out.Adds <- Collections.bufferAppend out.Adds op.Value
+
+                    mirror[p] <- op.Value
+
+            journal.Ops.Count <- 0
+            version <- version + 1L
+            Collections.pushAndMarkSet out &sinks edges
+
+    interface IListDeltaSink<'T> with
+        member this.OnDeltas(ops: ListOp<'T>[], opCnt: int) =
+            if not disposed then
+                Collections.journalAppendList &journal ops opCnt
+                version <- version + 1L
+                GraphContext.Default.MarkFrom(edges)
+
+    interface IAdaptiveSet<'T> with
+        member this.GetValue() =
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
+
+            try
+                if disposed then
+                    invalidOp "This adaptive set has been disposed."
+
+                this.EnsureInitialized()
+
+                if source.Version <> depVersion then
+                    source.GetValue() |> ignore
+                    depVersion <- source.Version
+
+                if not journal.IsEmpty then
+                    this.Drain()
+
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                output :> IReadOnlySet<'T>
+            finally
+                ctx.ReleaseOwner()
+
+        member _.Version = version
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                this.Unregister()
+                Collections.clearSinks &sinks
+
+    interface ISetSinkRegistry with
+        member this.AddSetSink(sink) = Collections.addSink &sinks sink
+
+        member this.RemoveSetSink(sink) =
+            Collections.removeSink &sinks sink
+
+    interface IEdgeTarget with
+        member _.EdgeCount = edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
+
+/// <summary>
+/// An adaptive list of a set's elements (FDA <c>AList.ofASet</c> parity, poll
+/// node). The order is the set's iteration order, stable while the set does
+/// not change; every read rebuilds and emits the positional diff.
+/// </summary>
+type SetToListNode<'T when 'T: equality>(source: IAdaptiveSet<'T>) =
+    let mutable data = ResizeArray<'T>()
+    let mutable out = ListDelta<'T>.Create()
+    let mutable version = 0L
+    let mutable sinks = SinkList.Create()
+    let edges = ParentEdges()
+    let mutable disposed = false
+
+    member private this.Poll() =
+        if not disposed then
+            let next = ResizeArray<'T>(source.GetValue())
+
+            if Collections.rebuildListDiff next data &out then
+                version <- version + 1L
+                Collections.pushAndMarkList out &sinks edges
+
+            out.Clear()
+
+    interface IAdaptiveList<'T> with
+        member this.GetValue() =
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
+
+            try
+                if disposed then
+                    invalidOp "This adaptive list has been disposed."
+
+                this.Poll()
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                data :> IReadOnlyList<'T>
+            finally
+                ctx.ReleaseOwner()
+
+        member this.Version =
+            this.Poll()
+            version
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                Collections.clearSinks &sinks
+
+    interface IListSinkRegistry with
+        member this.AddListSink(sink) = Collections.addSink &sinks sink
+
+        member this.RemoveListSink(sink) =
+            Collections.removeSink &sinks sink
+
+    interface IEdgeTarget with
+        member _.EdgeCount = edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
+
+/// <summary>
 /// An adaptive list bound to a scalar value (FDA <c>AList.bind</c> parity):
 /// <c>mapping value</c> selects the inner list; when the value or the inner
 /// list changes, the output is rebuilt and the positional diff is emitted.

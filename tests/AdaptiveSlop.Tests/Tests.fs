@@ -5606,3 +5606,123 @@ let ``CList updateTo perform and addRange`` () =
 
     CList.addRange (seq [ 5; 6 ]) l
     Assert.Equal<int[]>([| 3; 9; 8; 5; 6 |], CList.force l)
+
+// =============================================================================
+// Bring list — §10 conversions + slicing + ASet.sort; §11 AdaptiveReduction
+// par/structpar/mapIn/count.
+// =============================================================================
+
+[<Fact>]
+let ``AList toASet dedups and toIndexedASet pairs positions`` () =
+    let l = CList.ofSeq [ 1; 2; 2; 3 ]
+
+    let s = AList.toASet (CList.value l)
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2; 3 ], ASet.toSet s)
+
+    CList.append 2 l
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2; 3 ], ASet.toSet s) // still one 2
+
+    CList.removeAt 0 l // [ 2; 2; 3 ]: one 2 remains
+    Assert.Equal<Set<int>>(Set.ofList [ 2; 3 ], ASet.toSet s)
+
+    CList.removeAt 0 l // [ 2; 3 ]
+    Assert.Equal<Set<int>>(Set.ofList [ 2; 3 ], ASet.toSet s)
+
+    CList.removeAt 0 l // [ 3; 2 ]
+    Assert.Equal<Set<int>>(Set.ofList [ 2; 3 ], ASet.toSet s)
+
+    CList.removeAt 0 l // [ 2 ]
+    Assert.Equal<Set<int>>(Set.ofList [ 2 ], ASet.toSet s)
+
+    CList.removeAt 0 l // []
+    Assert.Equal<Set<int>>(Set.empty, ASet.toSet s)
+
+    let l2 = CList.ofSeq [ 10; 20 ]
+    let indexed = AList.toIndexedASet (CList.value l2)
+    Assert.Equal<Set<struct (int * int)>>(Set.ofList [ struct (0, 10); struct (1, 20) ], ASet.toSet indexed)
+
+[<Fact>]
+let ``AList ofASet follows the set`` () =
+    let s = CSet.ofSeq [ 3; 1; 2 ]
+    let l = AList.ofASet (CSet.value s)
+
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2; 3 ], ASet.toSet (AList.toASet l))
+    Assert.Equal(3, (AList.force l).Length)
+
+    CSet.add 9 s
+    CSet.remove 1 s
+    Assert.Equal<Set<int>>(Set.ofList [ 2; 3; 9 ], ASet.toSet (AList.toASet l))
+
+[<Fact>]
+let ``AMap toAList and ofAList`` () =
+    let m = CMap.ofSeq [ 1, "a"; 2, "b" ]
+    let l = AMap.toAList (CMap.value m)
+
+    Assert.Equal<Set<int * string>>(Set.ofList [ 1, "a"; 2, "b" ], AList.toArray l |> Set.ofArray)
+
+    CMap.addOrUpdate 3 "c" m
+    Assert.Equal<Set<int * string>>(Set.ofList [ 1, "a"; 2, "b"; 3, "c" ], AList.toArray l |> Set.ofArray)
+
+    let src = CList.ofSeq [ 1, "x"; 2, "y"; 1, "z" ] // duplicate key: last wins
+    let m2 = AMap.ofAList (CList.value src)
+    Assert.Equal<Map<int, string>>(Map.ofList [ 1, "z"; 2, "y" ], AMap.toMap m2)
+
+    CList.append (3, "w") src
+    Assert.Equal<Map<int, string>>(Map.ofList [ 1, "z"; 2, "y"; 3, "w" ], AMap.toMap m2)
+
+[<Fact>]
+let ``ASet sort family returns sorted lists`` () =
+    let s = CSet.ofSeq [ 3; 1; 2; 1 ] // the set dedups to { 1; 2; 3 }
+
+    Assert.Equal<int[]>([| 1; 2; 3 |], AList.toArray (ASet.sort (CSet.value s)))
+    Assert.Equal<int[]>([| 3; 2; 1 |], AList.toArray (ASet.sortDescending (CSet.value s)))
+    Assert.Equal<int[]>([| 1; 2; 3 |], AList.toArray (ASet.sortBy (fun v -> v) (CSet.value s)))
+    Assert.Equal<int[]>([| 3; 2; 1 |], AList.toArray (ASet.sortByDescending (fun v -> v) (CSet.value s)))
+
+    CSet.add 0 s
+    Assert.Equal<int[]>([| 0; 1; 2; 3 |], AList.toArray (ASet.sort (CSet.value s)))
+
+[<Fact>]
+let ``AList slicing syntax`` () =
+    let items = CList.ofSeq [ 0; 1; 2; 3; 4 ]
+    let l = CList.value items
+
+    Assert.Equal<int[]>([| 1; 2; 3 |], AList.toArray l.[1..3])
+    Assert.Equal<int[]>([| 2; 3; 4 |], AList.toArray l.[2..])
+    Assert.Equal<int[]>([| 0; 1 |], AList.toArray l.[..1])
+
+[<Fact>]
+let ``AdaptiveReduction par structpar mapIn count`` () =
+    let l = CList.ofSeq [ 1; 2; 3 ]
+
+    // count and sum in parallel over the same elements
+    let par =
+        AdaptiveReduction.par AdaptiveReduction.count (AdaptiveReduction.sum ())
+
+    let both = AList.reduceBy par (fun v -> v) (CList.value l)
+    let (c, s) = AVal.getValue both
+    Assert.Equal(3, c)
+    Assert.Equal(6, s)
+
+    CList.append 4 l
+    let (c2, s2) = AVal.getValue both
+    Assert.Equal(4, c2)
+    Assert.Equal(10, s2)
+
+    let spar =
+        AdaptiveReduction.structpar AdaptiveReduction.count (AdaptiveReduction.sum ())
+
+    let sboth = AList.reduceBy spar (fun v -> v) (CList.value l)
+    let struct (c3, s3) = AVal.getValue sboth
+    Assert.Equal(4, c3)
+    Assert.Equal(10, s3)
+
+    // mapIn: map the element side before reducing
+    let sumOfSquares =
+        AdaptiveReduction.sum () |> AdaptiveReduction.mapIn (fun v -> v * v)
+
+    let sq = AList.reduceBy sumOfSquares (fun v -> v) (CList.value l)
+    Assert.Equal(30, AVal.getValue sq) // 1 + 4 + 9 + 16
+
+    let c = AList.reduceBy AdaptiveReduction.count (fun v -> v) (CList.value l)
+    Assert.Equal(4, AVal.getValue c)

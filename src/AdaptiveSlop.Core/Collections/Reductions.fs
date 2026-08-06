@@ -54,6 +54,69 @@ module AdaptiveReduction =
           sub = reduction.sub
           view = fun s -> mapping (reduction.view s) }
 
+    /// <summary>
+    /// Composes two reductions over the same element in parallel (FDA
+    /// <c>AdaptiveReduction.par</c> parity; tuple state). The subtract falls
+    /// back to a full recompute when either side cannot invert.
+    /// </summary>
+    let inline par
+        (left: AdaptiveReduction<'a, 's, 'v>)
+        (right: AdaptiveReduction<'a, 't, 'w>)
+        : AdaptiveReduction<'a, 's * 't, 'v * 'w> =
+        { seed = (left.seed, right.seed)
+          add = fun (s, t) a -> (left.add s a, right.add t a)
+          sub =
+            fun (s, t) a ->
+                match left.sub s a with
+                | ValueSome s' ->
+                    match right.sub t a with
+                    | ValueSome t' -> ValueSome(s', t')
+                    | ValueNone -> ValueNone
+                | ValueNone -> ValueNone
+          view = fun (s, t) -> (left.view s, right.view t) }
+
+    /// <summary>
+    /// Composes two reductions over the same element in parallel (FDA
+    /// <c>AdaptiveReduction.structpar</c> parity; struct state, no tuple
+    /// allocation).
+    /// </summary>
+    let inline structpar
+        (left: AdaptiveReduction<'a, 's, 'v>)
+        (right: AdaptiveReduction<'a, 't, 'w>)
+        : AdaptiveReduction<'a, struct ('s * 't), struct ('v * 'w)> =
+        { seed = struct (left.seed, right.seed)
+          add = fun struct (s, t) a -> struct (left.add s a, right.add t a)
+          sub =
+            fun struct (s, t) a ->
+                match left.sub s a with
+                | ValueSome s' ->
+                    match right.sub t a with
+                    | ValueSome t' -> ValueSome(struct (s', t'))
+                    | ValueNone -> ValueNone
+                | ValueNone -> ValueNone
+          view = fun struct (s, t) -> struct (left.view s, right.view t) }
+
+    /// <summary>
+    /// Maps the element side of a reduction (FDA <c>AdaptiveReduction.mapIn</c>
+    /// parity).
+    /// </summary>
+    let inline mapIn
+        ([<InlineIfLambda>] mapping: 'a -> 'b)
+        (reduction: AdaptiveReduction<'b, 's, 'v>)
+        : AdaptiveReduction<'a, 's, 'v> =
+        { seed = reduction.seed
+          add = fun s a -> reduction.add s (mapping a)
+          sub = fun s a -> reduction.sub s (mapping a)
+          view = reduction.view }
+
+    /// <summary>Counts the elements (FDA <c>AdaptiveReduction.count</c> parity).</summary>
+    let count<'a> : AdaptiveReduction<'a, int, int> =
+        { seed = 0
+          add = fun s _ -> s + 1
+          sub = fun s _ -> ValueSome(s - 1)
+          view = id }
+
+
     /// <summary>A reduction with an invertible subtract operation.</summary>
     let inline group
         (zero: 's)

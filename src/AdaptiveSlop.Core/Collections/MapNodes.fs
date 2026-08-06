@@ -1300,6 +1300,195 @@ type BindMapNode<'K, 'V, 'T when 'K: equality>
         member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
 
 /// <summary>
+/// An adaptive map of a list of entries (FDA <c>AMap.ofAList</c> parity). The
+/// list deltas are converted to map deltas: an insert or update sets the key,
+/// a remove drops the key. The mirror (key per input position) is aligned
+/// with the source; a key update replaces the entry in place.
+/// </summary>
+type AListToMapNode<'K, 'V when 'K: equality>(source: IAdaptiveList<'K * 'V>) =
+    let mutable version = 0L
+    let mutable edges = ParentEdges()
+    let mutable sinks = SinkList.Create()
+    let mutable depVersion = 0L
+    let mutable initialized = false
+    let mutable disposed = false
+    let mutable output = Dictionary<'K, 'V>()
+    let mutable mirror = ResizeArray<'K * 'V>()
+    let mutable journal = ListDelta<'K * 'V>.Create()
+    let mutable out = MapDelta<'K, 'V>.Create()
+
+    member private this.Register() =
+        match box source with
+        | :? IListSinkRegistry as r -> r.AddListSink(box (this :> IListDeltaSink<'K * 'V>))
+        | _ -> ()
+
+    member private this.Unregister() =
+        match box source with
+        | :? IListSinkRegistry as r -> r.RemoveListSink(box (this :> IListDeltaSink<'K * 'V>))
+        | _ -> ()
+
+    member private this.EnsureInitialized() =
+        if not initialized then
+            let snapshot = ResizeArray<'K * 'V>(source.GetValue())
+            this.Register()
+
+            for kv in snapshot do
+                mirror.Add kv
+                output[fst kv] <- snd kv
+
+            depVersion <- source.Version
+            initialized <- true
+
+    member private this.Drain() =
+        if not journal.IsEmpty then
+            out.Clear()
+            let ops = journal.Ops.Items
+            let cnt = journal.Ops.Count
+
+            for i in 0 .. cnt - 1 do
+                let op = ops[i]
+                let p = op.Position
+
+                match op.Kind with
+                | ListOpKind.Insert ->
+                    mirror.Insert(p, op.Value)
+                    output[fst op.Value] <- snd op.Value
+                    out.Sets <- Collections.bufferAppend out.Sets (struct (fst op.Value, snd op.Value))
+                | ListOpKind.Remove ->
+                    let k = fst mirror[p]
+                    mirror.RemoveAt p
+                    output.Remove k |> ignore
+                    out.Rems <- Collections.bufferAppend out.Rems k
+                | _ -> // Update
+                    let (oldK, _) = mirror[p]
+                    mirror[p] <- op.Value
+
+                    if EqualityComparer<'K>.Default.Equals(oldK, fst op.Value) then
+                        output[fst op.Value] <- snd op.Value
+                        out.Sets <- Collections.bufferAppend out.Sets (struct (fst op.Value, snd op.Value))
+                    else
+                        output.Remove oldK |> ignore
+                        out.Rems <- Collections.bufferAppend out.Rems oldK
+                        output[fst op.Value] <- snd op.Value
+                        out.Sets <- Collections.bufferAppend out.Sets (struct (fst op.Value, snd op.Value))
+
+            journal.Ops.Count <- 0
+            version <- version + 1L
+            Collections.pushAndMarkMap out &sinks edges
+
+    interface IListDeltaSink<'K * 'V> with
+        member this.OnDeltas(ops: ListOp<'K * 'V>[], opCnt: int) =
+            if not disposed then
+                Collections.journalAppendList &journal ops opCnt
+                version <- version + 1L
+                GraphContext.Default.MarkFrom(edges)
+
+    interface IAdaptiveMap<'K, 'V> with
+        member this.GetValue() =
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
+
+            try
+                if disposed then
+                    invalidOp "This adaptive map has been disposed."
+
+                this.EnsureInitialized()
+
+                if source.Version <> depVersion then
+                    source.GetValue() |> ignore
+                    depVersion <- source.Version
+
+                if not journal.IsEmpty then
+                    this.Drain()
+
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                output :> IReadOnlyDictionary<'K, 'V>
+            finally
+                ctx.ReleaseOwner()
+
+        member _.Version = version
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                this.Unregister()
+                Collections.clearSinks &sinks
+
+    interface IMapSinkRegistry with
+        member this.AddMapSink(sink) = Collections.addSink &sinks sink
+
+        member this.RemoveMapSink(sink) =
+            Collections.removeSink &sinks sink
+
+    interface IEdgeTarget with
+        member _.EdgeCount = edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
+
+/// <summary>
+/// An adaptive list of a map's entries (FDA <c>AMap.toAList</c> parity, poll
+/// node). The order is the map's iteration order, stable while the map does
+/// not change; every read rebuilds and emits the positional diff.
+/// </summary>
+type MapToAListNode<'K, 'V when 'K: equality>(source: IAdaptiveMap<'K, 'V>) =
+    let mutable data = ResizeArray<'K * 'V>()
+    let mutable out = ListDelta<'K * 'V>.Create()
+    let mutable version = 0L
+    let mutable sinks = SinkList.Create()
+    let edges = ParentEdges()
+    let mutable disposed = false
+
+    member private this.Poll() =
+        if not disposed then
+            let next = ResizeArray<'K * 'V>()
+
+            for KeyValue(k, v) in source.GetValue() do
+                next.Add(k, v)
+
+            if Collections.rebuildListDiff next data &out then
+                version <- version + 1L
+                Collections.pushAndMarkList out &sinks edges
+
+            out.Clear()
+
+    interface IAdaptiveList<'K * 'V> with
+        member this.GetValue() =
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
+
+            try
+                if disposed then
+                    invalidOp "This adaptive list has been disposed."
+
+                this.Poll()
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                data :> IReadOnlyList<'K * 'V>
+            finally
+                ctx.ReleaseOwner()
+
+        member this.Version =
+            this.Poll()
+            version
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                Collections.clearSinks &sinks
+
+    interface IListSinkRegistry with
+        member this.AddListSink(sink) = Collections.addSink &sinks sink
+
+        member this.RemoveListSink(sink) =
+            Collections.removeSink &sinks sink
+
+    interface IEdgeTarget with
+        member _.EdgeCount = edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
+
+/// <summary>
 /// Maps every entry, disposing the mapped value when its key leaves (FDA
 /// <c>AMap.mapUse</c> parity). The mapped values are stable (the mapping runs
 /// once per key). Disposing the node disposes all live mapped values and

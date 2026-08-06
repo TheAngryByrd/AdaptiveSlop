@@ -504,6 +504,30 @@ module ASet =
     /// </summary>
     let inline force (set: aset<'T>) : FrozenSet<'T> = set.GetValue().ToFrozenSet()
 
+    /// <summary>
+    /// The sorted set as a list, using the given comparison (gap sheet §10.2,
+    /// stable, poll node; a sorted set is a list by construction).
+    /// </summary>
+    let inline sortWith ([<InlineIfLambda>] comparer: 'T -> 'T -> int) (set: aset<'T>) : alist<'T> =
+        new SortListNode<'T, 'T>(new SetToListNode<'T>(set), (fun _ v -> v), comparer)
+
+    /// <summary>The sorted set as a list, ascending (gap sheet §10.2, stable).</summary>
+    let inline sort (set: aset<'T>) : alist<'T> = sortWith compare set
+
+    /// <summary>The sorted set as a list, descending (gap sheet §10.2, stable).</summary>
+    let inline sortDescending (set: aset<'T>) : alist<'T> = sortWith (fun a b -> compare b a) set
+
+    /// <summary>
+    /// The set sorted by the keys given by the projection, as a list (gap
+    /// sheet §10.2, stable).
+    /// </summary>
+    let inline sortBy ([<InlineIfLambda>] f: 'T -> 'K) (set: aset<'T>) : alist<'T> =
+        new SortListNode<'T, 'K>(new SetToListNode<'T>(set), (fun _ v -> f v), compare)
+
+    /// <summary>The set sorted by the keys given by the projection, descending (gap sheet §10.2, stable).</summary>
+    let inline sortByDescending ([<InlineIfLambda>] f: 'T -> 'K) (set: aset<'T>) : alist<'T> =
+        new SortListNode<'T, 'K>(new SetToListNode<'T>(set), (fun _ v -> f v), fun a b -> compare b a)
+
     /// <summary>Materializes the F# <c>Set</c> counterpart (sorted, structural equality).</summary>
     let inline toSet (set: aset<'T>) : Set<'T> = Set.ofSeq (set.GetValue())
 
@@ -796,6 +820,19 @@ module AMap =
     /// <summary>An adaptive set of the map's keys (gap sheet §4.14).</summary>
     let inline keys (mapValue: amap<'K, 'V>) : aset<'K> =
         new MapToSetNode<'K, 'V, 'K>(mapValue, fun k _ -> k)
+
+    /// <summary>
+    /// An adaptive list of the map's entries (FDA <c>AMap.toAList</c> parity,
+    /// poll node). The order is the map's iteration order, stable while the
+    /// map does not change.
+    /// </summary>
+    let inline toAList (mapValue: amap<'K, 'V>) : alist<'K * 'V> = new MapToAListNode<'K, 'V>(mapValue)
+
+    /// <summary>
+    /// An adaptive map of a list of entries (FDA <c>AMap.ofAList</c> parity).
+    /// Duplicate keys: the last entry wins.
+    /// </summary>
+    let inline ofAList (list: alist<'K * 'V>) : amap<'K, 'V> = new AListToMapNode<'K, 'V>(list)
 
     /// <summary>An adaptive set of the map's distinct values (FDA <c>toASetValues</c> parity).</summary>
     let inline toASetValues (mapValue: amap<'K, 'V>) : aset<'V> =
@@ -1602,6 +1639,27 @@ module AList =
         AdaptiveNode<'T[]>(fun () -> Seq.toArray (list.GetValue()))
 
     /// <summary>
+    /// An adaptive set of the list's elements, deduplicated (FDA
+    /// <c>AList.toASet</c> parity). An element leaves the output only when its
+    /// last occurrence leaves.
+    /// </summary>
+    let inline toASet (list: alist<'T>) : aset<'T> = new ToSetListNode<'T>(list)
+
+    /// <summary>
+    /// An adaptive set of the elements paired with their input positions
+    /// (FDA <c>AList.toIndexedASet</c> parity; struct pairs, the library
+    /// convention).
+    /// </summary>
+    let inline toIndexedASet (list: alist<'T>) : aset<struct (int * 'T)> = list |> indexed |> toASet
+
+    /// <summary>
+    /// An adaptive list of a set's elements (FDA <c>AList.ofASet</c> parity,
+    /// poll node). The order is the set's iteration order, stable while the
+    /// set does not change.
+    /// </summary>
+    let inline ofASet (set: aset<'T>) : alist<'T> = new SetToListNode<'T>(set)
+
+    /// <summary>
     /// Reverses the list (FDA <c>AList.rev</c> parity, poll node).
     /// </summary>
     let inline rev (list: alist<'T>) : alist<'T> =
@@ -1952,3 +2010,25 @@ module CList =
 
     /// <summary>Materializes the F# <c>list</c> counterpart.</summary>
     let inline toList (list: clist<'T>) : 'T list = AList.toList list
+
+/// <summary>
+/// Slicing for adaptive lists (gap sheet §10.1): <c>list.[a..b]</c>. The
+/// bounds are clamped; the slice is the window <c>[a, b]</c> inclusive.
+/// </summary>
+[<AutoOpen>]
+module AListSliceExtensions =
+    type IAdaptiveList<'T> with
+        /// <summary>
+        /// Slicing: <c>list.[a..b]</c> (gap sheet §10.1). The bounds are
+        /// clamped; the slice is the window <c>[a, b]</c> inclusive.
+        /// </summary>
+        /// <example>
+        /// <code>
+        /// let items = CList.ofSeq [ 0; 1; 2; 3; 4 ]
+        /// let middle = (CList.value items).[1..3]   // [ 1; 2; 3 ]
+        /// </code>
+        /// </example>
+        member this.GetSlice(start: int option, finish: int option) : alist<'T> =
+            let s = defaultArg start 0
+            let f = defaultArg finish System.Int32.MaxValue
+            AList.sub s (max 0 (f - s + 1)) this
