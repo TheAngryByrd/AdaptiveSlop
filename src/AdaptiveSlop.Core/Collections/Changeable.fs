@@ -2,6 +2,7 @@ namespace AdaptiveSlop.Core
 
 open System
 open System.Collections.Generic
+open System.Threading
 
 // =============================================================================
 // Changeable collection sources (PLAN.md Section 6.9)
@@ -9,7 +10,127 @@ open System.Collections.Generic
 // A source write: updates the internal state, advances the version, appends the
 // net delta to the journal of every registered sink, and marks the scalar
 // parents. Writes never process a delta; processing happens on read (drain).
+//
+// Cross-thread posting (the cval.Post handoff pattern, per node): a post from
+// any thread lands in a per-node pending-op ring (PostedOpRing); the first op
+// of a pending batch enqueues the node into the global post ring through a
+// coalescing flag. At the next drain (auto-pump at the outermost claim of a
+// graph operation, or Posting.pump) the owner applies all pending ops as one
+// batch: one net delta, one notification delivery. The per-node rings are the
+// only additional Interlocked/Volatile use in the core, inside the explicit
+// handoff structure (PLAN.md §7.3).
 // =============================================================================
+
+/// Internal. One pending posted operation on a changeable set: an element
+/// add/remove, or a full replace (the op carries the whole new content).
+[<Struct>]
+type internal SetPostOp<'T> =
+    | Add of item: 'T
+    | Remove of item: 'T
+    | Replace of content: seq<'T>
+
+/// Internal. One pending posted operation on a changeable map.
+[<Struct>]
+type internal MapPostOp<'K, 'V> =
+    | AddOrUpdate of key: 'K * value: 'V
+    | Remove of key: 'K
+    | Replace of content: seq<'K * 'V>
+
+/// Internal. One pending posted operation on a changeable list. Insert with
+/// position -1 appends at the replay-time end of the batch.
+[<Struct>]
+type internal ListPostOp<'T> =
+    | Insert of position: int * value: 'T
+    | RemoveAt of position: int
+    | UpdateAt of position: int * value: 'T
+    | RemoveValue of value: 'T
+    | Replace of content: seq<'T>
+
+/// Internal. Capacity of a per-node posted-op ring. A producer spins when
+/// the ring is full; the owner drains at its next graph operation or pump.
+module internal PostedOps =
+    [<Literal>]
+    let RingCapacity = 1024
+
+/// <summary>
+/// Internal. Bounded multi-producer, single-consumer ring of pending posted
+/// operations for one changeable node. Preallocated; a post allocates
+/// nothing. The sequence-number discipline is identical to PostRing (PLAN.md
+/// §7.3): a producer claims a slot by CAS on the head, writes the payload,
+/// and publishes it with a release write of the slot sequence; the owner
+/// consumes by sequence number and advances the tail. A slot is reused only
+/// after the owner consumed it, so a live slot is never read and written
+/// concurrently: posted operations cannot tear.
+/// </summary>
+/// <remarks>
+/// Full-ring policy matches PostRing: the producer spins with bounded backoff
+/// until the owner drains. A post blocks rather than drop; the owner drains
+/// at its next graph operation or at <c>Posting.pump</c>.
+/// </remarks>
+[<AllowNullLiteral>]
+type internal PostedOpRing<'P>(capacity: int) =
+    let mask = capacity - 1
+    // Sequence numbers and payloads in parallel arrays: the payload store
+    // happens-before the sequence release, the sequence acquire
+    // happens-before the payload load, so a published payload is never read
+    // while it is written (no tearing).
+    let seqs = Array.zeroCreate<int> capacity
+    let payloads: 'P[] = Array.zeroCreate capacity
+
+    do
+        for i in 0 .. capacity - 1 do
+            seqs[i] <- i
+
+    // Producer claim position. The consumer position belongs to the owner thread.
+    let mutable head = 0L
+    let mutable tail = 0L
+
+    /// Enqueue one op. Spins until a slot is free. Called by any thread.
+    member this.Enqueue(payload: 'P) =
+        let mutable h = Volatile.Read(&head)
+        let mutable enqueued = false
+        let mutable spins = 0
+
+        while not enqueued do
+            let idx = int (h &&& int64 mask)
+            let seq = Volatile.Read(&seqs[idx])
+
+            if int h = seq then
+                if Interlocked.CompareExchange(&head, h + 1L, h) = h then
+                    payloads[idx] <- payload
+                    Volatile.Write(&seqs[idx], seq + 1)
+                    enqueued <- true
+            elif seq < int h then
+                // The ring is full: the slot has not been consumed yet. Wait
+                // with bounded backoff (policy: a post blocks until the owner
+                // drains; ops are never dropped).
+                spins <- spins + 1
+
+                if spins >= 32 then
+                    Thread.Yield() |> ignore
+                    spins <- 0
+                else
+                    Thread.SpinWait(8)
+
+                h <- Volatile.Read(&head)
+            else
+                // Claimed by another producer; retry at the new head.
+                h <- Volatile.Read(&head)
+
+    /// Dequeue one op, or none when empty. Called by the owner thread only.
+    member this.TryDequeue() : 'P voption =
+        let t = Volatile.Read(&tail)
+        let idx = int (t &&& int64 mask)
+        let seq = Volatile.Read(&seqs[idx])
+
+        if seq = int t + 1 then
+            let payload = payloads[idx]
+            payloads[idx] <- Unchecked.defaultof<'P>
+            Volatile.Write(&seqs[idx], int (t + int64 capacity))
+            Volatile.Write(&tail, t + 1L)
+            ValueSome payload
+        else
+            ValueNone
 
 /// <summary>
 /// A changeable set: the writable source of an adaptive set. Reads and writes
@@ -42,6 +163,11 @@ type ChangeableSet<'T>(initial: seq<'T>) =
     let mutable flushEnqueued = false
     // Pending full replace for Set inside a transaction. Last write wins.
     let mutable pendingValue: seq<'T> voption = ValueNone
+    // Posted ops (the cval.Post handoff pattern): a coalescing flag plus a
+    // per-node ring, allocated lazily on the first post. Foreign-thread posts
+    // land here; the owner applies them at the next drain as one batch.
+    let mutable postedOps: PostedOpRing<SetPostOp<'T>> = null
+    let mutable posted = 0
 
     member private this.PushAndMark() =
         if not outDelta.IsEmpty then
@@ -179,6 +305,124 @@ type ChangeableSet<'T>(initial: seq<'T>) =
         finally
             ctx.ReleaseOwner()
 
+    // ---------------------------------------------------------------------
+    // Cross-thread posting (the cval.Post handoff pattern)
+    // ---------------------------------------------------------------------
+
+    member private this.PostOp(op: SetPostOp<'T>) =
+        let ring =
+            match postedOps with
+            | null ->
+                let created = PostedOpRing<SetPostOp<'T>>(PostedOps.RingCapacity)
+
+                if Interlocked.CompareExchange(&postedOps, created, null) = null then
+                    created
+                else
+                    postedOps
+            | existing -> existing
+
+        ring.Enqueue op
+
+        // Coalesce a burst into one enqueue: only the first op of a pending
+        // batch puts the node into the global post ring. Ops that land while
+        // a batch is pending join that batch.
+        if Interlocked.CompareExchange(&posted, 1, 0) = 0 then
+            GraphContext.Default.PostRing.Enqueue(this :> obj)
+
+    member private this.ApplyPostedBatch() =
+        // Clear the queued flag before applying (the cval.Post pattern): a
+        // post that lands after the clear re-enqueues, so its op cannot be
+        // lost.
+        Interlocked.Exchange(&posted, 0) |> ignore
+
+        if not (isNull postedOps) then
+            // Replay the pending ops in arrival order through the net-delta
+            // scratch state (the same replay the transaction commit runs). A
+            // full replace supersedes the earlier ops of the batch, matching
+            // the transaction semantics of Set. Ops arriving during the
+            // replay stay in the ring and apply at the next drain.
+            scratchAdds.Clear()
+            scratchRems.Clear()
+            let mutable hasReplace = false
+            let mutable replaceValue = Unchecked.defaultof<seq<'T>>
+            let mutable op = postedOps.TryDequeue()
+
+            while op.IsSome do
+                let o = op.Value
+
+                match o with
+                | SetPostOp.Replace content ->
+                    hasReplace <- true
+                    replaceValue <- content
+                    scratchAdds.Clear()
+                    scratchRems.Clear()
+                | SetPostOp.Add item ->
+                    if not (scratchRems.Remove item) && not (data.Contains item) then
+                        scratchAdds.Add item |> ignore
+                | SetPostOp.Remove item ->
+                    if not (scratchAdds.Remove item) && data.Contains item then
+                        scratchRems.Add item |> ignore
+
+                op <- postedOps.TryDequeue()
+
+            if hasReplace then
+                this.Apply replaceValue
+            elif scratchAdds.Count > 0 || scratchRems.Count > 0 then
+                outDelta.Clear()
+
+                for item in scratchAdds do
+                    data.Add item |> ignore
+                    outDelta.Adds <- Collections.bufferAppend outDelta.Adds item
+
+                for item in scratchRems do
+                    data.Remove item |> ignore
+                    outDelta.Rems <- Collections.bufferAppend outDelta.Rems item
+
+                this.PushAndMark()
+
+    /// <summary>
+    /// Posts an add. Safe from any thread: the operation is queued and
+    /// returns immediately. The owner thread applies the queued operations at
+    /// the next graph operation (reads and writes auto-drain) or at
+    /// <c>Posting.pump</c>, as one batch: one net delta, one notification
+    /// delivery, and a burst is coalesced into a single handoff.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// // worker thread
+    /// CSet.postAdd item items
+    /// // owner thread: the next read applies the post automatically
+    /// let view = ASet.force items
+    /// </code>
+    /// </example>
+    member this.PostAdd(item: 'T) = this.PostOp(SetPostOp.Add item)
+
+    /// <summary>
+    /// Posts a remove. Safe from any thread. See <see cref="PostAdd"/> for
+    /// the application contract.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// // worker thread
+    /// CSet.postRemove item items
+    /// </code>
+    /// </example>
+    member this.PostRemove(item: 'T) = this.PostOp(SetPostOp.Remove item)
+
+    /// <summary>
+    /// Posts a full replace. Safe from any thread. See <see cref="PostAdd"/>
+    /// for the application contract; a posted replace supersedes the other
+    /// ops of the same pending batch (the transaction semantics of
+    /// <see cref="Set"/>).
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// // worker thread
+    /// CSet.postSet (Set.ofList [ 1; 2; 3 ]) items
+    /// </code>
+    /// </example>
+    member this.PostSet(newValue: seq<'T>) = this.PostOp(SetPostOp.Replace newValue)
+
     interface ICommit with
         member this.Commit() =
             // The pending full replace supersedes the whole batch: journaled
@@ -230,6 +474,9 @@ type ChangeableSet<'T>(initial: seq<'T>) =
         member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
         member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
 
+    interface IPostSource with
+        member this.ApplyPosted() = this.ApplyPostedBatch()
+
 /// <summary>
 /// A changeable map: the writable source of an adaptive map. Reads and writes
 /// are confined to the owner thread. See <see cref="ChangeableSet&lt;'T&gt;"/>
@@ -251,6 +498,11 @@ type ChangeableMap<'K, 'V when 'K: equality>(initial: seq<'K * 'V>) =
     let mutable flushEnqueued = false
     // Pending full replace for Set inside a transaction. Last write wins.
     let mutable pendingValue: seq<'K * 'V> voption = ValueNone
+    // Posted ops (the cval.Post handoff pattern): a coalescing flag plus a
+    // per-node ring, allocated lazily on the first post. Foreign-thread posts
+    // land here; the owner applies them at the next drain as one batch.
+    let mutable postedOps: PostedOpRing<MapPostOp<'K, 'V>> = null
+    let mutable posted = 0
 
     do
         for (k, v) in initial do
@@ -415,6 +667,144 @@ type ChangeableMap<'K, 'V when 'K: equality>(initial: seq<'K * 'V>) =
         finally
             ctx.ReleaseOwner()
 
+    // ---------------------------------------------------------------------
+    // Cross-thread posting (the cval.Post handoff pattern)
+    // ---------------------------------------------------------------------
+
+    member private this.PostOp(op: MapPostOp<'K, 'V>) =
+        let ring =
+            match postedOps with
+            | null ->
+                let created = PostedOpRing<MapPostOp<'K, 'V>>(PostedOps.RingCapacity)
+
+                if Interlocked.CompareExchange(&postedOps, created, null) = null then
+                    created
+                else
+                    postedOps
+            | existing -> existing
+
+        ring.Enqueue op
+
+        // Coalesce a burst into one enqueue: only the first op of a pending
+        // batch puts the node into the global post ring. Ops that land while
+        // a batch is pending join that batch.
+        if Interlocked.CompareExchange(&posted, 1, 0) = 0 then
+            GraphContext.Default.PostRing.Enqueue(this :> obj)
+
+    member private this.ApplyPostedBatch() =
+        // Clear the queued flag before applying (the cval.Post pattern): a
+        // post that lands after the clear re-enqueues, so its op cannot be
+        // lost.
+        Interlocked.Exchange(&posted, 0) |> ignore
+
+        if not (isNull postedOps) then
+            // Replay the pending ops in arrival order through the net-delta
+            // scratch state (the same replay the transaction commit runs). A
+            // full replace supersedes the earlier ops of the batch, matching
+            // the transaction semantics of Set. Ops arriving during the
+            // replay stay in the ring and apply at the next drain.
+            scratchSets.Clear()
+            scratchRems.Clear()
+            let mutable hasReplace = false
+            let mutable replaceValue = Unchecked.defaultof<seq<'K * 'V>>
+            let mutable op = postedOps.TryDequeue()
+
+            while op.IsSome do
+                let o = op.Value
+
+                match o with
+                | MapPostOp.Replace content ->
+                    hasReplace <- true
+                    replaceValue <- content
+                    scratchSets.Clear()
+                    scratchRems.Clear()
+                | MapPostOp.AddOrUpdate(key, value) ->
+                    scratchRems.Remove key |> ignore
+                    scratchSets[key] <- value
+                | MapPostOp.Remove key ->
+                    if not (scratchSets.Remove key) && data.ContainsKey key then
+                        scratchRems.Add key |> ignore
+
+                op <- postedOps.TryDequeue()
+
+            if hasReplace then
+                this.Apply replaceValue
+            elif scratchSets.Count > 0 || scratchRems.Count > 0 then
+                outDelta.Clear()
+
+                for KeyValue(k, v) in scratchSets do
+                    let mutable old = Unchecked.defaultof<'V>
+
+                    if data.TryGetValue(k, &old) && EqualityComparer<'V>.Default.Equals(old, v) then
+                        ()
+                    else
+                        data[k] <- v
+                        outDelta.Sets <- Collections.bufferAppend outDelta.Sets (struct (k, v))
+
+                for k in scratchRems do
+                    data.Remove k |> ignore
+                    outDelta.Rems <- Collections.bufferAppend outDelta.Rems k
+
+                this.PushAndMark()
+
+    /// <summary>
+    /// Posts an add or update. Safe from any thread: the operation is queued
+    /// and returns immediately. The owner thread applies the queued
+    /// operations at the next graph operation (reads and writes auto-drain)
+    /// or at <c>Posting.pump</c>, as one batch: one net delta, one
+    /// notification delivery, and a burst is coalesced into a single handoff.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// // worker thread
+    /// CMap.postAddOrUpdate key value map
+    /// // owner thread: the next read applies the post automatically
+    /// let view = AMap.force map
+    /// </code>
+    /// </example>
+    member this.PostAddOrUpdate (key: 'K) (valueToSet: 'V) =
+        this.PostOp(MapPostOp.AddOrUpdate(key, valueToSet))
+
+    /// <summary>
+    /// Posts a remove. Safe from any thread. See <see cref="PostAddOrUpdate"/>
+    /// for the application contract.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// // worker thread
+    /// CMap.postRemove key map
+    /// </code>
+    /// </example>
+    member this.PostRemove(key: 'K) = this.PostOp(MapPostOp.Remove key)
+
+    /// <summary>
+    /// Posts a full replace. Safe from any thread. See
+    /// <see cref="PostAddOrUpdate"/> for the application contract; a posted
+    /// replace supersedes the other ops of the same pending batch (the
+    /// transaction semantics of <see cref="Set"/>).
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// // worker thread
+    /// CMap.postSet (Map.ofList [ 1, "a" ]) map
+    /// </code>
+    /// </example>
+    member this.PostSet(newValue: seq<'K * 'V>) = this.PostOp(MapPostOp.Replace newValue)
+
+    /// <summary>
+    /// Posts a clear (a full replace with the empty map). Safe from any
+    /// thread. See <see cref="PostAddOrUpdate"/> for the application
+    /// contract.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// // worker thread
+    /// CMap.postClear map
+    /// </code>
+    /// </example>
+    member this.PostClear() =
+        this.PostOp(MapPostOp.Replace Seq.empty)
+
     interface ICommit with
         member this.Commit() =
             // The pending full replace supersedes the whole batch: journaled
@@ -466,6 +856,9 @@ type ChangeableMap<'K, 'V when 'K: equality>(initial: seq<'K * 'V>) =
         member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
         member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
 
+    interface IPostSource with
+        member this.ApplyPosted() = this.ApplyPostedBatch()
+
 /// <summary>An abbreviation for <see cref="ChangeableSet&lt;'T&gt;"/> (FDA <c>cset&lt;'T&gt;</c> parity).</summary>
 type cset<'T> = ChangeableSet<'T>
 
@@ -506,6 +899,11 @@ type ChangeableList<'T>(initial: seq<'T>) =
     // Pending full replace for Set inside a transaction. Last-wins over the
     // whole batch; applied after the journal replay.
     let mutable pendingValue: seq<'T> voption = ValueNone
+    // Posted ops (the cval.Post handoff pattern): a coalescing flag plus a
+    // per-node ring, allocated lazily on the first post. Foreign-thread posts
+    // land here; the owner applies them at the next drain as one batch.
+    let mutable postedOps: PostedOpRing<ListPostOp<'T>> = null
+    let mutable posted = 0
     // Virtual count of the replay state: data.Count at the first journaled op,
     // then maintained by every op that changes the length. Appends journal
     // the position at the replay-time end, so several appends in one batch
@@ -871,9 +1269,232 @@ type ChangeableList<'T>(initial: seq<'T>) =
         finally
             ctx.ReleaseOwner()
 
+    // ---------------------------------------------------------------------
+    // Cross-thread posting (the cval.Post handoff pattern)
+    // ---------------------------------------------------------------------
+
+    member private this.PostOp(op: ListPostOp<'T>) =
+        let ring =
+            match postedOps with
+            | null ->
+                let created = PostedOpRing<ListPostOp<'T>>(PostedOps.RingCapacity)
+
+                if Interlocked.CompareExchange(&postedOps, created, null) = null then
+                    created
+                else
+                    postedOps
+            | existing -> existing
+
+        ring.Enqueue op
+
+        // Coalesce a burst into one enqueue: only the first op of a pending
+        // batch puts the node into the global post ring. Ops that land while
+        // a batch is pending join that batch.
+        if Interlocked.CompareExchange(&posted, 1, 0) = 0 then
+            GraphContext.Default.PostRing.Enqueue(this :> obj)
+
+    member private this.ApplyPostedBatch() =
+        // Clear the queued flag before applying (the cval.Post pattern): a
+        // post that lands after the clear re-enqueues, so its op cannot be
+        // lost.
+        Interlocked.Exchange(&posted, 0) |> ignore
+
+        if not (isNull postedOps) then
+            // Consume the whole pending batch first: if a positional op is
+            // invalid, the batch aborts as a whole — nothing applies and no
+            // op is left in the ring. Positions refer to the state built by
+            // the earlier ops of the batch and are validated here, at apply
+            // time (the posting thread cannot know the owner's list).
+            let pending = ResizeArray<ListPostOp<'T>>()
+            let mutable op = postedOps.TryDequeue()
+
+            while op.IsSome do
+                pending.Add op.Value
+                op <- postedOps.TryDequeue()
+
+            if pending.Count > 0 then
+                let replay = ResizeArray<'T>(data)
+                let mutable hasReplace = false
+                let mutable replaceValue = Unchecked.defaultof<seq<'T>>
+
+                for o in pending do
+                    match o with
+                    | ListPostOp.Replace content ->
+                        hasReplace <- true
+                        replaceValue <- content
+                    | ListPostOp.Insert(position, value) ->
+                        // Insert; position -1 appends at the replay-time end.
+                        let pos = if position = -1 then replay.Count else position
+
+                        if pos < 0 || pos > replay.Count then
+                            raise (
+                                ArgumentOutOfRangeException(
+                                    "position",
+                                    "Posted insert is out of range when the batch applies."
+                                )
+                            )
+
+                        replay.Insert(pos, value)
+                    | ListPostOp.RemoveAt position ->
+                        if position < 0 || position >= replay.Count then
+                            raise (
+                                ArgumentOutOfRangeException(
+                                    "position",
+                                    "Posted remove is out of range when the batch applies."
+                                )
+                            )
+
+                        replay.RemoveAt position
+                    | ListPostOp.UpdateAt(position, value) ->
+                        if position < 0 || position >= replay.Count then
+                            raise (
+                                ArgumentOutOfRangeException(
+                                    "position",
+                                    "Posted update is out of range when the batch applies."
+                                )
+                            )
+
+                        replay[position] <- value
+                    | ListPostOp.RemoveValue value ->
+                        // Remove the first occurrence.
+                        let mutable index = -1
+                        let mutable i = 0
+
+                        while index < 0 && i < replay.Count do
+                            if EqualityComparer<'T>.Default.Equals(replay[i], value) then
+                                index <- i
+                            else
+                                i <- i + 1
+
+                        if index >= 0 then
+                            replay.RemoveAt index
+
+                // A full replace supersedes the other ops of the batch
+                // (the transaction semantics of Set). Otherwise the batch
+                // applies as one prefix/suffix-trim diff; the diff is empty
+                // when the batch changed nothing.
+                if hasReplace then
+                    this.Apply replaceValue
+                else
+                    this.Apply(replay :> seq<'T>)
+
+    /// <summary>
+    /// Posts an append. Safe from any thread: the operation is queued and
+    /// returns immediately. The owner thread applies the queued operations at
+    /// the next graph operation (reads and writes auto-drain) or at
+    /// <c>Posting.pump</c>, as one batch: one delta, one notification
+    /// delivery, and a burst is coalesced into a single handoff. Positions of
+    /// the batch refer to the state built by its earlier ops.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// // worker thread
+    /// CList.postAppend item items
+    /// // owner thread: the next read applies the post automatically
+    /// let view = AList.force items
+    /// </code>
+    /// </example>
+    member this.PostAppend(value: 'T) =
+        this.PostOp(ListPostOp.Insert(-1, value))
+
+    /// <summary>
+    /// Posts an insert at the start. Safe from any thread. See
+    /// <see cref="PostAppend"/> for the application contract.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// // worker thread
+    /// CList.postPrepend item items
+    /// </code>
+    /// </example>
+    member this.PostPrepend(value: 'T) =
+        this.PostOp(ListPostOp.Insert(0, value))
+
+    /// <summary>
+    /// Posts an insert before the element currently at the position. Safe
+    /// from any thread. See <see cref="PostAppend"/> for the application
+    /// contract; the position is validated when the batch applies and refers
+    /// to the state built by the earlier ops of the batch.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// // worker thread
+    /// CList.postInsertAt 0 item items
+    /// </code>
+    /// </example>
+    member this.PostInsertAt(position: int, value: 'T) =
+        this.PostOp(ListPostOp.Insert(position, value))
+
+    /// <summary>
+    /// Posts a remove at the position. Safe from any thread. See
+    /// <see cref="PostAppend"/> for the application contract; the position is
+    /// validated when the batch applies.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// // worker thread
+    /// CList.postRemoveAt 0 items
+    /// </code>
+    /// </example>
+    member this.PostRemoveAt(position: int) =
+        this.PostOp(ListPostOp.RemoveAt position)
+
+    /// <summary>
+    /// Posts a replace at the position. Safe from any thread. See
+    /// <see cref="PostAppend"/> for the application contract; the position is
+    /// validated when the batch applies.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// // worker thread
+    /// CList.postUpdateAt 0 item items
+    /// </code>
+    /// </example>
+    member this.PostUpdateAt(position: int, value: 'T) =
+        this.PostOp(ListPostOp.UpdateAt(position, value))
+
+    /// <summary>
+    /// Posts a remove of the first occurrence of the value. Safe from any
+    /// thread. See <see cref="PostAppend"/> for the application contract; the
+    /// scan runs when the batch applies.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// // worker thread
+    /// CList.postRemove item items
+    /// </code>
+    /// </example>
+    member this.PostRemove(value: 'T) =
+        this.PostOp(ListPostOp.RemoveValue value)
+
+    /// <summary>
+    /// Posts a clear. Safe from any thread. See <see cref="PostAppend"/> for
+    /// the application contract.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// // worker thread
+    /// CList.postClear items
+    /// </code>
+    /// </example>
+    member this.PostClear() = this.PostSet(Seq.empty)
+
+    /// <summary>
+    /// Posts a full replace. Safe from any thread. See <see cref="PostAppend"/>
+    /// for the application contract; a posted replace supersedes the other ops
+    /// of the same pending batch (the transaction semantics of <see cref="Set"/>).
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// // worker thread
+    /// CList.postSet [ 1; 2; 3 ] items
+    /// </code>
+    /// </example>
+    member this.PostSet(newValues: seq<'T>) =
+        this.PostOp(ListPostOp.Replace newValues)
+
     /// <summary>Gets the number of elements.</summary>
     member _.Count = data.Count
-
     /// <summary>Gets whether the list is empty.</summary>
     member _.IsEmpty = data.Count = 0
 
@@ -936,6 +1557,9 @@ type ChangeableList<'T>(initial: seq<'T>) =
         member _.EdgeCount = edges.Count
         member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
         member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
+
+    interface IPostSource with
+        member this.ApplyPosted() = this.ApplyPostedBatch()
 
 /// <summary>An abbreviation for <see cref="ChangeableList&lt;'T&gt;"/> (FDA <c>clist&lt;'T&gt;</c> parity).</summary>
 type clist<'T> = ChangeableList<'T>

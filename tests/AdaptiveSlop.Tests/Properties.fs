@@ -19,6 +19,7 @@ module AdaptiveSlop.Properties
 
 open System
 open System.Collections.Generic
+open System.Threading.Tasks
 open global.Xunit
 open FsCheck
 open FsCheck.FSharp
@@ -3589,3 +3590,102 @@ let ``AMap mapA over Guid keys matches the reference model`` () =
                 failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
 
     Check.One(nonIntConfig, prop)
+
+// =============================================================================
+// Cross-thread posting: a posted batch must match sequential application of
+// the same operations (single producer, one drain).
+// =============================================================================
+
+[<Fact>]
+let ``posted set ops match the sequential model`` () =
+    let prop (ops: (bool * int) list) =
+        let source = CSet.empty<int>
+        let model = HashSet<int>()
+
+        for (isAdd, v) in ops do
+            if isAdd then
+                model.Add v |> ignore
+            else
+                model.Remove v |> ignore
+
+        let worker =
+            Task.Run(fun () ->
+                for (isAdd, v) in ops do
+                    if isAdd then
+                        CSet.postAdd v source
+                    else
+                        CSet.postRemove v source)
+
+        worker.Wait()
+        Posting.pump ()
+
+        Assert.Equal<Set<int>>(Set.ofSeq model, ASet.toSet source)
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``posted map ops match the sequential model`` () =
+    let prop (ops: (int * int) list) =
+        let source = CMap.empty<int, int>
+        let model = Dictionary<int, int>()
+
+        for (k, v) in ops do
+            if v % 2 = 0 then
+                model[k] <- v
+            else
+                model.Remove k |> ignore
+
+        let worker =
+            Task.Run(fun () ->
+                for (k, v) in ops do
+                    if v % 2 = 0 then
+                        CMap.postAddOrUpdate k v source
+                    else
+                        CMap.postRemove k source)
+
+        worker.Wait()
+        Posting.pump ()
+
+        let expected = Map.ofSeq [ for KeyValue(k, v) in model -> k, v ]
+        Assert.Equal<Map<int, int>>(expected, AMap.toMap source)
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``posted list ops match the sequential model`` () =
+    let prop (values: int list) =
+        let source = CList.empty<int>
+        // Model: kind (0 = insert, 1 = removeAt), position, value.
+        let model = ResizeArray<int>()
+        let ops = ResizeArray<int * int * int>()
+
+        for v in values do
+            // abs of a bounded residue: Int32.MinValue is safe.
+            let n = abs (v % 997)
+
+            if v % 2 = 0 then
+                let pos = n % (model.Count + 1)
+                model.Insert(pos, v)
+                ops.Add(0, pos, v)
+            elif model.Count > 0 then
+                let pos = n % model.Count
+                model.RemoveAt pos
+                ops.Add(1, pos, 0)
+            else
+                model.Add v
+                ops.Add(0, model.Count - 1, v)
+
+        let worker =
+            Task.Run(fun () ->
+                for (kind, pos, v) in ops do
+                    if kind = 0 then
+                        CList.postInsertAt pos v source
+                    else
+                        CList.postRemoveAt pos source)
+
+        worker.Wait()
+        Posting.pump ()
+
+        Assert.Equal<int[]>(model.ToArray(), AList.force source)
+
+    Check.QuickThrowOnFailure prop

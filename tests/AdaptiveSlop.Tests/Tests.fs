@@ -5716,3 +5716,323 @@ let ``AdaptiveReduction par structpar mapIn count`` () =
 
     let c = AList.reduceBy AdaptiveReduction.count (fun v -> v) (CList.value l)
     Assert.Equal(4, AVal.getValue c)
+
+// =============================================================================
+// Cross-thread posting (the cval.Post handoff pattern) on the changeable
+// collections. A post from any thread lands in a per-node pending-op ring;
+// the owner applies it at the next graph operation (auto-pump) or at
+// Posting.pump, as one batch with one notification delivery.
+// =============================================================================
+
+[<Fact>]
+let ``CSet posts apply on the next read`` () =
+    let items = CSet.empty<int>
+    let doneSignal = new ManualResetEventSlim(false)
+
+    let worker =
+        Task.Run(fun () ->
+            CSet.postAdd 1 items
+            CSet.postAdd 2 items
+            doneSignal.Set())
+
+    doneSignal.Wait()
+    worker.Wait()
+
+    // The read's claim auto-drains the pending posts before it returns.
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2 ], ASet.toSet items)
+
+[<Fact>]
+let ``posted set batch delivers one net delta`` () =
+    let items = CSet.empty<int>
+    let mutable callbacks = 0
+    let mutable lastAdds = Set.empty<int>
+    let mutable lastRems = Set.empty<int>
+
+    use _obs =
+        ASet.observe
+            (fun _ (d: SetDelta<int>) ->
+                callbacks <- callbacks + 1
+                lastAdds <- d.Added.ToArray() |> Set.ofArray
+                lastRems <- d.Removed.ToArray() |> Set.ofArray)
+            items
+
+    let doneSignal = new ManualResetEventSlim(false)
+
+    let worker =
+        Task.Run(fun () ->
+            CSet.postAdd 1 items
+            CSet.postAdd 2 items
+            CSet.postRemove 1 items // cancels the add of 1
+            doneSignal.Set())
+
+    doneSignal.Wait()
+    worker.Wait()
+    Posting.pump ()
+
+    Assert.Equal(1, callbacks)
+    Assert.Equal<Set<int>>(Set.ofList [ 2 ], lastAdds)
+    Assert.Equal<Set<int>>(Set.empty, lastRems)
+    Assert.Equal<Set<int>>(Set.ofList [ 2 ], ASet.toSet items)
+
+[<Fact>]
+let ``posted set batch with no net change marks nothing`` () =
+    let items = CSet.empty<int>
+    let mutable callbacks = 0
+
+    use _obs = ASet.observe (fun _ _ -> callbacks <- callbacks + 1) items
+
+    let doneSignal = new ManualResetEventSlim(false)
+
+    let worker =
+        Task.Run(fun () ->
+            CSet.postAdd 1 items
+            CSet.postRemove 1 items
+            doneSignal.Set())
+
+    doneSignal.Wait()
+    worker.Wait()
+    Posting.pump ()
+
+    Assert.Equal(0, callbacks)
+    Assert.Equal<Set<int>>(Set.empty, ASet.toSet items)
+
+[<Fact>]
+let ``posted replace supersedes the other ops of the batch`` () =
+    let items = CSet.empty<int>
+    let doneSignal = new ManualResetEventSlim(false)
+
+    let worker =
+        Task.Run(fun () ->
+            CSet.postAdd 1 items
+            CSet.postSet (Set.ofList [ 9; 10 ]) items
+            doneSignal.Set())
+
+    doneSignal.Wait()
+    worker.Wait()
+    Posting.pump ()
+
+    Assert.Equal<Set<int>>(Set.ofList [ 9; 10 ], ASet.toSet items)
+
+[<Fact>]
+let ``CMap posts apply as one net delta`` () =
+    let mapValue = CMap.empty<int, string>
+    let mutable callbacks = 0
+    let mutable lastSets = Map.empty<int, string>
+
+    use _obs =
+        AMap.observe
+            (fun _ (d: MapDelta<int, string>) ->
+                callbacks <- callbacks + 1
+                lastSets <- Map.ofSeq [ for struct (k, v) in d.SetEntries.ToArray() -> k, v ])
+            mapValue
+
+    let doneSignal = new ManualResetEventSlim(false)
+
+    let worker =
+        Task.Run(fun () ->
+            CMap.postAddOrUpdate 1 "a" mapValue
+            CMap.postAddOrUpdate 2 "b" mapValue
+            CMap.postRemove 1 mapValue // cancels the add of 1
+            doneSignal.Set())
+
+    doneSignal.Wait()
+    worker.Wait()
+    Posting.pump ()
+
+    Assert.Equal(1, callbacks)
+    Assert.Equal<Map<int, string>>(Map.ofList [ 2, "b" ], lastSets)
+    Assert.Equal<Map<int, string>>(Map.ofList [ 2, "b" ], AMap.toMap mapValue)
+
+[<Fact>]
+let ``CList posts preserve order and apply-time positions`` () =
+    let items = CList.empty<int>
+    let doneSignal = new ManualResetEventSlim(false)
+
+    let worker =
+        Task.Run(fun () ->
+            CList.postAppend 1 items
+            CList.postAppend 2 items
+            CList.postAppend 3 items
+            doneSignal.Set())
+
+    doneSignal.Wait()
+    worker.Wait()
+    Posting.pump ()
+
+    Assert.Equal<int[]>([| 1; 2; 3 |], AList.force items)
+
+    // Positions refer to the state built by the earlier ops of the batch:
+    // both inserts land at position 0 of the evolving list.
+    let doneSignal2 = new ManualResetEventSlim(false)
+
+    let worker2 =
+        Task.Run(fun () ->
+            CList.postInsertAt 0 9 items
+            CList.postInsertAt 0 8 items
+            doneSignal2.Set())
+
+    doneSignal2.Wait()
+    worker2.Wait()
+    Posting.pump ()
+
+    Assert.Equal<int[]>([| 8; 9; 1; 2; 3 |], AList.force items)
+
+    let doneSignal3 = new ManualResetEventSlim(false)
+
+    let worker3 =
+        Task.Run(fun () ->
+            CList.postRemoveAt 0 items
+            CList.postRemoveAt 0 items
+            doneSignal3.Set())
+
+    doneSignal3.Wait()
+    worker3.Wait()
+    Posting.pump ()
+
+    Assert.Equal<int[]>([| 1; 2; 3 |], AList.force items)
+
+[<Fact>]
+let ``CList postRemove removes the first occurrence`` () =
+    let items = CList.empty<int>
+    let doneSignal = new ManualResetEventSlim(false)
+
+    let worker =
+        Task.Run(fun () ->
+            CList.postAppend 1 items
+            CList.postAppend 2 items
+            CList.postAppend 1 items
+            CList.postRemove 1 items
+            doneSignal.Set())
+
+    doneSignal.Wait()
+    worker.Wait()
+    Posting.pump ()
+
+    Assert.Equal<int[]>([| 2; 1 |], AList.force items)
+
+[<Fact>]
+let ``CList postClear and postSet replace the content`` () =
+    let items = CList.ofSeq [ 1; 2; 3 ]
+    let doneSignal = new ManualResetEventSlim(false)
+
+    let worker =
+        Task.Run(fun () ->
+            CList.postAppend 4 items
+            CList.postClear items // the replace supersedes the whole batch
+            doneSignal.Set())
+
+    doneSignal.Wait()
+    worker.Wait()
+    Posting.pump ()
+
+    // The replace (clear) supersedes the whole batch.
+    Assert.Equal<int[]>(Array.empty, AList.force items)
+
+    let doneSignal2 = new ManualResetEventSlim(false)
+
+    let worker2 =
+        Task.Run(fun () ->
+            CList.postSet [ 7; 8 ] items
+            doneSignal2.Set())
+
+    doneSignal2.Wait()
+    worker2.Wait()
+    Posting.pump ()
+
+    Assert.Equal<int[]>([| 7; 8 |], AList.force items)
+
+[<Fact>]
+let ``posted list positions are validated at apply time`` () =
+    let items = CList.empty<int>
+    let doneSignal = new ManualResetEventSlim(false)
+
+    let worker =
+        Task.Run(fun () ->
+            CList.postRemoveAt 5 items // invalid when the batch applies
+            doneSignal.Set())
+
+    doneSignal.Wait()
+    worker.Wait()
+
+    Assert.Throws<ArgumentOutOfRangeException>(fun () -> Posting.pump ()) |> ignore
+
+    // The failed batch applies nothing and the graph stays usable: a later
+    // valid batch applies normally (the drain failure unwinds the owner
+    // claim before propagating).
+    let doneSignal2 = new ManualResetEventSlim(false)
+
+    let worker2 =
+        Task.Run(fun () ->
+            CList.postAppend 1 items
+            doneSignal2.Set())
+
+    doneSignal2.Wait()
+    worker2.Wait()
+    Posting.pump ()
+
+    Assert.Equal<int[]>([| 1 |], AList.force items)
+
+[<Fact>]
+let ``posts inside a transaction apply after commit`` () =
+    let items = CSet.empty<int>
+    let started = new ManualResetEventSlim(false)
+    let posted = new ManualResetEventSlim(false)
+
+    Transaction.run (fun () ->
+        // A post lands while the transaction is open: the auto-pump is
+        // skipped (reads inside a transaction see the pre-transaction state).
+        let worker =
+            Task.Run(fun () ->
+                started.Wait()
+                CSet.postAdd 1 items
+                posted.Set())
+
+        started.Set()
+        posted.Wait()
+        worker.Wait()
+
+        Assert.Equal<Set<int>>(Set.empty, ASet.toSet items)
+
+        CSet.add 2 items)
+
+    // The post applies at the next graph operation, after the commit.
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2 ], ASet.toSet items)
+
+[<Fact>]
+let ``concurrent producers post to one set without loss`` () =
+    let items = CSet.empty<int>
+    let n = 500
+
+    let workers =
+        [| 1..2 |]
+        |> Array.map (fun w ->
+            Task.Run(fun () ->
+                for i in 1..n do
+                    CSet.postAdd (w * 100000 + i) items))
+
+    workers |> Array.iter (fun w -> w.Wait())
+    Posting.pump ()
+
+    Assert.Equal(2 * n, (ASet.getValue items).Count)
+
+[<Fact>]
+let ``posting allocates nothing after the first post`` () =
+    let items = CSet.empty<int>
+    // Warm up: the first post allocates the per-node ring lazily.
+    CSet.postAdd 0 items
+    Posting.pump ()
+
+    let workerAlloc =
+        Task
+            .Run(fun () ->
+                let before = GC.GetAllocatedBytesForCurrentThread()
+
+                for i in 1..1000 do
+                    CSet.postAdd i items
+
+                GC.GetAllocatedBytesForCurrentThread() - before)
+            .Result
+
+    Posting.pump ()
+    Assert.Equal(1001, (ASet.getValue items).Count)
+    Assert.True(workerAlloc < 1024, sprintf "worker allocated %d bytes per 1000 posts" workerAlloc)
