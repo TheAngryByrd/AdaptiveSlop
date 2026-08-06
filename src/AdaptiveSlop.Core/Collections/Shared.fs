@@ -763,8 +763,7 @@ module internal Collections =
     /// A throwing sink is isolated: the parents are still marked (the state
     /// already moved and downstream nodes must re-read), and the exception is
     /// rethrown after marking and delivery.
-    let pushAndMarkSet (delta: SetDelta<'T>) (sinks: SinkList byref) (edges: ParentEdges) =
-        let ctx = GraphContext.Default
+    let inline pushAndMarkSet (ctx: GraphContext) (delta: SetDelta<'T>) (sinks: SinkList byref) (edges: ParentEdges) =
         let wasActive = ctx.TxActive
         ctx.TxActive <- true
 
@@ -792,8 +791,12 @@ module internal Collections =
     /// A throwing sink is isolated: the parents are still marked (the state
     /// already moved and downstream nodes must re-read), and the exception is
     /// rethrown after marking and delivery.
-    let pushAndMarkMap (delta: MapDelta<'K, 'V>) (sinks: SinkList byref) (edges: ParentEdges) =
-        let ctx = GraphContext.Default
+    let inline pushAndMarkMap
+        (ctx: GraphContext)
+        (delta: MapDelta<'K, 'V>)
+        (sinks: SinkList byref)
+        (edges: ParentEdges)
+        =
         let wasActive = ctx.TxActive
         ctx.TxActive <- true
 
@@ -838,8 +841,7 @@ module internal Collections =
     /// A throwing sink is isolated: the parents are still marked (the state
     /// already moved and downstream nodes must re-read), and the exception is
     /// rethrown after marking and delivery.
-    let pushAndMarkList (delta: ListDelta<'T>) (sinks: SinkList byref) (edges: ParentEdges) =
-        let ctx = GraphContext.Default
+    let inline pushAndMarkList (ctx: GraphContext) (delta: ListDelta<'T>) (sinks: SinkList byref) (edges: ParentEdges) =
         let wasActive = ctx.TxActive
         ctx.TxActive <- true
 
@@ -1078,7 +1080,7 @@ module internal Collections =
     /// notification delivery deferred (PLAN.md Section 6.5). The byref appears
     /// only at this top-level call site (a class field address: 0 allocation).
     let inline drainSetPush ([<InlineIfLambda>] map: 'T -> 'U voption) (state: SetNodeState<'T, 'U> byref) =
-        let ctx = GraphContext.Default
+        let ctx = GraphContext.Current
         let wasActive = ctx.TxActive
         ctx.TxActive <- true
 
@@ -1097,7 +1099,7 @@ module internal Collections =
 
     /// Drain a plain set node (filter) and push the reduced output delta.
     let inline drainPlainSetPush ([<InlineIfLambda>] map: 'T -> 'T voption) (state: SetNodeState<'T, 'T> byref) =
-        let ctx = GraphContext.Default
+        let ctx = GraphContext.Current
         let wasActive = ctx.TxActive
         ctx.TxActive <- true
 
@@ -1117,7 +1119,7 @@ module internal Collections =
     /// Drain a map node and push the reduced output delta to its sinks, with
     /// notification delivery deferred (PLAN.md Section 6.5).
     let inline drainMapPush ([<InlineIfLambda>] map: 'K -> 'V -> 'U voption) (state: MapNodeState<'K, 'V, 'U> byref) =
-        let ctx = GraphContext.Default
+        let ctx = GraphContext.Current
         let wasActive = ctx.TxActive
         ctx.TxActive <- true
 
@@ -1451,7 +1453,7 @@ module internal Collections =
         s
 
     /// <summary>Drain both journals of a two-source set node. Returns the updated state and whether the output changed.</summary>
-    let drainTwoSet (op: TwoSetOp) (s: TwoSetState<'T>) : struct (TwoSetState<'T> * bool) =
+    let inline drainTwoSet (op: TwoSetOp) (s: TwoSetState<'T>) : struct (TwoSetState<'T> * bool) =
         let struct (s1, c1) = processTwoSide op 0 s
         let mutable struct (s2, c2) = processTwoSide op 1 s1
 
@@ -1467,8 +1469,8 @@ module internal Collections =
     /// with notification delivery deferred (PLAN.md Section 6.5). The byref appears
     /// only at this top-level call site (a class field address: 0 allocation).
     /// </summary>
-    let drainTwoSetPush (op: TwoSetOp) (state: TwoSetState<'T> byref) =
-        let ctx = GraphContext.Default
+    let inline drainTwoSetPush (op: TwoSetOp) (state: TwoSetState<'T> byref) =
+        let ctx = GraphContext.Current
         let wasActive = ctx.TxActive
         ctx.TxActive <- true
 
@@ -1859,7 +1861,7 @@ module internal Collections =
         ([<InlineIfLambda>] mapping: 'K -> 'V1 voption -> 'V2 voption -> 'V3 voption)
         (state: Choose2State<'K, 'V1, 'V2, 'V3> byref)
         =
-        let ctx = GraphContext.Default
+        let ctx = GraphContext.Current
         let wasActive = ctx.TxActive
         ctx.TxActive <- true
 
@@ -2131,7 +2133,7 @@ module internal Collections =
     /// value: the per-element hot path must not pass byrefs through byref
     /// parameters. Returns the updated state and whether the output changed.
     /// </summary>
-    let drainCollect
+    let inline drainCollect
         (target: ICollectTarget<'T, 'U>)
         (mapping: 'T -> IAdaptiveSet<'U>)
         (s: CollectState<'T, 'U>)
@@ -2334,12 +2336,12 @@ module internal Collections =
     /// notification delivery deferred (PLAN.md Section 6.5). The byref appears
     /// only at this top-level call site (a class field address: 0 allocation).
     /// </summary>
-    let drainCollectPush
+    let inline drainCollectPush
         (target: ICollectTarget<'T, 'U>)
         (mapping: 'T -> IAdaptiveSet<'U>)
         (state: CollectState<'T, 'U> byref)
         =
-        let ctx = GraphContext.Default
+        let ctx = GraphContext.Current
         let wasActive = ctx.TxActive
         ctx.TxActive <- true
 
@@ -2405,7 +2407,7 @@ module internal Collections =
     /// the per-element hot path must not pass byrefs through byref parameters.
     /// Returns the updated state and whether the output changed.
     /// </summary>
-    let drainBindSet (s: BindSetState<'U>) : struct (BindSetState<'U> * bool) =
+    let inline drainBindSet (s: BindSetState<'U>) : struct (BindSetState<'U> * bool) =
         let mutable s = s
         let mutable changed = false
         let rems = s.Journal.Rems
@@ -2457,8 +2459,8 @@ module internal Collections =
     /// notification delivery deferred (PLAN.md Section 6.5). The byref appears
     /// only at this top-level call site (a class field address: 0 allocation).
     /// </summary>
-    let drainBindSetPush (state: BindSetState<'U> byref) =
-        let ctx = GraphContext.Default
+    let inline drainBindSetPush (state: BindSetState<'U> byref) =
+        let ctx = GraphContext.Current
         let wasActive = ctx.TxActive
         ctx.TxActive <- true
 
@@ -2524,7 +2526,7 @@ module internal Collections =
     /// By value: the per-element hot path must not pass byrefs through byref
     /// parameters. Returns the updated state and whether the output changed.
     /// </summary>
-    let drainBindMap (s: BindMapState<'K, 'V>) : struct (BindMapState<'K, 'V> * bool) =
+    let inline drainBindMap (s: BindMapState<'K, 'V>) : struct (BindMapState<'K, 'V> * bool) =
         let mutable s = s
         let mutable changed = false
         let rems = s.Journal.Rems
@@ -2580,8 +2582,8 @@ module internal Collections =
     /// notification delivery deferred (PLAN.md Section 6.5). The byref appears
     /// only at this top-level call site (a class field address: 0 allocation).
     /// </summary>
-    let drainBindMapPush (state: BindMapState<'K, 'V> byref) =
-        let ctx = GraphContext.Default
+    let inline drainBindMapPush (state: BindMapState<'K, 'V> byref) =
+        let ctx = GraphContext.Current
         let wasActive = ctx.TxActive
         ctx.TxActive <- true
 

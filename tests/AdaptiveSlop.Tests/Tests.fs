@@ -6083,3 +6083,170 @@ let ``posting allocates nothing after the first post`` () =
     Posting.pump ()
     Assert.Equal(1001, (ASet.getValue items).Count)
     Assert.True(workerAlloc < 1024, sprintf "worker allocated %d bytes per 1000 posts" workerAlloc)
+
+// =============================================================================
+// Phase 8 — Per-thread graphs
+//
+// Every thread owns its ambient graph, created lazily on first use. A node
+// belongs to the graph of its creating thread. Direct operations on another
+// thread's nodes are rejected in debug builds; cross-thread changes go
+// through the post machinery and land in the node's own graph ring.
+//
+// A dedicated Thread is used for the foreign thread (Task.Run may inline the
+// work on the caller's own thread-pool thread, which would not be foreign).
+// =============================================================================
+
+/// Runs f on a dedicated thread and rethrows any exception on the caller.
+/// The caller must not need to interleave with f (no shared barriers).
+let private runOnThread (f: unit -> unit) : unit =
+    let mutable error: exn option = None
+
+    let t =
+        Thread(fun () ->
+            try
+                f ()
+            with ex ->
+                error <- Some ex)
+
+    t.Start()
+    t.Join()
+
+    match error with
+    | None -> ()
+    | Some ex -> raise ex
+
+/// Starts a dedicated thread that runs f, captures its exception, and joins
+/// it on dispose, rethrowing the captured exception.
+let private startThread (f: unit -> unit) : IDisposable =
+    let mutable error: exn option = None
+
+    let t =
+        Thread(fun () ->
+            try
+                f ()
+            with ex ->
+                error <- Some ex)
+
+    t.Start()
+
+    { new IDisposable with
+        member _.Dispose() =
+            t.Join()
+
+            match error with
+            | None -> ()
+            | Some ex -> raise ex }
+
+[<Fact>]
+let ``two threads own independent graphs`` () =
+    // The exact scenario: main and a background thread each create their own
+    // cval and write it concurrently. With per-thread graphs the writes never
+    // contend; with a shared graph the debug check would throw.
+    let value = CVal.create 10
+    let barrier = new Barrier(2)
+
+    let worker =
+        startThread (fun () ->
+            let valueb = CVal.create 10 // the worker's own graph
+            barrier.SignalAndWait()
+            valueb.Set 20
+            barrier.SignalAndWait()
+
+            if AVal.getValue valueb <> 20 then
+                failwith "background value wrong"
+
+            valueb.Set 21
+
+            if AVal.getValue valueb <> 21 then
+                failwith "background value wrong after second write")
+
+    barrier.SignalAndWait()
+    value.Set 15
+    barrier.SignalAndWait()
+
+    if AVal.getValue value <> 15 then
+        failwith "main value wrong"
+
+    value.Set 16
+
+    if AVal.getValue value <> 16 then
+        failwith "main value wrong after second write"
+
+    // Joins the worker and rethrows any worker failure.
+    worker.Dispose()
+
+[<Fact>]
+let ``collections on different threads are independent`` () =
+    let items = CSet.empty<int> // main's graph
+    let barrier = new Barrier(2)
+
+    let worker =
+        startThread (fun () ->
+            let workerItems = CSet.empty<int> // the worker's own graph
+            CSet.add 1 workerItems
+            barrier.SignalAndWait()
+            CSet.add 2 workerItems
+            barrier.SignalAndWait()
+
+            if ASet.toSet workerItems <> Set.ofList [ 1; 2 ] then
+                failwith "worker set wrong")
+
+    barrier.SignalAndWait()
+    CSet.add 10 items
+    barrier.SignalAndWait()
+
+    // Joins the worker and rethrows any worker failure before the asserts.
+    worker.Dispose()
+
+    Assert.Equal<Set<int>>(Set.ofList [ 10 ], ASet.toSet items)
+
+[<Fact>]
+let ``a thread with its own graph posts into the owner's ring`` () =
+    let value = CVal.create 0 // main's graph
+    let posted = new ManualResetEventSlim(false)
+
+    runOnThread (fun () ->
+        let own = CVal.create 1 // the worker's own graph
+        own.Set 2 // worker operates its own graph freely
+        value.Post 7 // cross-thread: lands in MAIN's ring
+
+        // The worker's pump must not apply the post: it sits in the node's
+        // own ring. If it landed in the worker's ring, applying it would
+        // claim the node's graph from a foreign thread (debug owner check)
+        // and throw.
+        Posting.pump ()
+        posted.Set())
+
+    posted.Wait()
+
+    // The owner's next graph operation drains and applies the post.
+    Assert.Equal(7, AVal.getValue value)
+
+#if DEBUG
+[<Fact>]
+let ``direct access to another thread's node throws in debug`` () =
+    let value = CVal.create 10
+    let mutable threw = false
+
+    runOnThread (fun () ->
+        try
+            value.Set 99 // foreign thread, direct access
+        with :? InvalidOperationException ->
+            threw <- true)
+
+    Assert.True(threw)
+    Assert.Equal(10, AVal.getValue value)
+
+[<Fact>]
+let ``direct read of another thread's node throws in debug`` () =
+    let value = CVal.create 10
+    let mutable threw = false
+
+    runOnThread (fun () ->
+        try
+            AVal.getValue value |> ignore
+        with :? InvalidOperationException ->
+            threw <- true)
+
+    Assert.True(threw)
+#endif

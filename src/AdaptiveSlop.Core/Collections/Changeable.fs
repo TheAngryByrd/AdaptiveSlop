@@ -149,6 +149,9 @@ type internal PostedOpRing<'P>(capacity: int) =
 /// </para>
 /// </remarks>
 type ChangeableSet<'T>(initial: seq<'T>) =
+    // The graph this node belongs to, captured at creation (the ambient graph
+    // of the creating thread).
+    let ctx = GraphContext.Current
     let mutable version = 0L
     let data = HashSet<'T>(initial)
     let edges = ParentEdges()
@@ -172,7 +175,7 @@ type ChangeableSet<'T>(initial: seq<'T>) =
     member private this.PushAndMark() =
         if not outDelta.IsEmpty then
             version <- version + 1L
-            Collections.pushAndMarkSet outDelta &sinks edges
+            Collections.pushAndMarkSet ctx outDelta &sinks edges
             outDelta.Clear()
 
     member private this.Apply(newValue: seq<'T>) =
@@ -250,7 +253,6 @@ type ChangeableSet<'T>(initial: seq<'T>) =
     /// transaction (later writes of the batch are discarded; matches the
     /// list, docs/ALIST-DESIGN.md §3.3).</summary>
     member this.Set(newValue: seq<'T>) =
-        let ctx = GraphContext.Default
         ctx.ClaimOwner()
 
         try
@@ -269,7 +271,6 @@ type ChangeableSet<'T>(initial: seq<'T>) =
 
     /// <summary>Adds an element. No-op when already present.</summary>
     member this.Add(item: 'T) =
-        let ctx = GraphContext.Default
         ctx.ClaimOwner()
 
         try
@@ -288,7 +289,6 @@ type ChangeableSet<'T>(initial: seq<'T>) =
 
     /// <summary>Removes an element. No-op when absent.</summary>
     member this.Remove(item: 'T) =
-        let ctx = GraphContext.Default
         ctx.ClaimOwner()
 
         try
@@ -327,7 +327,7 @@ type ChangeableSet<'T>(initial: seq<'T>) =
         // batch puts the node into the global post ring. Ops that land while
         // a batch is pending join that batch.
         if Interlocked.CompareExchange(&posted, 1, 0) = 0 then
-            GraphContext.Default.PostRing.Enqueue(this :> obj)
+            ctx.PostRing.Enqueue(this :> obj)
 
     member private this.ApplyPostedBatch() =
         // Clear the queued flag before applying (the cval.Post pattern): a
@@ -445,11 +445,10 @@ type ChangeableSet<'T>(initial: seq<'T>) =
 
     interface IAdaptiveSet<'T> with
         member this.GetValue() =
-            let ctx = GraphContext.Default
             ctx.ClaimOwner()
 
             try
-                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                ctx.AddDependency(this :> IAdaptiveObject, version)
                 data :> IReadOnlySet<'T>
             finally
                 ctx.ReleaseOwner()
@@ -485,6 +484,9 @@ type ChangeableSet<'T>(initial: seq<'T>) =
 /// for the transaction and view contracts.
 /// </summary>
 type ChangeableMap<'K, 'V when 'K: equality>(initial: seq<'K * 'V>) =
+    // The graph this node belongs to, captured at creation (the ambient graph
+    // of the creating thread).
+    let ctx = GraphContext.Current
     let mutable version = 0L
     let data = Dictionary<'K, 'V>()
     let edges = ParentEdges()
@@ -513,7 +515,7 @@ type ChangeableMap<'K, 'V when 'K: equality>(initial: seq<'K * 'V>) =
     member private this.PushAndMark() =
         if not outDelta.IsEmpty then
             version <- version + 1L
-            Collections.pushAndMarkMap outDelta &sinks edges
+            Collections.pushAndMarkMap ctx outDelta &sinks edges
             outDelta.Clear()
 
     member private this.Apply(newValue: seq<'K * 'V>) =
@@ -612,7 +614,6 @@ type ChangeableMap<'K, 'V when 'K: equality>(initial: seq<'K * 'V>) =
 
     /// <summary>Adds or updates an entry. No-op when the value is unchanged.</summary>
     member this.AddOrUpdate (key: 'K) (valueToSet: 'V) =
-        let ctx = GraphContext.Default
         ctx.ClaimOwner()
 
         try
@@ -631,7 +632,6 @@ type ChangeableMap<'K, 'V when 'K: equality>(initial: seq<'K * 'V>) =
 
     /// <summary>Removes an entry. No-op when absent.</summary>
     member this.Remove(key: 'K) =
-        let ctx = GraphContext.Default
         ctx.ClaimOwner()
 
         try
@@ -652,7 +652,6 @@ type ChangeableMap<'K, 'V when 'K: equality>(initial: seq<'K * 'V>) =
     /// transaction (later writes of the batch are discarded; matches the
     /// list, docs/ALIST-DESIGN.md §3.3).</summary>
     member this.Set(newValue: seq<'K * 'V>) =
-        let ctx = GraphContext.Default
         ctx.ClaimOwner()
 
         try
@@ -691,7 +690,7 @@ type ChangeableMap<'K, 'V when 'K: equality>(initial: seq<'K * 'V>) =
         // batch puts the node into the global post ring. Ops that land while
         // a batch is pending join that batch.
         if Interlocked.CompareExchange(&posted, 1, 0) = 0 then
-            GraphContext.Default.PostRing.Enqueue(this :> obj)
+            ctx.PostRing.Enqueue(this :> obj)
 
     member private this.ApplyPostedBatch() =
         // Clear the queued flag before applying (the cval.Post pattern): a
@@ -829,11 +828,10 @@ type ChangeableMap<'K, 'V when 'K: equality>(initial: seq<'K * 'V>) =
 
     interface IAdaptiveMap<'K, 'V> with
         member this.GetValue() =
-            let ctx = GraphContext.Default
             ctx.ClaimOwner()
 
             try
-                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                ctx.AddDependency(this :> IAdaptiveObject, version)
                 data :> IReadOnlyDictionary<'K, 'V>
             finally
                 ctx.ReleaseOwner()
@@ -890,6 +888,9 @@ type cmap<'K, 'V when 'K: equality> = ChangeableMap<'K, 'V>
 /// </para>
 /// </remarks>
 type ChangeableList<'T>(initial: seq<'T>) =
+    // The graph this node belongs to, captured at creation (the ambient graph
+    // of the creating thread).
+    let ctx = GraphContext.Current
     let mutable version = 0L
     let data = ResizeArray<'T>(initial)
     let edges = ParentEdges()
@@ -932,7 +933,7 @@ type ChangeableList<'T>(initial: seq<'T>) =
     member private this.PushAndMark() =
         if not outDelta.IsEmpty then
             version <- version + 1L
-            Collections.pushAndMarkList outDelta &sinks edges
+            Collections.pushAndMarkList ctx outDelta &sinks edges
             outDelta.Clear()
 
     member private this.JournalOp(op: ListOp<'T>) =
@@ -962,7 +963,7 @@ type ChangeableList<'T>(initial: seq<'T>) =
 
         if not flushEnqueued then
             flushEnqueued <- true
-            GraphContext.Default.TxBuffer.Enqueue(this :> ICommit)
+            ctx.TxBuffer.Enqueue(this :> ICommit)
 
     /// The prefix/suffix-trim diff used by <see cref="Set"/>. Applies the
     /// change to <paramref name="data"/> and appends the operations to the
@@ -1077,7 +1078,6 @@ type ChangeableList<'T>(initial: seq<'T>) =
 
     /// <summary>Appends an element at the end of the list.</summary>
     member this.Append(value: 'T) =
-        let ctx = GraphContext.Default
         ctx.ClaimOwner()
 
         try
@@ -1094,7 +1094,6 @@ type ChangeableList<'T>(initial: seq<'T>) =
 
     /// <summary>Inserts an element at the start of the list.</summary>
     member this.Prepend(value: 'T) =
-        let ctx = GraphContext.Default
         ctx.ClaimOwner()
 
         try
@@ -1111,7 +1110,6 @@ type ChangeableList<'T>(initial: seq<'T>) =
     /// <c>position = Count</c> appends. Throws when out of range.
     /// </summary>
     member this.InsertAt(position: int, value: 'T) =
-        let ctx = GraphContext.Default
         ctx.ClaimOwner()
 
         try
@@ -1139,7 +1137,6 @@ type ChangeableList<'T>(initial: seq<'T>) =
 
     /// <summary>Removes the element currently at <c>position</c>. Throws when out of range.</summary>
     member this.RemoveAt(position: int) =
-        let ctx = GraphContext.Default
         ctx.ClaimOwner()
 
         try
@@ -1166,7 +1163,6 @@ type ChangeableList<'T>(initial: seq<'T>) =
     /// is equal (equality at the source). Throws when out of range.
     /// </summary>
     member this.UpdateAt(position: int, value: 'T) =
-        let ctx = GraphContext.Default
         ctx.ClaimOwner()
 
         try
@@ -1193,7 +1189,6 @@ type ChangeableList<'T>(initial: seq<'T>) =
 
     /// <summary>Removes the first occurrence of the value. No-op when absent. O(n) write-time scan.</summary>
     member this.Remove(value: 'T) =
-        let ctx = GraphContext.Default
         ctx.ClaimOwner()
 
         try
@@ -1230,7 +1225,6 @@ type ChangeableList<'T>(initial: seq<'T>) =
 
     /// <summary>Removes all elements. The delta carries descending removes.</summary>
     member this.Clear() =
-        let ctx = GraphContext.Default
         ctx.ClaimOwner()
 
         try
@@ -1258,7 +1252,6 @@ type ChangeableList<'T>(initial: seq<'T>) =
     /// batch (docs/ALIST-DESIGN.md §3.3).
     /// </summary>
     member this.Set(newValues: seq<'T>) =
-        let ctx = GraphContext.Default
         ctx.ClaimOwner()
 
         try
@@ -1267,7 +1260,7 @@ type ChangeableList<'T>(initial: seq<'T>) =
                 journalCount <- 0
                 journalReplay <- ValueNone
                 flushEnqueued <- true
-                GraphContext.Default.TxBuffer.Enqueue(this :> ICommit)
+                ctx.TxBuffer.Enqueue(this :> ICommit)
             else
                 this.Apply newValues
         finally
@@ -1295,7 +1288,7 @@ type ChangeableList<'T>(initial: seq<'T>) =
         // batch puts the node into the global post ring. Ops that land while
         // a batch is pending join that batch.
         if Interlocked.CompareExchange(&posted, 1, 0) = 0 then
-            GraphContext.Default.PostRing.Enqueue(this :> obj)
+            ctx.PostRing.Enqueue(this :> obj)
 
     member private this.ApplyPostedBatch() =
         // Clear the queued flag before applying (the cval.Post pattern): a
@@ -1531,11 +1524,10 @@ type ChangeableList<'T>(initial: seq<'T>) =
 
     interface IAdaptiveList<'T> with
         member this.GetValue() =
-            let ctx = GraphContext.Default
             ctx.ClaimOwner()
 
             try
-                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                ctx.AddDependency(this :> IAdaptiveObject, version)
                 data :> IReadOnlyList<'T>
             finally
                 ctx.ReleaseOwner()

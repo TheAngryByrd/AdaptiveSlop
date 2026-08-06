@@ -35,6 +35,9 @@ open System.Threading
 /// invalidated polls.
 /// </summary>
 type ExternalSetNode<'T when 'T: equality>([<InlineIfLambda>] snapshot: unit -> IReadOnlySet<'T>) =
+    // The graph this node belongs to, captured at creation (the ambient graph
+    // of the creating thread).
+    let ctx = GraphContext.Current
     let mutable state = SetNodeState<'T, 'T>.Create(0)
     let scratch = HashSet<'T>()
     let mutable dirty = true
@@ -47,9 +50,9 @@ type ExternalSetNode<'T when 'T: equality>([<InlineIfLambda>] snapshot: unit -> 
     member this.Invalidate() =
         if Environment.CurrentManagedThreadId = ownerThread then
             dirty <- true
-            GraphContext.Default.MarkFrom state.Edges
+            ctx.MarkFrom state.Edges
         else if Interlocked.CompareExchange(&posted, 1, 0) = 0 then
-            GraphContext.Default.PostRing.Enqueue(this :> obj)
+            ctx.PostRing.Enqueue(this :> obj)
 
     member private this.Poll() =
         if dirty && not disposed then
@@ -61,7 +64,7 @@ type ExternalSetNode<'T when 'T: equality>([<InlineIfLambda>] snapshot: unit -> 
 
             if Collections.rebuildSetDiff scratch &state then
                 state.Version <- state.Version + 1L
-                Collections.pushAndMarkSet state.Out &state.Sinks state.Edges
+                Collections.pushAndMarkSet ctx state.Out &state.Sinks state.Edges
                 state.Out.Clear()
 
     interface IPostSource with
@@ -73,7 +76,6 @@ type ExternalSetNode<'T when 'T: equality>([<InlineIfLambda>] snapshot: unit -> 
 
     interface IAdaptiveSet<'T> with
         member this.GetValue() =
-            let ctx = GraphContext.Default
             ctx.ClaimOwner()
 
             try
@@ -117,6 +119,9 @@ type ExternalSetNode<'T when 'T: equality>([<InlineIfLambda>] snapshot: unit -> 
 /// on invalidated polls.
 /// </summary>
 type ExternalMapNode<'K, 'V when 'K: equality>([<InlineIfLambda>] snapshot: unit -> IReadOnlyDictionary<'K, 'V>) =
+    // The graph this node belongs to, captured at creation (the ambient graph
+    // of the creating thread).
+    let ctx = GraphContext.Current
     let mutable state = MapNodeState<'K, 'V, 'V>.Create(0)
     let scratch = Dictionary<'K, 'V>()
     let mutable dirty = true
@@ -127,9 +132,9 @@ type ExternalMapNode<'K, 'V when 'K: equality>([<InlineIfLambda>] snapshot: unit
     member this.Invalidate() =
         if Environment.CurrentManagedThreadId = ownerThread then
             dirty <- true
-            GraphContext.Default.MarkFrom state.Edges
+            ctx.MarkFrom state.Edges
         else if Interlocked.CompareExchange(&posted, 1, 0) = 0 then
-            GraphContext.Default.PostRing.Enqueue(this :> obj)
+            ctx.PostRing.Enqueue(this :> obj)
 
     member private this.Poll() =
         if dirty && not disposed then
@@ -141,7 +146,7 @@ type ExternalMapNode<'K, 'V when 'K: equality>([<InlineIfLambda>] snapshot: unit
 
             if Collections.rebuildMapDiff scratch &state then
                 state.Version <- state.Version + 1L
-                Collections.pushAndMarkMap state.Out &state.Sinks state.Edges
+                Collections.pushAndMarkMap ctx state.Out &state.Sinks state.Edges
                 state.Out.Clear()
 
     interface IPostSource with
@@ -151,7 +156,6 @@ type ExternalMapNode<'K, 'V when 'K: equality>([<InlineIfLambda>] snapshot: unit
 
     interface IAdaptiveMap<'K, 'V> with
         member this.GetValue() =
-            let ctx = GraphContext.Default
             ctx.ClaimOwner()
 
             try
@@ -195,6 +199,9 @@ type ExternalMapNode<'K, 'V when 'K: equality>([<InlineIfLambda>] snapshot: unit
 /// machinery.
 /// </summary>
 type ExternalListNode<'T when 'T: equality>([<InlineIfLambda>] snapshot: unit -> IReadOnlyList<'T>) =
+    // The graph this node belongs to, captured at creation (the ambient graph
+    // of the creating thread).
+    let ctx = GraphContext.Current
     let mutable data = ResizeArray<'T>()
     let mutable out = ListDelta<'T>.Create()
     let mutable version = 0L
@@ -208,9 +215,9 @@ type ExternalListNode<'T when 'T: equality>([<InlineIfLambda>] snapshot: unit ->
     member this.Invalidate() =
         if Environment.CurrentManagedThreadId = ownerThread then
             dirty <- true
-            GraphContext.Default.MarkFrom edges
+            ctx.MarkFrom edges
         else if Interlocked.CompareExchange(&posted, 1, 0) = 0 then
-            GraphContext.Default.PostRing.Enqueue(this :> obj)
+            ctx.PostRing.Enqueue(this :> obj)
 
     member private this.Poll() =
         if dirty && not disposed then
@@ -219,7 +226,7 @@ type ExternalListNode<'T when 'T: equality>([<InlineIfLambda>] snapshot: unit ->
 
             if Collections.rebuildListDiff next data &out then
                 version <- version + 1L
-                Collections.pushAndMarkList out &sinks edges
+                Collections.pushAndMarkList ctx out &sinks edges
                 out.Clear()
 
     interface IPostSource with
@@ -229,7 +236,6 @@ type ExternalListNode<'T when 'T: equality>([<InlineIfLambda>] snapshot: unit ->
 
     interface IAdaptiveList<'T> with
         member this.GetValue() =
-            let ctx = GraphContext.Default
             ctx.ClaimOwner()
 
             try

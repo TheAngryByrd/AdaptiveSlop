@@ -1034,7 +1034,7 @@ type OfAvalMapNode<'K, 'V, 'S when 'K: equality and 'S :> seq<'K * 'V>>(value: I
                 // source only when it changed (a stuck version makes
                 // derived nodes stale forever).
                 state.Version <- state.Version + 1L
-                Collections.pushAndMarkMap state.Out &state.Sinks state.Edges
+                Collections.pushAndMarkMap GraphContext.Current state.Out &state.Sinks state.Edges
                 state.Out.Clear()
 
             state.DepVersions[0] <- value.Version
@@ -1122,7 +1122,7 @@ type CustomMapNode<'K, 'V when 'K: equality>
                     state.Data.Remove rems.Items[i] |> ignore
 
                 state.Version <- state.Version + 1L
-                Collections.pushAndMarkMap (writer.Snapshot()) &state.Sinks state.Edges
+                Collections.pushAndMarkMap GraphContext.Current (writer.Snapshot()) &state.Sinks state.Edges
                 writer.Clear()
 
     interface IAdaptiveMap<'K, 'V> with
@@ -1374,7 +1374,7 @@ type AListToMapNode<'K, 'V when 'K: equality>(source: IAdaptiveList<'K * 'V>) =
 
             journal.Ops.Count <- 0
             version <- version + 1L
-            Collections.pushAndMarkMap out &sinks edges
+            Collections.pushAndMarkMap GraphContext.Current out &sinks edges
 
     interface IListDeltaSink<'K * 'V> with
         member this.OnDeltas(ops: ListOp<'K * 'V>[], opCnt: int) =
@@ -1447,7 +1447,7 @@ type MapToAListNode<'K, 'V when 'K: equality>(source: IAdaptiveMap<'K, 'V>) =
 
             if Collections.rebuildListDiff next data &out then
                 version <- version + 1L
-                Collections.pushAndMarkList out &sinks edges
+                Collections.pushAndMarkList GraphContext.Current out &sinks edges
 
             out.Clear()
 
@@ -1551,7 +1551,7 @@ type MapUseMapNode<'K, 'V, 'W when 'K: equality and 'W: equality and 'W :> IDisp
 
         state.Journal.Clear()
         state.Version <- state.Version + 1L
-        Collections.pushAndMarkMap state.Out &state.Sinks state.Edges
+        Collections.pushAndMarkMap GraphContext.Current state.Out &state.Sinks state.Edges
         state.Out.Clear()
 
     interface IMapDeltaSink<'K, 'V> with
