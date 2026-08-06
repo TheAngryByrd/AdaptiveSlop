@@ -1174,7 +1174,7 @@ module AMap =
 
     /// <summary>Materializes the F# <c>Map</c> counterpart (sorted, structural equality).</summary>
     let inline toMap (mapValue: amap<'K, 'V>) : Map<'K, 'V> =
-        mapValue.GetValue() |> Seq.map (fun (KeyValue(k, v)) -> (k, v)) |> Map.ofSeq
+        [ for KeyValue(k, v) in mapValue.GetValue() -> k, v ] |> Map.ofList
 
 /// <summary>Operations on changeable maps.</summary>
 module CMap =

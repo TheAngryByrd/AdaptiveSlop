@@ -299,8 +299,6 @@ type ElementSetNode<'T, 'U when 'T: equality and 'U: equality>
         else
             elementDirty <- false
 
-        lastDrainWriteGen <- GraphContext.Default.WriteGeneration
-
     /// Drain the journal, then the element scan, then push the accumulated
     /// output delta once, with notification delivery deferred.
     member private this.Process() =
@@ -324,6 +322,13 @@ type ElementSetNode<'T, 'U when 'T: equality and 'U: equality>
 
         if not wasActive then
             ctx.DeliverNotifications()
+
+        // Capture AFTER the push: the downstream sink's MarkFrom advances the
+        // write generation during the delta delivery. Capturing in the scan
+        // (before the push) left the gate permanently open and the Version
+        // dirty indicator inflated, so a version-gated consumer recorded a
+        // phantom version and missed the next change.
+        lastDrainWriteGen <- GraphContext.Default.WriteGeneration
 
     interface ISetDeltaSink<'T> with
         member this.OnDeltas(adds: 'T[], addCnt: int, rems: 'T[], remCnt: int) =

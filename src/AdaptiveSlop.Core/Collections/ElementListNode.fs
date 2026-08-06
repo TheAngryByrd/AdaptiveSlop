@@ -360,8 +360,6 @@ type ElementListNode<'T, 'U>(source: IAdaptiveList<'T>, [<InlineIfLambda>] mappi
         else
             elementDirty <- false
 
-        lastDrainWriteGen <- GraphContext.Default.WriteGeneration
-
     /// Drain the journal, then the element scan, then push the accumulated
     /// output delta once, with notification delivery deferred.
     member private this.Process() =
@@ -385,6 +383,13 @@ type ElementListNode<'T, 'U>(source: IAdaptiveList<'T>, [<InlineIfLambda>] mappi
 
         if not wasActive then
             ctx.DeliverNotifications()
+
+        // Capture AFTER the push: the downstream sink's MarkFrom advances the
+        // write generation during the delta delivery. Capturing in the scan
+        // (before the push) left the gate permanently open and the Version
+        // dirty indicator inflated, so a version-gated consumer recorded a
+        // phantom version and missed the next change.
+        lastDrainWriteGen <- GraphContext.Default.WriteGeneration
 
     interface IListDeltaSink<'T> with
         member this.OnDeltas(ops: ListOp<'T>[], opCnt: int) =
