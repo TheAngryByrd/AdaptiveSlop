@@ -193,8 +193,10 @@ let ``ASet mapA follows element avals and structural edits`` () =
     let result =
         s
         |> ASet.mapA (fun v ->
-            if v % 2 = 0 then AVal.map (fun e -> v * 10 + e) (even :> aval<int>)
-            else AVal.map (fun e -> v * 10 + e) (odd :> aval<int>))
+            if v % 2 = 0 then
+                AVal.map (fun e -> v * 10 + e) (even :> aval<int>)
+            else
+                AVal.map (fun e -> v * 10 + e) (odd :> aval<int>))
 
     // (1,10) (2,21) (3,30)
     Assert.Equal<Set<int>>(Set.ofList [ 10; 21; 30 ], ASet.toSet result)
@@ -228,8 +230,10 @@ let ``ASet chooseA survival flips`` () =
     let result =
         s
         |> ASet.chooseA (fun v ->
-            if v % 2 = 0 then even :> aval<int option>
-            else odd :> aval<int option>)
+            if v % 2 = 0 then
+                even :> aval<int option>
+            else
+                odd :> aval<int option>)
 
     // (1,0) (2,1) (3,0)
     Assert.Equal<Set<int>>(Set.ofList [ 0; 1 ], ASet.toSet result)
@@ -259,8 +263,10 @@ let ``ASet filterA flips with predicate avals`` () =
     let filtered =
         set
         |> ASet.filterA (fun i ->
-            if i % 2 = 0 then takeEven :> aval<bool>
-            else takeOdd :> aval<bool>)
+            if i % 2 = 0 then
+                takeEven :> aval<bool>
+            else
+                takeOdd :> aval<bool>)
 
     Assert.Equal<Set<int>>(Set.ofList [ 0; 1; 2; 3; 4 ], ASet.toSet filtered)
 
@@ -303,9 +309,7 @@ let ``ASet mapA delivers targeted deltas to observers`` () =
 
     let result =
         s
-        |> ASet.mapA (fun v ->
-            if v % 2 = 0 then even :> aval<int>
-            else odd :> aval<int>)
+        |> ASet.mapA (fun v -> if v % 2 = 0 then even :> aval<int> else odd :> aval<int>)
 
     let mutable lastAdds = Set.empty<int>
     let mutable lastRems = Set.empty<int>
@@ -382,10 +386,7 @@ let ``ASet mapA disposal unregisters every element aval edge`` () =
     let v2 = CVal.create 2
 
     let result =
-        s
-        |> ASet.mapA (fun x ->
-            if x % 2 = 0 then v1 :> aval<int>
-            else v2 :> aval<int>)
+        s |> ASet.mapA (fun x -> if x % 2 = 0 then v1 :> aval<int> else v2 :> aval<int>)
 
     use _obs = ASet.observe (fun _ _ -> ()) result
     ASet.force result |> ignore
@@ -402,11 +403,7 @@ let ``ASet countByA counts predicate-aval matches`` () =
     let s = CSet.ofSeq [ 1; 2; 3; 4 ]
     let flag = CVal.create true
 
-    let count =
-        s
-        |> ASet.countByA (fun v ->
-            flag
-            |> AVal.map (fun f -> f && v % 2 = 0))
+    let count = s |> ASet.countByA (fun v -> flag |> AVal.map (fun f -> f && v % 2 = 0))
 
     Assert.Equal(2, AVal.getValue count) // 2,4
     CVal.set false flag
@@ -423,17 +420,9 @@ let ``ASet existsA and forallA follow predicate avals`` () =
     let s = CSet.ofSeq [ 1; 2; 3 ]
     let flag = CVal.create true
 
-    let exists =
-        s
-        |> ASet.existsA (fun v ->
-            flag
-            |> AVal.map (fun f -> f && v > 2))
+    let exists = s |> ASet.existsA (fun v -> flag |> AVal.map (fun f -> f && v > 2))
 
-    let forall =
-        s
-        |> ASet.forallA (fun v ->
-            flag
-            |> AVal.map (fun f -> f && v > 2))
+    let forall = s |> ASet.forallA (fun v -> flag |> AVal.map (fun f -> f && v > 2))
 
     Assert.True(AVal.getValue exists) // 3 qualifies
     Assert.False(AVal.getValue forall) // 1,2 do not
@@ -449,11 +438,7 @@ let ``ASet sumByA sums mapped avals`` () =
     let s = CSet.ofSeq [ 1; 2; 3 ]
     let k = CVal.create 10
 
-    let sum =
-        s
-        |> ASet.sumByA (fun v ->
-            k
-            |> AVal.map (fun k -> v * k))
+    let sum = s |> ASet.sumByA (fun v -> k |> AVal.map (fun k -> v * k))
 
     Assert.Equal(60, AVal.getValue sum)
     CVal.set 2 k
@@ -468,11 +453,7 @@ let ``ASet averageByA averages mapped avals`` () =
     let s = CSet.ofSeq [ 1.0; 2.0; 3.0 ]
     let k = CVal.create 2.0
 
-    let avg =
-        s
-        |> ASet.averageByA (fun v ->
-            k
-            |> AVal.map (fun k -> v * k))
+    let avg = s |> ASet.averageByA (fun v -> k |> AVal.map (fun k -> v * k))
 
     Assert.Equal(4.0, AVal.getValue avg) // (2+4+6)/3
     CVal.set 3.0 k
@@ -489,9 +470,7 @@ let ``ASet reduceByA folds with a custom reduction`` () =
 
     let min =
         s
-        |> ASet.reduceByA (AdaptiveReduction.tryMin ()) (fun v ->
-            k
-            |> AVal.map (fun k -> v + k))
+        |> ASet.reduceByA (AdaptiveReduction.tryMin ()) (fun v -> k |> AVal.map (fun k -> v + k))
 
     Assert.Equal(ValueSome 11, AVal.getValue min)
     CVal.set 100 k
@@ -555,11 +534,7 @@ let ``AMap chooseA survival flips`` () =
 
     let res =
         m
-        |> AMap.chooseA (fun _ v ->
-            keep
-            |> AVal.map (fun b ->
-                if b = Some true then Some(v * 10)
-                else None))
+        |> AMap.chooseA (fun _ v -> keep |> AVal.map (fun b -> if b = Some true then Some(v * 10) else None))
 
     Assert.Equal<Map<string, int>>(Map.ofList [ "A", 10; "B", 20; "C", 30 ], AMap.toMap res)
 
@@ -577,8 +552,10 @@ let ``AMap filterA flips with predicate avals`` () =
     let filtered =
         m
         |> AMap.filterA (fun _ v ->
-            if v % 2 = 0 then takeEven :> aval<bool>
-            else AVal.constant true)
+            if v % 2 = 0 then
+                takeEven :> aval<bool>
+            else
+                AVal.constant true)
 
     Assert.Equal<Map<string, int>>(Map.ofList [ "A", 1; "B", 2; "C", 3; "D", 4 ], AMap.toMap filtered)
 
@@ -607,8 +584,7 @@ let ``AMap mapA delivers targeted deltas to observers`` () =
     use _obs =
         AMap.observe
             (fun _ (d: MapDelta<string, int>) ->
-                lastSets <-
-                    d.SetEntries.ToArray() |> Array.map (fun struct (k, v) -> k, v) |> Map.ofArray
+                lastSets <- d.SetEntries.ToArray() |> Array.map (fun struct (k, v) -> k, v) |> Map.ofArray
                 lastRems <- d.RemovedKeys.ToArray() |> Set.ofArray)
             res
 
@@ -662,9 +638,7 @@ let ``AMap mapA disposal unregisters every entry aval edge`` () =
 
     let res =
         m
-        |> AMap.mapA (fun _ v ->
-            if v % 2 = 0 then v1 :> aval<int>
-            else v2 :> aval<int>)
+        |> AMap.mapA (fun _ v -> if v % 2 = 0 then v1 :> aval<int> else v2 :> aval<int>)
 
     use _obs = AMap.observe (fun _ _ -> ()) res
     AMap.force res |> ignore
@@ -3745,9 +3719,7 @@ let ``AList mapA follows element avals and structural edits`` () =
 
     let result =
         l
-        |> AList.mapA (fun v ->
-            if v % 2 = 0 then even :> aval<int>
-            else odd :> aval<int>)
+        |> AList.mapA (fun v -> if v % 2 = 0 then even :> aval<int> else odd :> aval<int>)
 
     // (1,0) (2,1) (3,0)
     Assert.Equal<int list>([ 0; 1; 0 ], AList.toList result)
@@ -3781,8 +3753,10 @@ let ``AList chooseA survival flips`` () =
     let result =
         l
         |> AList.chooseA (fun v ->
-            if v % 2 = 0 then even :> aval<int option>
-            else odd :> aval<int option>)
+            if v % 2 = 0 then
+                even :> aval<int option>
+            else
+                odd :> aval<int option>)
 
     // (1,0) (2,1) (3,0)
     Assert.Equal<int list>([ 0; 1; 0 ], AList.toList result)
@@ -3811,8 +3785,10 @@ let ``AList filterA flips with predicate avals`` () =
     let filtered =
         l
         |> AList.filterA (fun i ->
-            if i % 2 = 0 then takeEven :> aval<bool>
-            else takeOdd :> aval<bool>)
+            if i % 2 = 0 then
+                takeEven :> aval<bool>
+            else
+                takeOdd :> aval<bool>)
 
     Assert.Equal<int list>([ 0; 1; 2; 3; 4 ], AList.toList filtered)
 
@@ -3834,9 +3810,7 @@ let ``AList mapA delivers targeted deltas to observers`` () =
 
     let result =
         l
-        |> AList.mapA (fun v ->
-            if v % 2 = 0 then even :> aval<int>
-            else odd :> aval<int>)
+        |> AList.mapA (fun v -> if v % 2 = 0 then even :> aval<int> else odd :> aval<int>)
 
     let mutable lastOps = []
 
@@ -3893,9 +3867,7 @@ let ``AList mapA disposal unregisters every element aval edge`` () =
 
     let result =
         l
-        |> AList.mapA (fun x ->
-            if x % 2 = 0 then v1 :> aval<int>
-            else v2 :> aval<int>)
+        |> AList.mapA (fun x -> if x % 2 = 0 then v1 :> aval<int> else v2 :> aval<int>)
 
     use _obs = AList.observe (fun _ _ -> ()) result
     AList.force result |> ignore
@@ -3911,9 +3883,7 @@ let ``AList mapA disposal unregisters every element aval edge`` () =
 let ``AList mapiA passes the position at mapping time`` () =
     let l = CList.ofList [ 10; 20; 30 ]
 
-    let result =
-        l
-        |> AList.mapiA (fun i _ -> AVal.constant i)
+    let result = l |> AList.mapiA (fun i _ -> AVal.constant i)
 
     Assert.Equal<int list>([ 0; 1; 2 ], AList.toList result)
 
@@ -3939,7 +3909,12 @@ let ``AList mapiA inner change (mapping depends on another adaptive set)`` () =
 
     let res =
         map
-        |> AList.mapiA (fun k v -> keys |> ASet.contains k |> AVal.map (function true -> v | false -> -1))
+        |> AList.mapiA (fun k v ->
+            keys
+            |> ASet.contains k
+            |> AVal.map (function
+                | true -> v
+                | false -> -1))
 
     Assert.Equal<int list>([ 1; -1; 3; -1; 5 ], AList.toList res)
 
@@ -3954,9 +3929,7 @@ let ``AList filteriA flips by position`` () =
     let map = CList.ofList [ 1; 2; 3; 4; 5 ]
     let keys = CSet.ofSeq [ 0; 2; 4 ]
 
-    let res =
-        map
-        |> AList.filteriA (fun k _ -> keys |> ASet.contains k)
+    let res = map |> AList.filteriA (fun k _ -> keys |> ASet.contains k)
 
     Assert.Equal<int list>([ 1; 3; 5 ], AList.toList res)
 
@@ -3973,11 +3946,7 @@ let ``AList chooseiA survival flips by position`` () =
 
     let result =
         l
-        |> AList.chooseiA (fun i v ->
-            keepEven
-            |> AVal.map (fun k ->
-                if k && i % 2 = 1 then Some(v * 10)
-                else None))
+        |> AList.chooseiA (fun i v -> keepEven |> AVal.map (fun k -> if k && i % 2 = 1 then Some(v * 10) else None))
 
     Assert.Equal<int list>([ 20 ], AList.toList result)
 
@@ -4599,7 +4568,11 @@ let ``AVal ofExternal: first read takes the snapshot; invalidate re-reads`` () =
 [<Fact>]
 let ``AVal ofExternal: reads without invalidate do not re-run the function`` () =
     let mutable calls = 0
-    let value, _ = AVal.ofExternal (fun () -> calls <- calls + 1; calls)
+
+    let value, _ =
+        AVal.ofExternal (fun () ->
+            calls <- calls + 1
+            calls)
 
     AVal.getValue value |> ignore
     AVal.getValue value |> ignore
@@ -4709,7 +4682,8 @@ let ``AMap ofExternal: materializes on first read and diffs on invalidate`` () =
     current[1] <- "a"
     current[2] <- "b"
 
-    let m, invalidate = AMap.ofExternal (fun () -> current :> IReadOnlyDictionary<int, string>)
+    let m, invalidate =
+        AMap.ofExternal (fun () -> current :> IReadOnlyDictionary<int, string>)
 
     Assert.Equal<Map<int, string>>(Map.ofList [ 1, "a"; 2, "b" ], AMap.toMap m)
 
@@ -4814,11 +4788,18 @@ let ``AList custom: observes receive the computed ops`` () =
 let ``ofExternal: reads without invalidate allocate nothing`` () =
     let mutable current = 1
     let v, invalidateV = AVal.ofExternal (fun () -> current)
-    let s, invalidateS = ASet.ofExternal (fun () -> HashSet<int>([ 1 ]) :> IReadOnlySet<int>)
+
+    let s, invalidateS =
+        ASet.ofExternal (fun () -> HashSet<int>([ 1 ]) :> IReadOnlySet<int>)
+
     let map = Dictionary<int, string>()
     map[1] <- "a"
-    let m, invalidateM = AMap.ofExternal (fun () -> map :> IReadOnlyDictionary<int, string>)
-    let l, invalidateL = AList.ofExternal (fun () -> ResizeArray [ 1 ] :> IReadOnlyList<int>)
+
+    let m, invalidateM =
+        AMap.ofExternal (fun () -> map :> IReadOnlyDictionary<int, string>)
+
+    let l, invalidateL =
+        AList.ofExternal (fun () -> ResizeArray [ 1 ] :> IReadOnlyList<int>)
 
     // Settle: first reads, an invalidate round, settled reads.
     AVal.getValue v |> ignore
@@ -4994,8 +4975,7 @@ let ``AMap intersectV pairs the values as struct pairs`` () =
 
     let paired = AMap.intersectV (CMap.value a) (CMap.value b)
 
-    let expected =
-        Map.ofList [ 2, struct ("b", 20); 3, struct ("c", 30) ]
+    let expected = Map.ofList [ 2, struct ("b", 20); 3, struct ("c", 30) ]
 
     Assert.Equal<Map<int, struct (string * int)>>(expected, AMap.toMap paired)
 
@@ -5003,7 +4983,9 @@ let ``AMap intersectV pairs the values as struct pairs`` () =
 let ``AMap bind2 and bind3 remap when any input changes`` () =
     let a = CVal.create 0
     let b = CVal.create 0
-    let tables = [| CMap.empty<int, string>; CMap.empty<int, string>; CMap.empty<int, string> |]
+
+    let tables =
+        [| CMap.empty<int, string>; CMap.empty<int, string>; CMap.empty<int, string> |]
 
     let combined =
         AMap.bind2 (fun av bv -> tables[av + bv]) (CVal.value a) (CVal.value b)
@@ -5067,11 +5049,7 @@ let ``AMap foldHalfGroup, sumBy and averageBy`` () =
 
     // Fully invertible: removals subtract without a full recompute.
     let sum =
-        AMap.foldHalfGroup
-            (fun s k v -> s + v)
-            (fun s k v -> ValueSome(s - v))
-            0
-            (CMap.value m)
+        AMap.foldHalfGroup (fun s k v -> s + v) (fun s k v -> ValueSome(s - v)) 0 (CMap.value m)
 
     Assert.Equal(60, AVal.getValue sum)
 
@@ -5084,11 +5062,7 @@ let ``AMap foldHalfGroup, sumBy and averageBy`` () =
     // Non-invertible trySubtract: removals recompute the whole fold; the
     // result stays correct.
     let always =
-        AMap.foldHalfGroup
-            (fun s k v -> s + v)
-            (fun _ _ _ -> ValueNone)
-            0
-            (CMap.value m)
+        AMap.foldHalfGroup (fun s k v -> s + v) (fun _ _ _ -> ValueNone) 0 (CMap.value m)
 
     Assert.Equal(80, AVal.getValue always)
 
@@ -5109,10 +5083,7 @@ let ``AMap toASet returns pairs and keys returns keys`` () =
     let pairs = AMap.toASet (CMap.value m)
     let keys = AMap.keys (CMap.value m)
 
-    Assert.Equal<Set<struct (int * string)>>(
-        Set.ofList [ struct (1, "a"); struct (2, "b") ],
-        ASet.toSet pairs
-    )
+    Assert.Equal<Set<struct (int * string)>>(Set.ofList [ struct (1, "a"); struct (2, "b") ], ASet.toSet pairs)
 
     Assert.Equal<Set<int>>(Set.ofList [ 1; 2 ], ASet.toSet keys)
 
@@ -5133,7 +5104,9 @@ let ``AList mapi choosei and filteri pass the input position`` () =
     let withPos = l |> AList.mapi (fun i v -> (i, v))
     Assert.Equal<(int * int)[]>([| 0, 10; 1, 20; 2, 30 |], AList.toArray withPos)
 
-    let chosen = l |> AList.choosei (fun i v -> if i % 2 = 0 then Some(v * 10) else None)
+    let chosen =
+        l |> AList.choosei (fun i v -> if i % 2 = 0 then Some(v * 10) else None)
+
     Assert.Equal<int[]>([| 100; 300 |], AList.toArray chosen)
 
     let filtered = l |> AList.filteri (fun i v -> i = 1 || v = 30)
@@ -5144,7 +5117,9 @@ let ``AList mapi choosei and filteri pass the input position`` () =
     // keep the position the mapping saw (FDA stable-Index equivalent).
     Assert.Equal<(int * int)[]>([| 0, 5; 0, 10; 1, 20; 2, 30 |], AList.toArray withPos)
 
-    let chosen2 = l |> AList.choosei (fun i v -> if i % 2 = 0 then Some(v * 10) else None)
+    let chosen2 =
+        l |> AList.choosei (fun i v -> if i % 2 = 0 then Some(v * 10) else None)
+
     Assert.Equal<int[]>([| 50; 200 |], AList.toArray chosen2) // 5@0, 20@2
 
 [<Fact>]
@@ -5156,7 +5131,10 @@ let ``AList indexed pairs elements with their positions`` () =
 
     CList.insertAt 1 "x" l
     // Mapping-time positions stick (the mapiA convention).
-    Assert.Equal<struct (int * string)[]>([| struct (0, "a"); struct (1, "x"); struct (1, "b") |], AList.toArray indexed)
+    Assert.Equal<struct (int * string)[]>(
+        [| struct (0, "a"); struct (1, "x"); struct (1, "b") |],
+        AList.toArray indexed
+    )
 
 [<Fact>]
 let ``AList ofAVal rebuilds on value change`` () =
@@ -5452,14 +5430,20 @@ let ``AList fold family`` () =
     Assert.Equal(4, AVal.getValue g)
 
     let l3 = CList.ofSeq [ 1; 2; 3 ]
-    let h = AList.foldHalfGroup (fun s v -> s + v) (fun s v -> ValueSome(s - v)) 0 (CList.value l3)
+
+    let h =
+        AList.foldHalfGroup (fun s v -> s + v) (fun s v -> ValueSome(s - v)) 0 (CList.value l3)
+
     Assert.Equal(6, AVal.getValue h)
 
     CList.removeAt 0 l3
     Assert.Equal(5, AVal.getValue h)
 
     let l4 = CList.ofSeq [ 1; 2; 3 ]
-    let nonInv = AList.foldHalfGroup (fun s v -> s + v) (fun _ _ -> ValueNone) 0 (CList.value l4)
+
+    let nonInv =
+        AList.foldHalfGroup (fun s v -> s + v) (fun _ _ -> ValueNone) 0 (CList.value l4)
+
     Assert.Equal(6, AVal.getValue nonInv)
 
     CList.removeAt 0 l4 // cannot invert: recompute
@@ -5696,8 +5680,7 @@ let ``AdaptiveReduction par structpar mapIn count`` () =
     let l = CList.ofSeq [ 1; 2; 3 ]
 
     // count and sum in parallel over the same elements
-    let par =
-        AdaptiveReduction.par AdaptiveReduction.count (AdaptiveReduction.sum ())
+    let par = AdaptiveReduction.par AdaptiveReduction.count (AdaptiveReduction.sum ())
 
     let both = AList.reduceBy par (fun v -> v) (CList.value l)
     let (c, s) = AVal.getValue both

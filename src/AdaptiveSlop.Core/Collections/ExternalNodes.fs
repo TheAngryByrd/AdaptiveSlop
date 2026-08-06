@@ -48,9 +48,8 @@ type ExternalSetNode<'T when 'T: equality>([<InlineIfLambda>] snapshot: unit -> 
         if Environment.CurrentManagedThreadId = ownerThread then
             dirty <- true
             GraphContext.Default.MarkFrom state.Edges
-        else
-            if Interlocked.CompareExchange(&posted, 1, 0) = 0 then
-                GraphContext.Default.PostRing.Enqueue(this :> obj)
+        else if Interlocked.CompareExchange(&posted, 1, 0) = 0 then
+            GraphContext.Default.PostRing.Enqueue(this :> obj)
 
     member private this.Poll() =
         if dirty && not disposed then
@@ -117,8 +116,7 @@ type ExternalSetNode<'T when 'T: equality>([<InlineIfLambda>] snapshot: unit -> 
 /// its struct enumerator stays allocation-free); the scratch is refilled only
 /// on invalidated polls.
 /// </summary>
-type ExternalMapNode<'K, 'V when 'K: equality>
-    ([<InlineIfLambda>] snapshot: unit -> IReadOnlyDictionary<'K, 'V>) =
+type ExternalMapNode<'K, 'V when 'K: equality>([<InlineIfLambda>] snapshot: unit -> IReadOnlyDictionary<'K, 'V>) =
     let mutable state = MapNodeState<'K, 'V, 'V>.Create(0)
     let scratch = Dictionary<'K, 'V>()
     let mutable dirty = true
@@ -130,9 +128,8 @@ type ExternalMapNode<'K, 'V when 'K: equality>
         if Environment.CurrentManagedThreadId = ownerThread then
             dirty <- true
             GraphContext.Default.MarkFrom state.Edges
-        else
-            if Interlocked.CompareExchange(&posted, 1, 0) = 0 then
-                GraphContext.Default.PostRing.Enqueue(this :> obj)
+        else if Interlocked.CompareExchange(&posted, 1, 0) = 0 then
+            GraphContext.Default.PostRing.Enqueue(this :> obj)
 
     member private this.Poll() =
         if dirty && not disposed then
@@ -212,9 +209,8 @@ type ExternalListNode<'T when 'T: equality>([<InlineIfLambda>] snapshot: unit ->
         if Environment.CurrentManagedThreadId = ownerThread then
             dirty <- true
             GraphContext.Default.MarkFrom edges
-        else
-            if Interlocked.CompareExchange(&posted, 1, 0) = 0 then
-                GraphContext.Default.PostRing.Enqueue(this :> obj)
+        else if Interlocked.CompareExchange(&posted, 1, 0) = 0 then
+            GraphContext.Default.PostRing.Enqueue(this :> obj)
 
     member private this.Poll() =
         if dirty && not disposed then
@@ -259,8 +255,7 @@ type ExternalListNode<'T when 'T: equality>([<InlineIfLambda>] snapshot: unit ->
     interface IListSinkRegistry with
         member this.AddListSink(sink) = Collections.addSink &sinks sink
 
-        member this.RemoveListSink(sink) =
-            Collections.removeSink &sinks sink
+        member this.RemoveListSink(sink) = Collections.removeSink &sinks sink
 
     interface IEdgeTarget with
         member _.EdgeCount = edges.Count

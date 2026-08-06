@@ -27,9 +27,7 @@ open System.Collections.Generic
 /// on a surviving element that now fails removes it (FDA choose semantics,
 /// docs/ALIST-DESIGN.md §3.4).
 /// </remarks>
-type ElementListNode<'T, 'U>
-    (source: IAdaptiveList<'T>, [<InlineIfLambda>] mapping: int -> 'T -> aval<'U voption>)
-    =
+type ElementListNode<'T, 'U>(source: IAdaptiveList<'T>, [<InlineIfLambda>] mapping: int -> 'T -> aval<'U voption>) =
     let mutable version = 0L
     let mutable edges = ParentEdges()
     let mutable sinks = SinkList.Create()
@@ -135,7 +133,8 @@ type ElementListNode<'T, 'U>
     /// The dirty gate: a scan is needed when the precise flag is set, or when
     /// registration is incomplete and a write moved the generation.
     member private _.NeedsElementScan() =
-        elementDirty || (not regComplete && GraphContext.Default.WriteGeneration <> lastDrainWriteGen)
+        elementDirty
+        || (not regComplete && GraphContext.Default.WriteGeneration <> lastDrainWriteGen)
 
     /// Load the cache and the output from a snapshot of the source.
     member private this.Load(snapshot: ResizeArray<'T>) =
@@ -319,10 +318,7 @@ type ElementListNode<'T, 'U>
                             // Surviving element, new value: an update at its
                             // output position (present by the invariant).
                             output[j] <- u
-                            out.Ops <-
-                                Collections.bufferAppend
-                                    out.Ops
-                                    (ListOp(ListOpKind.Update, j, u, 0uy))
+                            out.Ops <- Collections.bufferAppend out.Ops (ListOp(ListOpKind.Update, j, u, 0uy))
 
                             changed <- true
                     | ValueNone ->
@@ -433,8 +429,7 @@ type ElementListNode<'T, 'U>
     interface IListSinkRegistry with
         member this.AddListSink(sink) = Collections.addSink &sinks sink
 
-        member this.RemoveListSink(sink) =
-            Collections.removeSink &sinks sink
+        member this.RemoveListSink(sink) = Collections.removeSink &sinks sink
 
     interface IEdgeTarget with
         member _.EdgeCount = edges.Count

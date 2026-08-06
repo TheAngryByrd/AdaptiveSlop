@@ -1590,9 +1590,8 @@ module AVal =
                 // generation (the *A gate) and marks observers.
                 dirty <- true
                 GraphContext.Default.MarkFrom edges
-            else
-                if Interlocked.CompareExchange(&posted, 1, 0) = 0 then
-                    GraphContext.Default.PostRing.Enqueue(this :> obj)
+            else if Interlocked.CompareExchange(&posted, 1, 0) = 0 then
+                GraphContext.Default.PostRing.Enqueue(this :> obj)
 
         member private this.Poll() =
             if dirty then

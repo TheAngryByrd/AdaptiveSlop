@@ -157,10 +157,7 @@ module ASet =
     /// cleanup.Dispose()          // all remaining resources are disposed
     /// </code>
     /// </example>
-    let inline mapUse
-        ([<InlineIfLambda>] mapping: 'A -> 'B)
-        (set: aset<'A>)
-        : IDisposable * aset<'B> =
+    let inline mapUse ([<InlineIfLambda>] mapping: 'A -> 'B) (set: aset<'A>) : IDisposable * aset<'B> =
         let node = new MapUseSetNode<'A, 'B>(set, mapping)
         (node :> IDisposable, node :> aset<'B>)
 
@@ -209,8 +206,8 @@ module ASet =
     /// An adaptive numeric range (FDA <c>ASet.range</c> parity). The set is
     /// rebuilt when either bound changes; the bounds are inclusive.
     /// </summary>
-    let inline range (min: aval<^T>) (max: aval<^T>) : aset<^T> =
-        ofAVal (AVal.map2 (fun lo hi -> seq { lo .. hi }) min max)
+    let inline range (min: aval< ^T >) (max: aval< ^T >) : aset< ^T > =
+        ofAVal (AVal.map2 (fun lo hi -> seq { lo..hi }) min max)
 
     /// <summary>
     /// Adaptively maps over the two values and returns the resulting set (FDA
@@ -219,11 +216,7 @@ module ASet =
     /// mapped pair (the FDA approach: nested binds would miss the inner
     /// bind's swap, which signals by version only, not by delta).
     /// </summary>
-    let inline bind2
-        ([<InlineIfLambda>] mapping: 'A -> 'B -> aset<'C>)
-        (a: aval<'A>)
-        (b: aval<'B>)
-        : aset<'C> =
+    let inline bind2 ([<InlineIfLambda>] mapping: 'A -> 'B -> aset<'C>) (a: aval<'A>) (b: aval<'B>) : aset<'C> =
         bind (fun (av, bv) -> mapping av bv) (AVal.map2 (fun av bv -> (av, bv)) a b)
 
     /// <summary>
@@ -428,7 +421,10 @@ module ASet =
 
     /// <summary>Adaptively tests if every element's predicate aval holds <c>true</c> (FDA <c>ASet.forallA</c> parity).</summary>
     let inline forallA ([<InlineIfLambda>] predicate: 'T -> aval<bool>) (set: aset<'T>) : aval<bool> =
-        set |> filterA (fun x -> AVal.map not (predicate x)) |> count |> AVal.map (fun c -> c = 0)
+        set
+        |> filterA (fun x -> AVal.map not (predicate x))
+        |> count
+        |> AVal.map (fun c -> c = 0)
 
     /// <summary>Adaptively sums the avals mapped from the elements (FDA <c>ASet.sumByA</c> parity).</summary>
     let inline sumByA ([<InlineIfLambda>] mapping: 'T -> aval<'U>) (set: aset<'T>) : aval<'U> =
@@ -456,18 +452,14 @@ module ASet =
     /// Adaptively averages the elements (needs a numeric type with
     /// <c>DivideByInt</c>, e.g. <c>float</c>). The average is sum/count.
     /// </summary>
-    let inline average (set: aset<^T>) : aval<^T> =
-        AVal.map2
-            (fun total count -> LanguagePrimitives.DivideByInt total count)
-            (sum set)
-            (count set)
+    let inline average (set: aset< ^T >) : aval< ^T > =
+        AVal.map2 (fun total count -> LanguagePrimitives.DivideByInt total count) (sum set) (count set)
 
     /// <summary>
     /// Adaptively averages the mapped elements (needs a numeric type with
     /// <c>DivideByInt</c>, e.g. <c>float</c>).
     /// </summary>
-    let inline averageBy ([<InlineIfLambda>] mapping: 'T -> ^U) (set: aset<'T>) : aval<^U> =
-        average (map mapping set)
+    let inline averageBy ([<InlineIfLambda>] mapping: 'T -> ^U) (set: aset<'T>) : aval< ^U > = average (map mapping set)
 
     /// <summary>Adaptively gets the minimum element, or <c>ValueNone</c> when empty.</summary>
     let inline tryMin (set: aset<'T>) : aval<'T voption> =
@@ -874,11 +866,7 @@ module AMap =
     /// mapped pair (the FDA approach: nested binds would miss the inner
     /// bind's swap, which signals by version only, not by delta).
     /// </summary>
-    let inline bind2
-        ([<InlineIfLambda>] mapping: 'A -> 'B -> amap<'K, 'V>)
-        (a: aval<'A>)
-        (b: aval<'B>)
-        : amap<'K, 'V> =
+    let inline bind2 ([<InlineIfLambda>] mapping: 'A -> 'B -> amap<'K, 'V>) (a: aval<'A>) (b: aval<'B>) : amap<'K, 'V> =
         bind (fun (av, bv) -> mapping av bv) (AVal.map2 (fun av bv -> (av, bv)) a b)
 
     /// <summary>
@@ -981,11 +969,11 @@ module AMap =
     /// Adaptively keeps the entries whose predicate aval holds <c>true</c>
     /// (FDA <c>AMap.filterA</c> parity).
     /// </summary>
-    let inline filterA
-        ([<InlineIfLambda>] predicate: 'K -> 'V -> aval<bool>)
-        (mapValue: amap<'K, 'V>)
-        : amap<'K, 'V> =
-        new ElementMapNode<'K, 'V, 'V>(mapValue, fun k v -> AVal.map (fun b -> if b then ValueSome v else ValueNone) (predicate k v))
+    let inline filterA ([<InlineIfLambda>] predicate: 'K -> 'V -> aval<bool>) (mapValue: amap<'K, 'V>) : amap<'K, 'V> =
+        new ElementMapNode<'K, 'V, 'V>(
+            mapValue,
+            fun k v -> AVal.map (fun b -> if b then ValueSome v else ValueNone) (predicate k v)
+        )
 
     /// <summary>
     /// Registers a callback that receives the current view and the net delta
@@ -1100,7 +1088,7 @@ module AMap =
     /// Adaptively averages the mapped entries (needs a numeric type with
     /// <c>DivideByInt</c>, e.g. <c>float</c>). The average is sum/count.
     /// </summary>
-    let inline averageBy ([<InlineIfLambda>] mapping: 'k -> 'v -> ^u) (mapValue: amap<'k, 'v>) : aval<^u> =
+    let inline averageBy ([<InlineIfLambda>] mapping: 'k -> 'v -> ^u) (mapValue: amap<'k, 'v>) : aval< ^u > =
         AVal.map2
             (fun total c -> LanguagePrimitives.DivideByInt total c)
             (reduceBy (AdaptiveReduction.sum ()) mapping mapValue)
@@ -1206,17 +1194,15 @@ module CMap =
     let inline set (value: Map<'K, 'V>) (mapValue: cmap<'K, 'V>) = mapValue.Set(Map.toSeq value)
 
     /// <summary>Tests whether the key is present (FDA <c>cmap.ContainsKey</c> parity).</summary>
-    let inline containsKey (key: 'K) (mapValue: cmap<'K, 'V>) : bool = (AMap.getValue mapValue).ContainsKey key
+    let inline containsKey (key: 'K) (mapValue: cmap<'K, 'V>) : bool =
+        (AMap.getValue mapValue).ContainsKey key
 
     /// <summary>Gets the value for the key, or <c>ValueNone</c> when absent (FDA <c>cmap.TryGetValue</c> parity).</summary>
     let inline tryGetValue (key: 'K) (mapValue: cmap<'K, 'V>) : 'V voption =
         let view = AMap.getValue mapValue
         let mutable v = Unchecked.defaultof<'V>
 
-        if view.TryGetValue(key, &v) then
-            ValueSome v
-        else
-            ValueNone
+        if view.TryGetValue(key, &v) then ValueSome v else ValueNone
 
     /// <summary>Gets the value for the key (FDA <c>cmap.Item</c> parity; <see cref="KeyNotFoundException"/> when absent).</summary>
     let inline item (key: 'K) (mapValue: cmap<'K, 'V>) : 'V = (AMap.getValue mapValue).[key]
@@ -1239,7 +1225,10 @@ module CMap =
             for KeyValue(k, v) in view do
                 let mutable t = Unchecked.defaultof<'V>
 
-                if not (targetMap.TryGetValue(k, &t)) || not (EqualityComparer<'V>.Default.Equals(t, v)) then
+                if
+                    not (targetMap.TryGetValue(k, &t))
+                    || not (EqualityComparer<'V>.Default.Equals(t, v))
+                then
                     changed <- true
 
         if changed then
@@ -1367,8 +1356,7 @@ module AList =
     /// (FDA <c>AList.indexed</c> parity; struct pair, the library convention;
     /// the position is the <c>int</c> input position).
     /// </summary>
-    let inline indexed (list: alist<'T>) : alist<struct (int * 'T)> =
-        mapi (fun i v -> struct (i, v)) list
+    let inline indexed (list: alist<'T>) : alist<struct (int * 'T)> = mapi (fun i v -> struct (i, v)) list
 
     /// <summary>
     /// Adaptively maps every element of the list to an adaptive value (FDA
@@ -1391,7 +1379,10 @@ module AList =
     /// (FDA <c>AList.filterA</c> parity).
     /// </summary>
     let inline filterA ([<InlineIfLambda>] predicate: 'T -> aval<bool>) (list: alist<'T>) : alist<'T> =
-        new ElementListNode<'T, 'T>(list, fun _ x -> AVal.map (fun b -> if b then ValueSome x else ValueNone) (predicate x))
+        new ElementListNode<'T, 'T>(
+            list,
+            fun _ x -> AVal.map (fun b -> if b then ValueSome x else ValueNone) (predicate x)
+        )
 
     /// <summary>
     /// Adaptively maps every element of the list to an adaptive value, passing
@@ -1406,10 +1397,7 @@ module AList =
     /// only the elements whose aval holds <c>Some</c>, passing the input
     /// position to the mapping (FDA <c>AList.chooseiA</c> parity).
     /// </summary>
-    let inline chooseiA
-        ([<InlineIfLambda>] mapping: int -> 'T -> aval<'U option>)
-        (list: alist<'T>)
-        : alist<'U> =
+    let inline chooseiA ([<InlineIfLambda>] mapping: int -> 'T -> aval<'U option>) (list: alist<'T>) : alist<'U> =
         new ElementListNode<'T, 'U>(list, fun i x -> AVal.map Option.toValueOption (mapping i x))
 
     /// <summary>
@@ -1417,10 +1405,7 @@ module AList =
     /// passing the input position to the predicate (FDA <c>AList.filteriA</c>
     /// parity).
     /// </summary>
-    let inline filteriA
-        ([<InlineIfLambda>] predicate: int -> 'T -> aval<bool>)
-        (list: alist<'T>)
-        : alist<'T> =
+    let inline filteriA ([<InlineIfLambda>] predicate: int -> 'T -> aval<bool>) (list: alist<'T>) : alist<'T> =
         new ElementListNode<'T, 'T>(
             list,
             fun i x -> AVal.map (fun b -> if b then ValueSome x else ValueNone) (predicate i x)
@@ -1554,29 +1539,22 @@ module AList =
     /// Adaptively averages the elements (needs a numeric type with
     /// <c>DivideByInt</c>, e.g. <c>float</c>; FDA <c>AList.average</c> parity).
     /// </summary>
-    let inline average (list: alist<^T>) : aval<^T> =
-        AVal.map2
-            (fun total c -> LanguagePrimitives.DivideByInt total c)
-            (sum list)
-            (count list)
+    let inline average (list: alist< ^T >) : aval< ^T > =
+        AVal.map2 (fun total c -> LanguagePrimitives.DivideByInt total c) (sum list) (count list)
 
     /// <summary>
     /// Adaptively averages the mapped elements (needs a numeric type with
     /// <c>DivideByInt</c>, e.g. <c>float</c>; FDA <c>AList.averageBy</c> parity).
     /// </summary>
-    let inline averageBy ([<InlineIfLambda>] mapping: 'T -> ^U) (list: alist<'T>) : aval<^U> =
-        AVal.map2
-            (fun total c -> LanguagePrimitives.DivideByInt total c)
-            (sumBy mapping list)
-            (count list)
+    let inline averageBy ([<InlineIfLambda>] mapping: 'T -> ^U) (list: alist<'T>) : aval< ^U > =
+        AVal.map2 (fun total c -> LanguagePrimitives.DivideByInt total c) (sumBy mapping list) (count list)
 
     /// <summary>
     /// An adaptive list over an adaptive value of a sequence (FDA
     /// <c>AList.ofAVal</c> parity). Every change of the value replaces the
     /// whole state and emits the positional diff as the delta.
     /// </summary>
-    let inline ofAVal<'T, 'S when 'S :> seq<'T>> (value: aval<'S>) : alist<'T> =
-        new OfAvalListNode<'T, 'S>(value)
+    let inline ofAVal<'T, 'S when 'S :> seq<'T>> (value: aval<'S>) : alist<'T> = new OfAvalListNode<'T, 'S>(value)
 
     /// <summary>
     /// An adaptive list generated from a count and a generator (FDA
@@ -1589,8 +1567,8 @@ module AList =
     /// An adaptive numeric range as a list (FDA <c>AList.range</c> parity).
     /// The list is rebuilt when either bound changes; the bounds are inclusive.
     /// </summary>
-    let inline range (min: aval<^T>) (max: aval<^T>) : alist<^T> =
-        ofAVal (AVal.map2 (fun lo hi -> seq { lo .. hi }) min max)
+    let inline range (min: aval< ^T >) (max: aval< ^T >) : alist< ^T > =
+        ofAVal (AVal.map2 (fun lo hi -> seq { lo..hi }) min max)
 
     /// <summary>
     /// Adaptively looks up the element at the given position (FDA
@@ -1614,10 +1592,7 @@ module AList =
         AdaptiveNode(fun () ->
             let view = list.GetValue()
 
-            if view.Count > 0 then
-                ValueSome view[0]
-            else
-                ValueNone)
+            if view.Count > 0 then ValueSome view[0] else ValueNone)
 
     /// <summary>Adaptively gets the last element, or <c>ValueNone</c> when empty (FDA <c>AList.tryLast</c> parity).</summary>
     let inline tryLast (list: alist<'T>) : aval<'T voption> =
@@ -1689,11 +1664,7 @@ module AList =
     /// pair (the ASet lesson: nested binds miss the inner bind's swap, which
     /// signals by version only, not by delta).
     /// </summary>
-    let inline bind2
-        ([<InlineIfLambda>] mapping: 'A -> 'B -> alist<'C>)
-        (a: aval<'A>)
-        (b: aval<'B>)
-        : alist<'C> =
+    let inline bind2 ([<InlineIfLambda>] mapping: 'A -> 'B -> alist<'C>) (a: aval<'A>) (b: aval<'B>) : alist<'C> =
         bind (fun (av, bv) -> mapping av bv) (AVal.map2 (fun av bv -> (av, bv)) a b)
 
     /// <summary>

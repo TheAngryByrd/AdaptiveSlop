@@ -360,8 +360,7 @@ type SetReduceNode<'a, 'b, 's, 'v when 'a: equality>
 /// same contract as the set/map reduction nodes.
 /// </summary>
 type ListReduceNode<'a, 'b, 's, 'v>
-    (source: IAdaptiveList<'a>, [<InlineIfLambda>] mapping: 'a -> 'b, reduction: AdaptiveReduction<'b, 's, 'v>)
-    =
+    (source: IAdaptiveList<'a>, [<InlineIfLambda>] mapping: 'a -> 'b, reduction: AdaptiveReduction<'b, 's, 'v>) =
     let mutable version = 0L
     let mutable edges = ParentEdges()
     let mutable depVersion = 0L

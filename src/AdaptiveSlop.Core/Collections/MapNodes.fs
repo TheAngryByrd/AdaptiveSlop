@@ -1418,8 +1418,7 @@ type AListToMapNode<'K, 'V when 'K: equality>(source: IAdaptiveList<'K * 'V>) =
     interface IMapSinkRegistry with
         member this.AddMapSink(sink) = Collections.addSink &sinks sink
 
-        member this.RemoveMapSink(sink) =
-            Collections.removeSink &sinks sink
+        member this.RemoveMapSink(sink) = Collections.removeSink &sinks sink
 
     interface IEdgeTarget with
         member _.EdgeCount = edges.Count
@@ -1480,8 +1479,7 @@ type MapToAListNode<'K, 'V when 'K: equality>(source: IAdaptiveMap<'K, 'V>) =
     interface IListSinkRegistry with
         member this.AddListSink(sink) = Collections.addSink &sinks sink
 
-        member this.RemoveListSink(sink) =
-            Collections.removeSink &sinks sink
+        member this.RemoveListSink(sink) = Collections.removeSink &sinks sink
 
     interface IEdgeTarget with
         member _.EdgeCount = edges.Count

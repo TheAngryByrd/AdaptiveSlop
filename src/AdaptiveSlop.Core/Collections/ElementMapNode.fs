@@ -18,8 +18,7 @@ open System.Collections.Generic
 /// the aval's value is <c>ValueNone</c> to drop the entry).
 /// </summary>
 type ElementMapNode<'K, 'V, 'U when 'K: equality>
-    (source: IAdaptiveMap<'K, 'V>, [<InlineIfLambda>] mapping: 'K -> 'V -> aval<'U voption>)
-    =
+    (source: IAdaptiveMap<'K, 'V>, [<InlineIfLambda>] mapping: 'K -> 'V -> aval<'U voption>) =
     let mutable state = MapNodeState<'K, 'V, 'U>.Create(1)
     let mutable cache = Dictionary<'K, ElementEntry<'U>>()
     let mutable nextId = 0
@@ -98,7 +97,8 @@ type ElementMapNode<'K, 'V, 'U when 'K: equality>
     /// The dirty gate: a scan is needed when the precise flag is set, or when
     /// registration is incomplete and a write moved the generation.
     member private _.NeedsElementScan() =
-        elementDirty || (not regComplete && GraphContext.Default.WriteGeneration <> lastDrainWriteGen)
+        elementDirty
+        || (not regComplete && GraphContext.Default.WriteGeneration <> lastDrainWriteGen)
 
     member private this.EnsureInitialized() =
         if not initialized then
@@ -227,7 +227,10 @@ type ElementMapNode<'K, 'V, 'U when 'K: equality>
                 | ValueSome u ->
                     let mutable old = Unchecked.defaultof<'U>
 
-                    if state.Data.TryGetValue(kvp.Key, &old) && EqualityComparer<'U>.Default.Equals(old, u) then
+                    if
+                        state.Data.TryGetValue(kvp.Key, &old)
+                        && EqualityComparer<'U>.Default.Equals(old, u)
+                    then
                         () // version bumped to an equal value: no delta
                     else
                         state.Data[kvp.Key] <- u
@@ -308,7 +311,10 @@ type ElementMapNode<'K, 'V, 'U when 'K: equality>
 
         member this.Version =
             // Dirty indicator for version-checking readers (see ElementSetNode).
-            if this.NeedsElementScan() then state.Version + 1L else state.Version
+            if this.NeedsElementScan() then
+                state.Version + 1L
+            else
+                state.Version
 
     interface IDisposable with
         member this.Dispose() =

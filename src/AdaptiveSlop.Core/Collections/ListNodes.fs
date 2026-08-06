@@ -529,7 +529,8 @@ type ObserveListNode<'T>
 /// the change since the previous call (consuming its own event queue, for
 /// example). Called on every read (poll), like <see cref="CustomSetNode"/>.
 /// </summary>
-type CustomListNode<'T when 'T: equality>([<InlineIfLambda>] compute: IReadOnlyList<'T> -> ListDeltaBuilder<'T> -> unit) =
+type CustomListNode<'T when 'T: equality>([<InlineIfLambda>] compute: IReadOnlyList<'T> -> ListDeltaBuilder<'T> -> unit)
+    =
     let mutable data = ResizeArray<'T>()
     let builder = ListDeltaBuilder<'T>()
     let mutable version = 0L
@@ -590,8 +591,7 @@ type CustomListNode<'T when 'T: equality>([<InlineIfLambda>] compute: IReadOnlyL
     interface IListSinkRegistry with
         member this.AddListSink(sink) = Collections.addSink &sinks sink
 
-        member this.RemoveListSink(sink) =
-            Collections.removeSink &sinks sink
+        member this.RemoveListSink(sink) = Collections.removeSink &sinks sink
 
     interface IEdgeTarget with
         member _.EdgeCount = edges.Count
@@ -743,8 +743,7 @@ type ToSetListNode<'T when 'T: equality>(source: IAdaptiveList<'T>) =
     interface ISetSinkRegistry with
         member this.AddSetSink(sink) = Collections.addSink &sinks sink
 
-        member this.RemoveSetSink(sink) =
-            Collections.removeSink &sinks sink
+        member this.RemoveSetSink(sink) = Collections.removeSink &sinks sink
 
     interface IEdgeTarget with
         member _.EdgeCount = edges.Count
@@ -802,8 +801,7 @@ type SetToListNode<'T when 'T: equality>(source: IAdaptiveSet<'T>) =
     interface IListSinkRegistry with
         member this.AddListSink(sink) = Collections.addSink &sinks sink
 
-        member this.RemoveListSink(sink) =
-            Collections.removeSink &sinks sink
+        member this.RemoveListSink(sink) = Collections.removeSink &sinks sink
 
     interface IEdgeTarget with
         member _.EdgeCount = edges.Count
@@ -817,8 +815,7 @@ type SetToListNode<'T when 'T: equality>(source: IAdaptiveSet<'T>) =
 /// The mapping runs only when the value changed. Rebuild-on-change semantics:
 /// the deltas are full replaces (the inner list's own deltas are not streamed).
 /// </summary>
-type BindListNode<'T, 'U>
-    (value: IAdaptiveValue<'T>, [<InlineIfLambda>] mapping: 'T -> IAdaptiveList<'U>) =
+type BindListNode<'T, 'U>(value: IAdaptiveValue<'T>, [<InlineIfLambda>] mapping: 'T -> IAdaptiveList<'U>) =
     let mutable data = ResizeArray<'U>()
     let mutable out = ListDelta<'U>.Create()
     let mutable version = 0L
@@ -881,8 +878,7 @@ type BindListNode<'T, 'U>
     interface IListSinkRegistry with
         member this.AddListSink(sink) = Collections.addSink &sinks sink
 
-        member this.RemoveListSink(sink) =
-            Collections.removeSink &sinks sink
+        member this.RemoveListSink(sink) = Collections.removeSink &sinks sink
 
     interface IEdgeTarget with
         member _.EdgeCount = edges.Count
@@ -946,8 +942,7 @@ type ConcatListNode<'T>(sources: IAdaptiveList<'T>[]) =
     interface IListSinkRegistry with
         member this.AddListSink(sink) = Collections.addSink &sinks sink
 
-        member this.RemoveListSink(sink) =
-            Collections.removeSink &sinks sink
+        member this.RemoveListSink(sink) = Collections.removeSink &sinks sink
 
     interface IEdgeTarget with
         member _.EdgeCount = edges.Count
@@ -1011,8 +1006,7 @@ type OfAvalListNode<'T, 'S when 'S :> seq<'T>>(value: IAdaptiveValue<'S>) =
     interface IListSinkRegistry with
         member this.AddListSink(sink) = Collections.addSink &sinks sink
 
-        member this.RemoveListSink(sink) =
-            Collections.removeSink &sinks sink
+        member this.RemoveListSink(sink) = Collections.removeSink &sinks sink
 
     interface IEdgeTarget with
         member _.EdgeCount = edges.Count
@@ -1072,8 +1066,7 @@ type PollListSourceNode<'T, 'U>
     interface IListSinkRegistry with
         member this.AddListSink(sink) = Collections.addSink &sinks sink
 
-        member this.RemoveListSink(sink) =
-            Collections.removeSink &sinks sink
+        member this.RemoveListSink(sink) = Collections.removeSink &sinks sink
 
     interface IEdgeTarget with
         member _.EdgeCount = edges.Count
@@ -1086,7 +1079,11 @@ type PollListSourceNode<'T, 'U>
 /// <c>sortByi</c> mapping contract); the sort is stable by position.
 /// </summary>
 type SortListNode<'T, 'K>
-    (source: IAdaptiveList<'T>, [<InlineIfLambda>] keyMapping: int -> 'T -> 'K, [<InlineIfLambda>] comparer: 'K -> 'K -> int) =
+    (
+        source: IAdaptiveList<'T>,
+        [<InlineIfLambda>] keyMapping: int -> 'T -> 'K,
+        [<InlineIfLambda>] comparer: 'K -> 'K -> int
+    ) =
     let mutable data = ResizeArray<'T>()
     let mutable out = ListDelta<'T>.Create()
     let mutable version = 0L
@@ -1156,8 +1153,7 @@ type SortListNode<'T, 'K>
     interface IListSinkRegistry with
         member this.AddListSink(sink) = Collections.addSink &sinks sink
 
-        member this.RemoveListSink(sink) =
-            Collections.removeSink &sinks sink
+        member this.RemoveListSink(sink) = Collections.removeSink &sinks sink
 
     interface IEdgeTarget with
         member _.EdgeCount = edges.Count
@@ -1225,7 +1221,10 @@ type MapUseListNode<'T, 'W when 'W: equality and 'W :> IDisposable>
                 | ListOpKind.Remove ->
                     output[p].Dispose()
                     output.RemoveAt p
-                    out.Ops <- Collections.bufferAppend out.Ops (ListOp(ListOpKind.Remove, p, Unchecked.defaultof<'W>, 0uy))
+
+                    out.Ops <-
+                        Collections.bufferAppend out.Ops (ListOp(ListOpKind.Remove, p, Unchecked.defaultof<'W>, 0uy))
+
                     inputCount <- inputCount - 1
                 | _ -> // Update: dispose the old mapped value, keep the position.
                     let w = mapping p op.Value
@@ -1284,8 +1283,7 @@ type MapUseListNode<'T, 'W when 'W: equality and 'W :> IDisposable>
     interface IListSinkRegistry with
         member this.AddListSink(sink) = Collections.addSink &sinks sink
 
-        member this.RemoveListSink(sink) =
-            Collections.removeSink &sinks sink
+        member this.RemoveListSink(sink) = Collections.removeSink &sinks sink
 
     interface IEdgeTarget with
         member _.EdgeCount = edges.Count

@@ -1581,13 +1581,16 @@ type MapABenchmarks() =
         counter <- 0
         slopElements <- Array.init this.ElementCount (fun i -> AdaptiveSlop.Core.CVal.create (i * 10))
         slopSet <- AdaptiveSlop.Core.CSet.ofSeq [ 0 .. this.ElementCount - 1 ]
+
         slopMapped <-
             slopSet
             |> AdaptiveSlop.Core.ASet.mapA (fun v -> AdaptiveSlop.Core.CVal.value slopElements[v % this.ElementCount])
+
         slopNaive <-
             slopSet
             |> AdaptiveSlop.Core.ASet.map (fun v ->
                 AdaptiveSlop.Core.AVal.getValue (AdaptiveSlop.Core.CVal.value slopElements[v % this.ElementCount]))
+
         fdaElements <- Array.init this.ElementCount (fun i -> cval (i * 10))
         fdaSet <- cset [ 0 .. this.ElementCount - 1 ]
         fdaMapped <- fdaSet |> ASet.mapA (fun v -> fdaElements[v % this.ElementCount] :> aval<int>)
