@@ -1006,34 +1006,268 @@ let ``scalar bind3 tracks its inputs and its inner`` () =
     Check.One (scalarConfig, prop)
 
 // =============================================================================
+// Collection scenario generators: typed, weighted op sequences with a random
+// initial state, registered as FsCheck arbitraries. The differential
+// properties consume the scenarios instead of decoding int lists; the
+// initial state exercises the load path, the ops the drain path.
+// =============================================================================
+
+type SetOp =
+    | Add of int * int // element, initial aval value
+    | Remove of int
+    | SetValue of int * int // element, new aval value
+
+type MapOp =
+    | Upsert of int * int
+    | Remove of int
+    | SetValue of int * int // key, new aval value
+
+type ListChange =
+    | Insert of int * int // element, position payload
+    | RemoveAt of int // position payload
+    | UpdateAt of int * int // element, position payload
+    | SetValue of int * int // element, new aval value
+
+type CrossOp =
+    | EntityUpsert of int * int
+    | EntityRemove of int
+    | LookupUpsert of int * int
+    | LookupRemove of int
+
+type JoinOp =
+    | LeftEdit of MapOp
+    | RightEdit of MapOp
+
+type ExternalOp =
+    | Replace of int
+    | Invalidate
+
+type SetScenario = { initial: (int * int) list; ops: SetOp list }
+type MapScenario = { initial: (int * int) list; ops: MapOp list }
+type ListScenario = { initial: (int * int) list; ops: ListChange list }
+type CrossScenario =
+    { initialEntities: (int * int) list
+      initialLookups: (int * int) list
+      ops: CrossOp list }
+
+type JoinScenario =
+    { initialA: (int * int) list
+      initialB: (int * int) list
+      ops: JoinOp list }
+
+type ExternalScenario = { ops: ExternalOp list }
+
+let pairGen =
+    gen {
+        let! k = Gen.choose(0, 19)
+        let! v = Gen.choose(0, 99)
+        return k, v
+    }
+
+/// Deduplicates the initial pairs with the last value winning (the set/map
+/// semantics), keeping the generated initial state valid for both sides.
+let dedupPairs (xs: (int * int) list) =
+    let d = Dictionary<int, int>()
+
+    for (k, v) in xs do
+        d[k] <- v
+
+    [ for KeyValue(k, v) in d -> k, v ]
+
+let setOpGen: Gen<SetOp> =
+    Gen.frequency [
+        (3, gen {
+            let! e = Gen.choose(0, 19)
+            let! v = Gen.choose(0, 99)
+            return Add(e, v)
+        })
+        (2, gen {
+            let! e = Gen.choose(0, 19)
+            return SetOp.Remove e
+        })
+        (2, gen {
+            let! e = Gen.choose(0, 19)
+            let! v = Gen.choose(0, 99)
+            return SetOp.SetValue(e, v)
+        })
+    ]
+
+let mapOpGen: Gen<MapOp> =
+    Gen.frequency [
+        (3, gen {
+            let! k = Gen.choose(0, 9)
+            let! v = Gen.choose(0, 99)
+            return Upsert(k, v)
+        })
+        (2, gen {
+            let! k = Gen.choose(0, 9)
+            return MapOp.Remove k
+        })
+        (2, gen {
+            let! k = Gen.choose(0, 9)
+            let! v = Gen.choose(0, 99)
+            return MapOp.SetValue(k, v)
+        })
+    ]
+
+let listChangeGen: Gen<ListChange> =
+    Gen.frequency [
+        (3, gen {
+            let! e = Gen.choose(0, 9)
+            let! p = Gen.choose(0, 200)
+            return Insert(e, p)
+        })
+        (2, gen {
+            let! p = Gen.choose(0, 200)
+            return RemoveAt p
+        })
+        (2, gen {
+            let! e = Gen.choose(0, 9)
+            let! p = Gen.choose(0, 200)
+            return UpdateAt(e, p)
+        })
+        (1, gen {
+            let! e = Gen.choose(0, 9)
+            let! v = Gen.choose(0, 99)
+            return ListChange.SetValue(e, v)
+        })
+    ]
+
+let crossOpGen: Gen<CrossOp> =
+    Gen.frequency [
+        (2, gen {
+            let! k = Gen.choose(0, 9)
+            let! v = Gen.choose(0, 99)
+            return EntityUpsert(k, v)
+        })
+        (1, gen {
+            let! k = Gen.choose(0, 9)
+            return EntityRemove k
+        })
+        (2, gen {
+            let! k = Gen.choose(0, 9)
+            let! v = Gen.choose(0, 99)
+            return LookupUpsert(k, v)
+        })
+        (1, gen {
+            let! k = Gen.choose(0, 9)
+            return LookupRemove k
+        })
+    ]
+
+let joinOpGen: Gen<JoinOp> =
+    Gen.frequency [
+        (2, Gen.map LeftEdit mapOpGen)
+        (2, Gen.map RightEdit mapOpGen)
+    ]
+
+let externalOpGen: Gen<ExternalOp> =
+    Gen.frequency [
+        (3, gen {
+            let! v = Gen.choose(0, 99)
+            return Replace v
+        })
+        (1, Gen.constant Invalidate)
+    ]
+
+let setScenarioGen: Gen<SetScenario> =
+    gen {
+        let! initial = Gen.listOf pairGen
+        let! ops = Gen.listOf setOpGen
+        return { initial = dedupPairs initial; ops = ops }
+    }
+
+let mapScenarioGen: Gen<MapScenario> =
+    gen {
+        let! initial = Gen.listOf pairGen
+        let! ops = Gen.listOf mapOpGen
+        return { initial = dedupPairs initial; ops = ops }
+    }
+
+let listScenarioGen: Gen<ListScenario> =
+    gen {
+        let! initial = Gen.listOf pairGen
+        let! ops = Gen.listOf listChangeGen
+        return { initial = initial; ops = ops }
+    }
+
+let crossScenarioGen: Gen<CrossScenario> =
+    gen {
+        let! initialEntities = Gen.listOf pairGen
+        let! initialLookups = Gen.listOf pairGen
+        let! ops = Gen.listOf crossOpGen
+
+        return
+            { initialEntities = dedupPairs initialEntities
+              initialLookups = dedupPairs initialLookups
+              ops = ops }
+    }
+
+let joinScenarioGen: Gen<JoinScenario> =
+    gen {
+        let! initialA = Gen.listOf pairGen
+        let! initialB = Gen.listOf pairGen
+        let! ops = Gen.listOf joinOpGen
+        return { initialA = dedupPairs initialA; initialB = dedupPairs initialB; ops = ops }
+    }
+
+let externalScenarioGen: Gen<ExternalScenario> =
+    gen {
+        let! ops = Gen.listOf externalOpGen
+        return { ops = ops }
+    }
+
+/// The registered arbitraries: FsCheck resolves the property parameters by type.
+type ScenarioArbs =
+    static member SetScenario() : Arbitrary<SetScenario> = Arb.fromGen setScenarioGen
+    static member MapScenario() : Arbitrary<MapScenario> = Arb.fromGen mapScenarioGen
+    static member ListScenario() : Arbitrary<ListScenario> = Arb.fromGen listScenarioGen
+    static member CrossScenario() : Arbitrary<CrossScenario> = Arb.fromGen crossScenarioGen
+    static member JoinScenario() : Arbitrary<JoinScenario> = Arb.fromGen joinScenarioGen
+    static member ExternalScenario() : Arbitrary<ExternalScenario> = Arb.fromGen externalScenarioGen
+    static member SetOpList() : Arbitrary<SetOp list> = Arb.fromGen (Gen.listOf setOpGen)
+    static member MapOpList() : Arbitrary<MapOp list> = Arb.fromGen (Gen.listOf mapOpGen)
+    static member ListChangeList() : Arbitrary<ListChange list> = Arb.fromGen (Gen.listOf listChangeGen)
+
+let private scenarioConfig = Config.QuickThrowOnFailure.WithArbitrary([| typeof<ScenarioArbs> |])
+
+// =============================================================================
 // Reference-impl model: ASet.mapA (MAPA-DESIGN §12).
 //
-// The ops are encoded as an int list (no custom generator registration for
-// the first model test): kind = op % 3 (0 Add, 1 Remove, 2 Set); the payload
-// decodes to an element in [0, 20) and a value in [0, 100). The model tracks
-// element -> value plus a value refcount (the output set dedups); the
-// library output is compared to the model after EVERY op.
+// The scenario generator provides a random initial state and a weighted op
+// sequence; the model tracks element -> value plus a value refcount (the
+// output set dedups); the library output is compared to the model after
+// EVERY op.
 // =============================================================================
 
 [<Fact>]
 let ``ASet mapA matches the reference model`` () =
-    let prop (ops: int list) =
+    let prop (sc: SetScenario) =
         let source = CSet.empty<int>
         let values = Dictionary<int, cval<int>>()
+
+        for (e, v) in sc.initial do
+            CSet.add e source
+            values[e] <- CVal.create v
+
         let mapped = ASet.mapA (fun v -> CVal.value values[v]) (CSet.value source)
         // Model: element -> current value; value -> occurrence count; the output.
         let elementValue = Dictionary<int, int>()
         let valueRefs = Dictionary<int, int>()
         let model = HashSet<int>()
 
-        let apply (op: int) =
-            let kind = op % 3
-            let payload = op / 3
-            let element = payload % 20
-            let value = (payload / 20) % 100
+        for (e, v) in sc.initial do
+            elementValue[e] <- v
 
-            match kind with
-            | 0 -> // Add the element with a fresh aval holding the value.
+            match valueRefs.TryGetValue v with
+            | true, r -> valueRefs[v] <- r + 1
+            | false, _ ->
+                valueRefs[v] <- 1
+                model.Add v |> ignore
+
+        let apply (op: SetOp) =
+            match op with
+            | Add(element, value) -> // Add the element with a fresh aval holding the value.
                 CSet.add element source
 
                 if not (elementValue.ContainsKey element) then
@@ -1045,7 +1279,7 @@ let ``ASet mapA matches the reference model`` () =
                     | false, _ ->
                         valueRefs[value] <- 1
                         model.Add value |> ignore
-            | 1 -> // Remove the element.
+            | SetOp.Remove element -> // Remove the element.
                 CSet.remove element source
 
                 if elementValue.ContainsKey element then
@@ -1059,7 +1293,7 @@ let ``ASet mapA matches the reference model`` () =
                         model.Remove v |> ignore
                     else
                         valueRefs[v] <- r
-            | _ -> // Set the element's aval.
+            | SetOp.SetValue(element, value) -> // Set the element's aval.
                 if elementValue.ContainsKey element then
                     let old = elementValue[element]
 
@@ -1083,7 +1317,7 @@ let ``ASet mapA matches the reference model`` () =
 
         let mutable ok = true
 
-        for op in ops do
+        for op in sc.ops do
             apply op
 
             let actual = Set.ofSeq (ASet.toSet mapped)
@@ -1094,63 +1328,71 @@ let ``ASet mapA matches the reference model`` () =
 
         ok
 
-    Check.QuickThrowOnFailure prop
+    Check.One (scenarioConfig, prop)
 
 // =============================================================================
 // Reference-impl model: AList.mapA (MAPA-DESIGN §12).
 //
-// Ops encoded as an int list: kind = op % 4 (0 Insert, 1 RemoveAt, 2 Update,
-// 3 Set); element = rest % 10; value = (rest / 10) % 100; the position is
-// derived at apply time from the current length. The model tracks the
-// element list (the output is a list: duplicates survive) plus element ->
-// value; a re-inserted element reuses its aval (one aval per element).
+// The scenario generator provides a random initial state and a weighted op
+// sequence; the model tracks the element list (the output is a list:
+// duplicates survive) plus element -> value; a re-inserted element reuses
+// its aval (one aval per element).
 // =============================================================================
 
 [<Fact>]
 let ``AList mapA matches the reference model`` () =
-    let prop (ops: int list) =
+    let prop (sc: ListScenario) =
         let source = CList.empty<int>
         let values = Dictionary<int, cval<int>>()
+
+        for (e, v) in sc.initial do
+            CList.append e source
+            values[e] <- CVal.create v
+
         let mapped = AList.mapA (fun v -> CVal.value values[v]) (CList.value source)
         // Model: the element list in order, and the element -> value map.
-        let elements = ResizeArray<int>()
+        let elements = ResizeArray<int>(List.map fst sc.initial)
         let elementValue = Dictionary<int, int>()
 
-        let apply (op: int) =
-            let kind = op % 4
-            let rest = op / 4
-            let element = rest % 10
-            let value = (rest / 10) % 100
-            let position = (rest / 1000) % (elements.Count + 1)
+        for (e, v) in sc.initial do
+            elementValue[e] <- v
 
-            match kind with
-            | 0 -> // Insert the element at the position; a fresh element gets a fresh aval.
+        let apply (op: ListChange) =
+            match op with
+            | Insert(element, payload) ->
+                let position = payload % (elements.Count + 1)
+
+                // Insert the element at the position; a fresh element gets a fresh aval.
                 if not (elementValue.ContainsKey element) then
-                    values[element] <- CVal.create value
-                    elementValue[element] <- value
+                    values[element] <- CVal.create 0
+                    elementValue[element] <- 0
 
                 CList.insertAt position element source
                 elements.Insert(position, element)
-            | 1 -> // RemoveAt the position.
+            | RemoveAt payload ->
+                let position = payload % (elements.Count + 1)
+
                 if elements.Count > 0 && position < elements.Count then
                     CList.removeAt position source
                     elements.RemoveAt position
-            | 2 -> // Update the position with the element.
+            | UpdateAt(element, payload) ->
+                let position = payload % (elements.Count + 1)
+
                 if elements.Count > 0 && position < elements.Count then
                     if not (elementValue.ContainsKey element) then
-                        values[element] <- CVal.create value
-                        elementValue[element] <- value
+                        values[element] <- CVal.create 0
+                        elementValue[element] <- 0
 
                     CList.updateAt position element source
                     elements[position] <- element
-            | _ -> // Set the element's aval.
+            | ListChange.SetValue(element, value) -> // Set the element's aval.
                 if elementValue.ContainsKey element then
                     CVal.set value (values[element])
                     elementValue[element] <- value
 
         let mutable ok = true
 
-        for op in ops do
+        for op in sc.ops do
             apply op
 
             let actual = AList.toArray mapped
@@ -1161,32 +1403,34 @@ let ``AList mapA matches the reference model`` () =
 
         ok
 
-    Check.QuickThrowOnFailure prop
+    Check.One (scenarioConfig, prop)
 
 // =============================================================================
 // Reference-impl model: AMap.mapA.
 //
-// Ops encoded as an int list: kind = op % 3 (0 AddOrUpdate, 1 Remove,
-// 2 Set); key = rest % 10; value = (rest / 10) % 100. A fresh key gets a
-// fresh aval; the model tracks key -> value.
+// The scenario generator provides a random initial state and a weighted op
+// sequence; a fresh key gets a fresh aval; the model tracks key -> value.
 // =============================================================================
 
 [<Fact>]
 let ``AMap mapA matches the reference model`` () =
-    let prop (ops: int list) =
+    let prop (sc: MapScenario) =
         let source = CMap.empty<int, int>
         let values = Dictionary<int, cval<int>>()
+
+        for (k, v) in sc.initial do
+            CMap.addOrUpdate k v source
+            values[k] <- CVal.create v
+
         let mapped = AMap.mapA (fun k _ -> CVal.value values[k]) (CMap.value source)
         let model = Dictionary<int, int>()
 
-        let apply (op: int) =
-            let kind = op % 3
-            let rest = op / 3
-            let key = rest % 10
-            let value = (rest / 10) % 100
+        for (k, v) in sc.initial do
+            model[k] <- v
 
-            match kind with
-            | 0 -> // AddOrUpdate the key. The output follows the key's aval:
+        let apply (op: MapOp) =
+            match op with
+            | Upsert(key, value) -> // AddOrUpdate the key. The output follows the key's aval:
                 // a fresh key gets a fresh aval, an existing key keeps it
                 // (the mapping ignores the map value here).
                 CMap.addOrUpdate key value source
@@ -1194,19 +1438,19 @@ let ``AMap mapA matches the reference model`` () =
                 if not (model.ContainsKey key) then
                     values[key] <- CVal.create value
                     model[key] <- value
-            | 1 -> // Remove the key.
+            | MapOp.Remove key -> // Remove the key.
                 CMap.remove key source
 
                 if model.ContainsKey key then
                     model.Remove key |> ignore
-            | _ -> // Set the key's aval.
+            | MapOp.SetValue(key, value) -> // Set the key's aval.
                 if model.ContainsKey key then
                     CVal.set value (values[key])
                     model[key] <- value
 
         let mutable ok = true
 
-        for op in ops do
+        for op in sc.ops do
             apply op
 
             let actual = AMap.toMap mapped
@@ -1217,7 +1461,7 @@ let ``AMap mapA matches the reference model`` () =
 
         ok
 
-    Check.QuickThrowOnFailure prop
+    Check.One (scenarioConfig, prop)
 
 // =============================================================================
 // Reference-impl model: ASet.filterA and ASet.chooseA.
@@ -1230,37 +1474,43 @@ let ``AMap mapA matches the reference model`` () =
 
 [<Fact>]
 let ``ASet filterA matches the reference model`` () =
-    let prop (ops: int list) =
+    let prop (sc: SetScenario) =
         let source = CSet.empty<int>
         let flags = Dictionary<int, cval<bool>>()
+
+        for (e, v) in sc.initial do
+            CSet.add e source
+            flags[e] <- CVal.create (v % 2 = 0)
+
         let filtered = ASet.filterA (fun v -> CVal.value flags[v]) (CSet.value source)
-        let present = HashSet<int>()
+        let present = HashSet<int>(List.map fst sc.initial)
         let flagValue = Dictionary<int, bool>()
 
-        let apply (op: int) =
-            let kind = op % 3
-            let rest = op / 3
-            let element = rest % 10
-            let flag = (rest / 10) % 2 = 0
+        for (e, v) in sc.initial do
+            flagValue[e] <- v % 2 = 0
 
-            match kind with
-            | 0 -> // Add the element with a fresh flag aval.
+        let apply (op: SetOp) =
+            match op with
+            | Add(element, value) -> // Add the element with a fresh flag aval.
+                let flag = value % 2 = 0
                 CSet.add element source
 
                 if present.Add element then
                     flags[element] <- CVal.create flag
                     flagValue[element] <- flag
-            | 1 -> // Remove the element.
+            | SetOp.Remove element -> // Remove the element.
                 CSet.remove element source
                 present.Remove element |> ignore
-            | _ -> // Set the element's flag aval.
+            | SetOp.SetValue(element, value) -> // Set the element's flag aval.
+                let flag = value % 2 = 0
+
                 if present.Contains element then
                     CVal.set flag (flags[element])
                     flagValue[element] <- flag
 
         let mutable ok = true
 
-        for op in ops do
+        for op in sc.ops do
             apply op
 
             let actual = Set.ofSeq (ASet.toSet filtered)
@@ -1279,46 +1529,51 @@ let ``ASet filterA matches the reference model`` () =
 
         ok
 
-    Check.QuickThrowOnFailure prop
+    Check.One (scenarioConfig, prop)
 
 [<Fact>]
 let ``ASet chooseA matches the reference model`` () =
-    let prop (ops: int list) =
+    let prop (sc: SetScenario) =
         let source = CSet.empty<int>
         let flags = Dictionary<int, cval<bool>>()
+
+        for (e, v) in sc.initial do
+            CSet.add e source
+            flags[e] <- CVal.create (v % 2 = 0)
 
         let chosen =
             ASet.chooseA
                 (fun v -> AVal.map (fun f -> if f then Some(v * 10) else None) (CVal.value flags[v]))
                 (CSet.value source)
 
-        let present = HashSet<int>()
+        let present = HashSet<int>(List.map fst sc.initial)
         let flagValue = Dictionary<int, bool>()
 
-        let apply (op: int) =
-            let kind = op % 3
-            let rest = op / 3
-            let element = rest % 10
-            let flag = (rest / 10) % 2 = 0
+        for (e, v) in sc.initial do
+            flagValue[e] <- v % 2 = 0
 
-            match kind with
-            | 0 -> // Add the element with a fresh flag aval.
+        let apply (op: SetOp) =
+            match op with
+            | Add(element, value) -> // Add the element with a fresh flag aval.
+                let flag = value % 2 = 0
                 CSet.add element source
 
                 if present.Add element then
                     flags[element] <- CVal.create flag
                     flagValue[element] <- flag
-            | 1 -> // Remove the element.
+            | SetOp.Remove element -> // Remove the element.
                 CSet.remove element source
                 present.Remove element |> ignore
-            | _ -> // Set the element's flag aval.
+            | SetOp.SetValue(element, value) -> // Set the element's flag aval.
+                let flag = value % 2 = 0
+
                 if present.Contains element then
                     CVal.set flag (flags[element])
                     flagValue[element] <- flag
 
         let mutable ok = true
 
-        for op in ops do
+        for op in sc.ops do
             apply op
 
             let actual = Set.ofSeq (ASet.toSet chosen)
@@ -1337,7 +1592,7 @@ let ``ASet chooseA matches the reference model`` () =
 
         ok
 
-    Check.QuickThrowOnFailure prop
+    Check.One (scenarioConfig, prop)
 
 // =============================================================================
 // Reference-impl model: ASet.ofExternal (MAPA-DESIGN §1.1).
@@ -1350,7 +1605,7 @@ let ``ASet chooseA matches the reference model`` () =
 
 [<Fact>]
 let ``ASet ofExternal matches the reference model`` () =
-    let prop (ops: int list) =
+    let prop (sc: ExternalScenario) =
         let mutable snapshot = HashSet<int>()
         let ext, invalidate = ASet.ofExternal (fun () -> snapshot :> IReadOnlySet<int>)
         // Model: whether an invalidate is pending, and the last read snapshot.
@@ -1358,19 +1613,14 @@ let ``ASet ofExternal matches the reference model`` () =
         let mutable dirty = true
         let mutable lastSeen = HashSet<int>()
 
-        let apply (op: int) =
-            let kind = op % 2
-            let rest = op / 2
-            let element = rest % 20
-            let value = (rest / 20) % 100
-
-            match kind with
-            | 0 -> // Replace the external snapshot with a single element.
+        let apply (op: ExternalOp) =
+            match op with
+            | Replace value -> // Replace the external snapshot with a single element.
                 snapshot <- HashSet<int>([ value ])
 
-                if element % 4 = 0 then
-                    snapshot.Add element |> ignore // sometimes two elements
-            | _ -> // Invalidate: the next read re-reads the snapshot.
+                if value % 4 = 0 then
+                    snapshot.Add (value / 2) |> ignore // sometimes two elements
+            | Invalidate -> // Invalidate: the next read re-reads the snapshot.
                 invalidate ()
                 dirty <- true
 
@@ -1387,13 +1637,13 @@ let ``ASet ofExternal matches the reference model`` () =
 
         let mutable ok = true
 
-        for op in ops do
+        for op in sc.ops do
             if not (apply op) then
                 ok <- false
 
         ok
 
-    Check.QuickThrowOnFailure prop
+    Check.One (scenarioConfig, prop)
 
 // =============================================================================
 // Kipo usage shapes (E:\Kipo Pomo.Core\Projections.fs):
@@ -1412,9 +1662,15 @@ let ``ASet ofExternal matches the reference model`` () =
 
 [<Fact>]
 let ``AMap join choose2V with mapA matches the model`` () =
-    let prop (ops: int list) =
+    let prop (sc: JoinScenario) =
         let baseStats = CMap.empty<int, int>
         let effects = CMap.empty<int, int>
+
+        for (k, v) in sc.initialA do
+            CMap.addOrUpdate k v baseStats
+
+        for (k, v) in sc.initialB do
+            CMap.addOrUpdate k v effects
 
         let derived =
             (CMap.value baseStats, CMap.value effects)
@@ -1427,29 +1683,32 @@ let ``AMap join choose2V with mapA matches the model`` () =
         let modelA = Dictionary<int, int>()
         let modelB = Dictionary<int, int>()
 
-        let apply (op: int) =
-            let kind = op % 4
-            let rest = op / 4
-            let key = rest % 10
-            let value = (rest / 10) % 100
+        for (k, v) in sc.initialA do
+            modelA[k] <- v
 
-            match kind with
-            | 0 -> // Upsert into the base-stats map.
+        for (k, v) in sc.initialB do
+            modelB[k] <- v
+
+        let apply (op: JoinOp) =
+            match op with
+            | LeftEdit(Upsert(key, value)) -> // Upsert into the base-stats map.
                 CMap.addOrUpdate key value baseStats
                 modelA[key] <- value
-            | 1 -> // Remove from the base-stats map.
+            | LeftEdit(MapOp.Remove key) -> // Remove from the base-stats map.
                 CMap.remove key baseStats
                 modelA.Remove key |> ignore
-            | 2 -> // Upsert into the effects map.
+            | LeftEdit(MapOp.SetValue _) -> ()
+            | RightEdit(Upsert(key, value)) -> // Upsert into the effects map.
                 CMap.addOrUpdate key value effects
                 modelB[key] <- value
-            | _ -> // Remove from the effects map.
+            | RightEdit(MapOp.Remove key) -> // Remove from the effects map.
                 CMap.remove key effects
                 modelB.Remove key |> ignore
+            | RightEdit(MapOp.SetValue _) -> ()
 
         let mutable ok = true
 
-        for op in ops do
+        for op in sc.ops do
             apply op
 
             let actual = AMap.toMap derived
@@ -1469,13 +1728,19 @@ let ``AMap join choose2V with mapA matches the model`` () =
 
         ok
 
-    Check.QuickThrowOnFailure prop
+    Check.One (scenarioConfig, prop)
 
 [<Fact>]
 let ``AMap mapA with cross-map lookup matches the model`` () =
-    let prop (ops: int list) =
+    let prop (sc: CrossScenario) =
         let entities = CMap.empty<int, int> // entity -> lookup key
         let lookups = CMap.empty<int, int> // key -> value
+
+        for (k, v) in sc.initialEntities do
+            CMap.addOrUpdate k v entities
+
+        for (k, v) in sc.initialLookups do
+            CMap.addOrUpdate k v lookups
 
         let contexts =
             entities
@@ -1485,29 +1750,30 @@ let ``AMap mapA with cross-map lookup matches the model`` () =
         let modelEntities = Dictionary<int, int>()
         let modelLookups = Dictionary<int, int>()
 
-        let apply (op: int) =
-            let kind = op % 4
-            let rest = op / 4
-            let key = rest % 10
-            let value = (rest / 10) % 100
+        for (k, v) in sc.initialEntities do
+            modelEntities[k] <- v
 
-            match kind with
-            | 0 -> // Upsert an entity with its lookup key.
+        for (k, v) in sc.initialLookups do
+            modelLookups[k] <- v
+
+        let apply (op: CrossOp) =
+            match op with
+            | EntityUpsert(key, value) -> // Upsert an entity with its lookup key.
                 CMap.addOrUpdate key value entities
                 modelEntities[key] <- value
-            | 1 -> // Remove the entity.
+            | EntityRemove key -> // Remove the entity.
                 CMap.remove key entities
                 modelEntities.Remove key |> ignore
-            | 2 -> // Upsert a lookup entry.
+            | LookupUpsert(key, value) -> // Upsert a lookup entry.
                 CMap.addOrUpdate key value lookups
                 modelLookups[key] <- value
-            | _ -> // Remove the lookup entry.
+            | LookupRemove key -> // Remove the lookup entry.
                 CMap.remove key lookups
                 modelLookups.Remove key |> ignore
 
         let mutable ok = true
 
-        for op in ops do
+        for op in sc.ops do
             apply op
 
             let actual = AMap.toMap contexts
@@ -1527,45 +1793,49 @@ let ``AMap mapA with cross-map lookup matches the model`` () =
 
         ok
 
-    Check.QuickThrowOnFailure prop
+    Check.One (scenarioConfig, prop)
 
 [<Fact>]
 let ``ASet mapA with cross-map lookup matches the model`` () =
-    let prop (ops: int list) =
+    let prop (sc: CrossScenario) =
         let entities = CSet.empty<int> // entity ids
         let lookups = CMap.empty<int, int> // key -> value
+
+        for (k, _) in sc.initialEntities do
+            CSet.add k entities
+
+        for (k, v) in sc.initialLookups do
+            CMap.addOrUpdate k v lookups
 
         let contexts =
             entities
             |> ASet.mapA (fun id -> AMap.tryFind id (CMap.value lookups))
             |> ASet.choose (fun v -> ValueOption.toOption v)
 
-        let modelEntities = HashSet<int>()
+        let modelEntities = HashSet<int>(List.map fst sc.initialEntities)
         let modelLookups = Dictionary<int, int>()
 
-        let apply (op: int) =
-            let kind = op % 4
-            let rest = op / 4
-            let key = rest % 10
-            let value = (rest / 10) % 100
+        for (k, v) in sc.initialLookups do
+            modelLookups[k] <- v
 
-            match kind with
-            | 0 -> // Add an entity id.
+        let apply (op: CrossOp) =
+            match op with
+            | EntityUpsert(key, _) -> // Add an entity id.
                 CSet.add key entities
                 modelEntities.Add key |> ignore
-            | 1 -> // Remove the entity.
+            | EntityRemove key -> // Remove the entity.
                 CSet.remove key entities
                 modelEntities.Remove key |> ignore
-            | 2 -> // Upsert a lookup entry.
+            | LookupUpsert(key, value) -> // Upsert a lookup entry.
                 CMap.addOrUpdate key value lookups
                 modelLookups[key] <- value
-            | _ -> // Remove the lookup entry.
+            | LookupRemove key -> // Remove the lookup entry.
                 CMap.remove key lookups
                 modelLookups.Remove key |> ignore
 
         let mutable ok = true
 
-        for op in ops do
+        for op in sc.ops do
             apply op
 
             let actual = Set.ofSeq (ASet.toSet contexts)
@@ -1585,51 +1855,53 @@ let ``ASet mapA with cross-map lookup matches the model`` () =
 
         ok
 
-    Check.QuickThrowOnFailure prop
+    Check.One (scenarioConfig, prop)
 
 [<Fact>]
 let ``AList mapA with cross-map lookup matches the model`` () =
-    let prop (ops: int list) =
+    let prop (sc: CrossScenario) =
         let entities = CList.empty<int> // entity ids in order
         let lookups = CMap.empty<int, int> // key -> value
+
+        for (k, _) in sc.initialEntities do
+            CList.append k entities
+
+        for (k, v) in sc.initialLookups do
+            CMap.addOrUpdate k v lookups
 
         let contexts =
             entities
             |> AList.mapA (fun id -> AMap.tryFind id (CMap.value lookups))
             |> AList.choose (fun v -> ValueOption.toOption v)
 
-        let modelEntities = ResizeArray<int>()
+        let modelEntities = ResizeArray<int>(List.map fst sc.initialEntities)
         let modelLookups = Dictionary<int, int>()
 
-        let apply (op: int) =
-            let kind = op % 4
-            let rest = op / 4
-            let key = rest % 10
-            let value = (rest / 10) % 100
+        for (k, v) in sc.initialLookups do
+            modelLookups[k] <- v
 
-            let position =
-                // F#'s % is signed: normalize to [0, Count + 1).
-                let p = (rest / 1000) % (modelEntities.Count + 1)
-                if p < 0 then p + (modelEntities.Count + 1) else p
-
-            match kind with
-            | 0 -> // Insert the entity id at the position.
+        let apply (op: CrossOp) =
+            match op with
+            | EntityUpsert(key, _) -> // Insert the entity id at a derived position.
+                let position = key % (modelEntities.Count + 1)
                 CList.insertAt position key entities
                 modelEntities.Insert(position, key)
-            | 1 -> // Remove the entity at the position.
-                if modelEntities.Count > 0 && position < modelEntities.Count then
-                    CList.removeAt position entities
-                    modelEntities.RemoveAt position
-            | 2 -> // Upsert a lookup entry.
+            | EntityRemove key -> // Remove the first occurrence of the entity id.
+                let idx = modelEntities.IndexOf key
+
+                if idx >= 0 then
+                    CList.removeAt idx entities
+                    modelEntities.RemoveAt idx
+            | LookupUpsert(key, value) -> // Upsert a lookup entry.
                 CMap.addOrUpdate key value lookups
                 modelLookups[key] <- value
-            | _ -> // Remove the lookup entry.
+            | LookupRemove key -> // Remove the lookup entry.
                 CMap.remove key lookups
                 modelLookups.Remove key |> ignore
 
         let mutable ok = true
 
-        for op in ops do
+        for op in sc.ops do
             apply op
 
             let actual = AList.toArray contexts
@@ -1649,7 +1921,7 @@ let ``AList mapA with cross-map lookup matches the model`` () =
 
         ok
 
-    Check.QuickThrowOnFailure prop
+    Check.One (scenarioConfig, prop)
 
 [<Fact>]
 let ``AMap filter with keys matches the model`` () =
@@ -2119,7 +2391,7 @@ let ``Transaction.run defers application until commit`` () =
 
 [<Fact>]
 let ``AMap ofExternal matches the reference model`` () =
-    let prop (ops: int list) =
+    let prop (sc: ExternalScenario) =
         let mutable snapshot = Map.empty<int, int>
 
         let ext, invalidate =
@@ -2129,19 +2401,14 @@ let ``AMap ofExternal matches the reference model`` () =
         let mutable dirty = true
         let mutable lastSeen = Map.empty<int, int>
 
-        let apply (op: int) =
-            let kind = op % 2
-            let rest = op / 2
-            let key = rest % 10
-            let value = (rest / 10) % 100
+        let apply (op: ExternalOp) =
+            match op with
+            | Replace value -> // Replace the external snapshot.
+                snapshot <- Map.ofList [ value % 10, value ]
 
-            match kind with
-            | 0 -> // Replace the external snapshot.
-                snapshot <- Map.ofList [ key, value ]
-
-                if key % 4 = 0 then
-                    snapshot <- Map.add ((key + 1) % 10) (value + 1) snapshot
-            | _ -> // Invalidate: the next read re-reads the snapshot.
+                if value % 4 = 0 then
+                    snapshot <- Map.add ((value + 1) % 10) (value + 1) snapshot
+            | Invalidate -> // Invalidate: the next read re-reads the snapshot.
                 invalidate ()
                 dirty <- true
 
@@ -2157,17 +2424,17 @@ let ``AMap ofExternal matches the reference model`` () =
 
         let mutable ok = true
 
-        for op in ops do
+        for op in sc.ops do
             if not (apply op) then
                 ok <- false
 
         ok
 
-    Check.QuickThrowOnFailure prop
+    Check.One (scenarioConfig, prop)
 
 [<Fact>]
 let ``AList ofExternal matches the reference model`` () =
-    let prop (ops: int list) =
+    let prop (sc: ExternalScenario) =
         let mutable snapshot: int list = []
 
         let ext, invalidate =
@@ -2177,15 +2444,11 @@ let ``AList ofExternal matches the reference model`` () =
         let mutable dirty = true
         let mutable lastSeen: int[] = [||]
 
-        let apply (op: int) =
-            let kind = op % 2
-            let rest = op / 2
-            let value = rest % 20
-
-            match kind with
-            | 0 -> // Replace the external snapshot.
+        let apply (op: ExternalOp) =
+            match op with
+            | Replace value -> // Replace the external snapshot.
                 snapshot <- [ value; value * 2 ]
-            | _ -> // Invalidate: the next read re-reads the snapshot.
+            | Invalidate -> // Invalidate: the next read re-reads the snapshot.
                 invalidate ()
                 dirty <- true
 
@@ -2201,13 +2464,13 @@ let ``AList ofExternal matches the reference model`` () =
 
         let mutable ok = true
 
-        for op in ops do
+        for op in sc.ops do
             if not (apply op) then
                 ok <- false
 
         ok
 
-    Check.QuickThrowOnFailure prop
+    Check.One (scenarioConfig, prop)
 
 [<Fact>]
 let ``AList take matches the model`` () =
@@ -2799,3 +3062,273 @@ let ``AList mapiA passes the mapping-time position`` () =
         ok
 
     Check.QuickThrowOnFailure prop
+
+// =============================================================================
+// Gap coverage: AVal.ofExternal, the changeables' batch ops, and the observed
+// path (the IObservation delivery).
+// =============================================================================
+
+[<Fact>]
+let ``AVal ofExternal matches the reference model`` () =
+    let prop (sc: ExternalScenario) =
+        let mutable snapshot = 0
+        let ext, invalidate = AVal.ofExternal (fun () -> snapshot)
+        // Model: whether an invalidate is pending, and the last read snapshot.
+        let mutable dirty = true
+        let mutable lastSeen = 0
+
+        let apply (op: ExternalOp) =
+            match op with
+            | Replace value -> // Replace the external snapshot.
+                snapshot <- value
+            | Invalidate -> // Invalidate: the next read re-reads the snapshot.
+                invalidate ()
+                dirty <- true
+
+            let expected = if dirty then snapshot else lastSeen
+            let actual = AVal.getValue ext
+
+            if actual <> expected then
+                false
+            else
+                dirty <- false
+                lastSeen <- expected
+                true
+
+        let mutable ok = true
+
+        for op in sc.ops do
+            if not (apply op) then
+                ok <- false
+
+        ok
+
+    Check.One (scenarioConfig, prop)
+
+[<Fact>]
+let ``CSet updateTo and perform match the sequential model`` () =
+    let prop (ops: SetOp list) =
+        let viaUpdate = CSet.empty<int>
+        let viaPerform = CSet.empty<int>
+        let model = HashSet<int>()
+        let pendingRems = HashSet<int>()
+
+        for op in ops do
+            match op with
+            | Add(e, _) -> model.Add e |> ignore
+            | SetOp.Remove e -> pendingRems.Add e |> ignore
+            | SetOp.SetValue _ -> ()
+
+        // The batch semantics: adds and removes are separate phases (an add
+        // and a remove of the same element cancel, regardless of order).
+        for e in pendingRems do
+            model.Remove e |> ignore
+
+        CSet.updateTo model viaUpdate
+
+        let d = SetDeltaBuilder<int>()
+
+        for op in ops do
+            match op with
+            | Add(e, _) -> d.Add e
+            | SetOp.Remove e -> d.Remove e
+            | SetOp.SetValue _ -> ()
+
+        CSet.perform d viaPerform
+
+        let expected = Set.ofSeq model
+        Set.ofSeq (ASet.toSet (CSet.value viaUpdate)) = expected
+        && Set.ofSeq (ASet.toSet (CSet.value viaPerform)) = expected
+
+    Check.One (scenarioConfig, prop)
+
+[<Fact>]
+let ``CMap updateTo and perform match the sequential model`` () =
+    let prop (ops: MapOp list) =
+        let viaUpdate = CMap.empty<int, int>
+        let viaPerform = CMap.empty<int, int>
+        let model = Dictionary<int, int>()
+        let pendingRems = HashSet<int>()
+
+        for op in ops do
+            match op with
+            | Upsert(k, v) -> model[k] <- v
+            | MapOp.Remove k -> pendingRems.Add k |> ignore
+            | MapOp.SetValue _ -> ()
+
+        // The batch semantics: sets and removes are separate phases (a set
+        // and a remove of the same key cancel, regardless of order).
+        for k in pendingRems do
+            model.Remove k |> ignore
+
+        CMap.updateTo (Seq.map (fun (KeyValue(k, v)) -> k, v) model) viaUpdate
+
+        let d = MapDeltaBuilder<int, int>()
+
+        for op in ops do
+            match op with
+            | Upsert(k, v) -> d.Set(k, v)
+            | MapOp.Remove k -> d.Remove k
+            | MapOp.SetValue _ -> ()
+
+        CMap.perform d viaPerform
+
+        let expected = [ for KeyValue(k, v) in model -> k, v ] |> Map.ofList
+        AMap.toMap (CMap.value viaUpdate) = expected
+        && AMap.toMap (CMap.value viaPerform) = expected
+
+    Check.One (scenarioConfig, prop)
+
+[<Fact>]
+let ``CList updateTo and perform match the sequential model`` () =
+    let prop (ops: ListChange list) =
+        let viaUpdate = CList.empty<int>
+        let viaPerform = CList.empty<int>
+        let model = ResizeArray<int>()
+        let d = ListDeltaBuilder<int>()
+
+        for op in ops do
+            match op with
+            | Insert(e, payload) ->
+                let pos = payload % (model.Count + 1)
+                model.Insert(pos, e)
+                d.Insert(pos, e)
+            | RemoveAt payload ->
+                if model.Count > 0 then
+                    let pos = payload % model.Count
+                    model.RemoveAt pos
+                    d.Remove(pos)
+            | UpdateAt(e, payload) ->
+                if model.Count > 0 then
+                    let pos = payload % model.Count
+                    model[pos] <- e
+                    d.Update(pos, e)
+            | ListChange.SetValue _ -> ()
+
+        CList.updateTo (Array.ofSeq model) viaUpdate
+        CList.perform d viaPerform
+
+        let expected = Array.ofSeq model
+        AList.force (CList.value viaUpdate) = expected
+        && AList.force (CList.value viaPerform) = expected
+
+    Check.One (scenarioConfig, prop)
+
+[<Fact>]
+let ``CList addRange appends the items`` () =
+    let prop (xs: int list) =
+        let l = CList.empty<int>
+        CList.addRange xs l
+        AList.force (CList.value l) = List.toArray xs
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``ASet observe delivers the model content after every op`` () =
+    let prop (sc: SetScenario) =
+        let source = CSet.empty<int>
+
+        for (e, _) in sc.initial do
+            CSet.add e source
+
+        let mutable observed = Set.ofSeq (ASet.toSet (CSet.value source))
+        let obs = ASet.observe (fun view _ -> observed <- Set.ofSeq view) (CSet.value source)
+        let model = HashSet<int>(List.map fst sc.initial)
+        let mutable ok = true
+
+        for op in sc.ops do
+            match op with
+            | Add(e, _) ->
+                CSet.add e source
+                model.Add e |> ignore
+            | SetOp.Remove e ->
+                CSet.remove e source
+                model.Remove e |> ignore
+            | SetOp.SetValue _ -> ()
+
+            // The notification is delivered during the write; the callback
+            // must have recorded the new content.
+            if observed <> Set.ofSeq model then
+                ok <- false
+
+        obs.Dispose()
+        ok
+
+    Check.One (scenarioConfig, prop)
+
+[<Fact>]
+let ``AMap observe delivers the model content after every op`` () =
+    let prop (sc: MapScenario) =
+        let source = CMap.empty<int, int>
+
+        for (k, v) in sc.initial do
+            CMap.addOrUpdate k v source
+
+        let mutable observed = AMap.toMap (CMap.value source)
+        let obs = AMap.observe (fun view _ -> observed <- [ for KeyValue(k, v) in view -> k, v ] |> Map.ofList) (CMap.value source)
+        let model = Dictionary<int, int>()
+
+        for (k, v) in sc.initial do
+            model[k] <- v
+
+        let mutable ok = true
+
+        for op in sc.ops do
+            match op with
+            | Upsert(k, v) ->
+                CMap.addOrUpdate k v source
+                model[k] <- v
+            | MapOp.Remove k ->
+                CMap.remove k source
+                model.Remove k |> ignore
+            | MapOp.SetValue _ -> ()
+
+            let expected = [ for KeyValue(k, v) in model -> k, v ] |> Map.ofList
+
+            if observed <> expected then
+                ok <- false
+
+        obs.Dispose()
+        ok
+
+    Check.One (scenarioConfig, prop)
+
+[<Fact>]
+let ``AList observe delivers the model content after every op`` () =
+    let prop (sc: ListScenario) =
+        let source = CList.empty<int>
+        let model = ResizeArray<int>()
+
+        for (e, _) in sc.initial do
+            CList.append e source
+            model.Add e
+
+        let mutable observed = AList.toArray (CList.value source)
+        let obs = AList.observe (fun view _ -> observed <- Seq.toArray view) (CList.value source)
+        let mutable ok = true
+
+        for op in sc.ops do
+            match op with
+            | Insert(e, payload) ->
+                let pos = payload % (model.Count + 1)
+                CList.insertAt pos e source
+                model.Insert(pos, e)
+            | RemoveAt payload ->
+                if model.Count > 0 then
+                    let pos = payload % model.Count
+                    CList.removeAt pos source
+                    model.RemoveAt pos
+            | UpdateAt(e, payload) ->
+                if model.Count > 0 then
+                    let pos = payload % model.Count
+                    CList.updateAt pos e source
+                    model[pos] <- e
+            | SetValue _ -> ()
+
+            if observed <> Array.ofSeq model then
+                ok <- false
+
+        obs.Dispose()
+        ok
+
+    Check.One (scenarioConfig, prop)

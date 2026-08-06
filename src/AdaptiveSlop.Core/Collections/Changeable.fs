@@ -148,7 +148,7 @@ type ChangeableSet<'T>(initial: seq<'T>) =
 
         try
             if ctx.TxActive then
-                Collections.ensureCapacity &journal journalCount
+                Collections.ensureCapacity &journal (journalCount + 1)
                 journal[journalCount] <- struct (item, true)
                 journalCount <- journalCount + 1
 
@@ -167,7 +167,7 @@ type ChangeableSet<'T>(initial: seq<'T>) =
 
         try
             if ctx.TxActive then
-                Collections.ensureCapacity &journal journalCount
+                Collections.ensureCapacity &journal (journalCount + 1)
                 journal[journalCount] <- struct (item, false)
                 journalCount <- journalCount + 1
 
@@ -363,7 +363,7 @@ type ChangeableMap<'K, 'V when 'K: equality>(initial: seq<'K * 'V>) =
 
         try
             if ctx.TxActive then
-                Collections.ensureCapacity &journal journalCount
+                Collections.ensureCapacity &journal (journalCount + 1)
                 journal[journalCount] <- struct (key, valueToSet, true)
                 journalCount <- journalCount + 1
 
@@ -382,7 +382,7 @@ type ChangeableMap<'K, 'V when 'K: equality>(initial: seq<'K * 'V>) =
 
         try
             if ctx.TxActive then
-                Collections.ensureCapacity &journal journalCount
+                Collections.ensureCapacity &journal (journalCount + 1)
                 journal[journalCount] <- struct (key, Unchecked.defaultof<'V>, false)
                 journalCount <- journalCount + 1
 
