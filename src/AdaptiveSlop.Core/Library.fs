@@ -461,6 +461,14 @@ type internal GraphContext() =
     static member internal Default = GraphContext.Current
 
     member internal _.WriteGeneration = writeGeneration
+    member internal _.Collector = collector
+
+    /// Add a dependency with its current committed version (explicit context:
+    /// the scalar node hot paths pass their captured graph, avoiding the
+    /// ambient resolution).
+    member internal this.AddDependency(dep: IAdaptiveObject, version: int64) =
+        if this.CollectorActive then
+            this.Collector.Add(dep, version)
 
     /// Claim the graph for the current operation. Throws in debug builds when
     /// the calling thread is not the thread that created this graph, or when
@@ -518,8 +526,6 @@ type internal GraphContext() =
     member internal this.ExitEvaluation() =
         evaluationDepth <- evaluationDepth - 1
         this.ReleaseOwner()
-
-    member internal _.Collector = collector
 
     member internal _.CollectorActive
         with get () = collectorActive
@@ -640,21 +646,27 @@ type internal GraphContext() =
         | None -> ()
 
 module internal AdaptiveRuntime =
-    let internal getWriteGeneration () = GraphContext.Current.WriteGeneration
+    // The runtime functions take the graph context explicitly: node methods
+    // pass their captured context (a field read), so the per-node hot paths
+    // never re-resolve the ambient graph (a ThreadStatic read).
+    let inline getWriteGeneration (ctx: GraphContext) = ctx.WriteGeneration
 
-    let internal enterEvaluation () = GraphContext.Current.EnterEvaluation()
-    let internal exitEvaluation () = GraphContext.Current.ExitEvaluation()
+    let inline enterEvaluation (ctx: GraphContext) = ctx.EnterEvaluation()
+    let inline exitEvaluation (ctx: GraphContext) = ctx.ExitEvaluation()
 
-    /// Add a dependency with its current committed version.
-    let internal addDependency (dep: IAdaptiveObject) (version: int64) =
+    /// Add a dependency with its current committed version. Resolves the
+    /// ambient graph (one ThreadStatic read per call); used by the collection
+    /// nodes, whose read paths are dominated by delta machinery. The scalar
+    /// node hot paths use the explicit-context member
+    /// <see cref="GraphContext.AddDependency"/> instead.
+    let inline addDependency (dep: IAdaptiveObject) (version: int64) =
         let ctx = GraphContext.Current
 
         if ctx.CollectorActive then
             ctx.Collector.Add(dep, version)
 
     /// Collect dependencies during evaluation. Returns struct tuple to avoid heap allocation.
-    let internal collect (f: unit -> 'T) =
-        let ctx = GraphContext.Current
+    let inline collect (ctx: GraphContext) (f: unit -> 'T) =
         let collector = ctx.Collector
 
         if not ctx.CollectorActive then
@@ -827,7 +839,7 @@ type AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
     /// affect this node moves the generation (scalar writes via MarkFrom,
     /// collection writes via sink delivery + MarkFrom).
     member private this.IsDirty() =
-        let writeGen = AdaptiveRuntime.getWriteGeneration ()
+        let writeGen = AdaptiveRuntime.getWriteGeneration ctx
 
         if lastCheckedWriteGen = writeGen then
             // Already checked at this write generation: return cached result
@@ -912,10 +924,10 @@ type AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
         // Generation at which the recompute starts. A write from user code in the
         // middle of the compute moves the generation; the computed value would be
         // stale, so the node stays Dirty and recomputes on the next read.
-        let checkedGen = AdaptiveRuntime.getWriteGeneration ()
+        let checkedGen = AdaptiveRuntime.getWriteGeneration ctx
 
         let struct (newValue, newDeps, newVersions, newStart, newLen) =
-            AdaptiveRuntime.collect compute
+            AdaptiveRuntime.collect ctx compute
 
         value <- newValue
 
@@ -957,7 +969,7 @@ type AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
         version <- version + 1L
 
         dirtyState <-
-            if AdaptiveRuntime.getWriteGeneration () <> checkedGen then
+            if AdaptiveRuntime.getWriteGeneration ctx <> checkedGen then
                 // A write landed mid-compute: the value may be stale, keep Dirty.
                 DirtyState.Dirty
             elif observed then
@@ -972,24 +984,24 @@ type AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
 
     interface IAdaptiveValue<'T> with
         member this.GetValue() =
-            AdaptiveRuntime.enterEvaluation ()
+            AdaptiveRuntime.enterEvaluation ctx
 
             try
                 if this.IsDirty() then
                     this.Recompute()
                 // Add dependency with committed version AFTER any recompute
-                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                ctx.AddDependency(this :> IAdaptiveObject, version)
                 value
             finally
-                AdaptiveRuntime.exitEvaluation ()
+                AdaptiveRuntime.exitEvaluation ctx
 
         member this.Version =
-            AdaptiveRuntime.enterEvaluation ()
+            AdaptiveRuntime.enterEvaluation ctx
 
             try
                 if this.IsDirty() then version + 1L else version
             finally
-                AdaptiveRuntime.exitEvaluation ()
+                AdaptiveRuntime.exitEvaluation ctx
 
     interface IAdaptiveNode with
         member this.MarkDirty() =
@@ -1147,7 +1159,7 @@ type ChangeableValue<'T>(initial: 'T) =
             ctx.ClaimOwner()
 
             try
-                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                ctx.AddDependency(this :> IAdaptiveObject, version)
                 value
             finally
                 ctx.ReleaseOwner()
@@ -1186,7 +1198,7 @@ type MapNNode<'T, 'U>(deps: IAdaptiveValue<'T>[], [<InlineIfLambda>] compute: 'T
     let mutable dirtyCache = true
 
     member private this.IsDirty() =
-        let writeGen = AdaptiveRuntime.getWriteGeneration ()
+        let writeGen = AdaptiveRuntime.getWriteGeneration ctx
 
         if lastCheckedWriteGen = writeGen then
             dirtyCache
@@ -1234,7 +1246,7 @@ type MapNNode<'T, 'U>(deps: IAdaptiveValue<'T>[], [<InlineIfLambda>] compute: 'T
     member private this.Recompute() =
         // Generation at which the recompute starts; a write mid-compute would make
         // the computed value stale, so the node stays Dirty.
-        let checkedGen = AdaptiveRuntime.getWriteGeneration ()
+        let checkedGen = AdaptiveRuntime.getWriteGeneration ctx
 
         for i in 0 .. deps.Length - 1 do
             values.[i] <- deps.[i].GetValue()
@@ -1245,7 +1257,7 @@ type MapNNode<'T, 'U>(deps: IAdaptiveValue<'T>[], [<InlineIfLambda>] compute: 'T
         version <- version + 1L
 
         dirtyState <-
-            if AdaptiveRuntime.getWriteGeneration () <> checkedGen then
+            if AdaptiveRuntime.getWriteGeneration ctx <> checkedGen then
                 DirtyState.Dirty
             elif edges.Count > 0 then
                 DirtyState.Clean
@@ -1276,24 +1288,24 @@ type MapNNode<'T, 'U>(deps: IAdaptiveValue<'T>[], [<InlineIfLambda>] compute: 'T
 
     interface IAdaptiveValue<'U> with
         member this.GetValue() =
-            AdaptiveRuntime.enterEvaluation ()
+            AdaptiveRuntime.enterEvaluation ctx
 
             try
                 if this.IsDirty() then
                     this.Recompute()
 
-                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                ctx.AddDependency(this :> IAdaptiveObject, version)
                 value
             finally
-                AdaptiveRuntime.exitEvaluation ()
+                AdaptiveRuntime.exitEvaluation ctx
 
         member this.Version =
-            AdaptiveRuntime.enterEvaluation ()
+            AdaptiveRuntime.enterEvaluation ctx
 
             try
                 if this.IsDirty() then version + 1L else version
             finally
-                AdaptiveRuntime.exitEvaluation ()
+                AdaptiveRuntime.exitEvaluation ctx
 
     interface IAdaptiveNode with
         member this.MarkDirty() =
@@ -1370,7 +1382,7 @@ type ReduceNode<'T>(deps: IAdaptiveValue<'T>[], init: 'T, [<InlineIfLambda>] red
     let mutable dirtyCache = true
 
     member private this.IsDirty() =
-        let writeGen = AdaptiveRuntime.getWriteGeneration ()
+        let writeGen = AdaptiveRuntime.getWriteGeneration ctx
 
         if lastCheckedWriteGen = writeGen then
             dirtyCache
@@ -1417,7 +1429,7 @@ type ReduceNode<'T>(deps: IAdaptiveValue<'T>[], init: 'T, [<InlineIfLambda>] red
     member private this.Recompute() =
         // Generation at which the recompute starts; a write mid-compute would make
         // the computed value stale, so the node stays Dirty.
-        let checkedGen = AdaptiveRuntime.getWriteGeneration ()
+        let checkedGen = AdaptiveRuntime.getWriteGeneration ctx
 
         let mutable acc = init
 
@@ -1431,7 +1443,7 @@ type ReduceNode<'T>(deps: IAdaptiveValue<'T>[], init: 'T, [<InlineIfLambda>] red
         version <- version + 1L
 
         dirtyState <-
-            if AdaptiveRuntime.getWriteGeneration () <> checkedGen then
+            if AdaptiveRuntime.getWriteGeneration ctx <> checkedGen then
                 // A write from user code inside the reduce callback: the value
                 // may be stale, keep Dirty so the next read recomputes.
                 DirtyState.Dirty
@@ -1466,24 +1478,24 @@ type ReduceNode<'T>(deps: IAdaptiveValue<'T>[], init: 'T, [<InlineIfLambda>] red
 
     interface IAdaptiveValue<'T> with
         member this.GetValue() =
-            AdaptiveRuntime.enterEvaluation ()
+            AdaptiveRuntime.enterEvaluation ctx
 
             try
                 if this.IsDirty() then
                     this.Recompute()
 
-                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                ctx.AddDependency(this :> IAdaptiveObject, version)
                 value
             finally
-                AdaptiveRuntime.exitEvaluation ()
+                AdaptiveRuntime.exitEvaluation ctx
 
         member this.Version =
-            AdaptiveRuntime.enterEvaluation ()
+            AdaptiveRuntime.enterEvaluation ctx
 
             try
                 if this.IsDirty() then version + 1L else version
             finally
-                AdaptiveRuntime.exitEvaluation ()
+                AdaptiveRuntime.exitEvaluation ctx
 
     interface IAdaptiveNode with
         member this.MarkDirty() =
@@ -1674,7 +1686,7 @@ module AVal =
 
                 try
                     this.Poll()
-                    AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                    ctx.AddDependency(this :> IAdaptiveObject, version)
                     value
                 finally
                     ctx.ReleaseOwner()
