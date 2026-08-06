@@ -1,3 +1,7 @@
+// Shares a collection with the property tests (Properties.fs): the adaptive
+// graph is confined to one owner thread, so xUnit must not run this module's
+// tests in parallel with the FsCheck properties.
+[<global.Xunit.Collection("AdaptiveSlop")>]
 module AdaptiveSlop.Tests
 
 #nowarn "893"
