@@ -64,7 +64,7 @@ type ExternalSetNode<'T when 'T: equality>([<InlineIfLambda>] snapshot: unit -> 
 
             if Collections.rebuildSetDiff scratch &state then
                 state.Version <- state.Version + 1L
-                Collections.pushAndMarkSet state.Out &state.Sinks state.Edges
+                Collections.pushAndMarkSet ctx state.Out &state.Sinks state.Edges
                 state.Out.Clear()
 
     interface IPostSource with
@@ -146,7 +146,7 @@ type ExternalMapNode<'K, 'V when 'K: equality>([<InlineIfLambda>] snapshot: unit
 
             if Collections.rebuildMapDiff scratch &state then
                 state.Version <- state.Version + 1L
-                Collections.pushAndMarkMap state.Out &state.Sinks state.Edges
+                Collections.pushAndMarkMap ctx state.Out &state.Sinks state.Edges
                 state.Out.Clear()
 
     interface IPostSource with
@@ -226,7 +226,7 @@ type ExternalListNode<'T when 'T: equality>([<InlineIfLambda>] snapshot: unit ->
 
             if Collections.rebuildListDiff next data &out then
                 version <- version + 1L
-                Collections.pushAndMarkList out &sinks edges
+                Collections.pushAndMarkList ctx out &sinks edges
                 out.Clear()
 
     interface IPostSource with

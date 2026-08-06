@@ -175,7 +175,7 @@ type ChangeableSet<'T>(initial: seq<'T>) =
     member private this.PushAndMark() =
         if not outDelta.IsEmpty then
             version <- version + 1L
-            Collections.pushAndMarkSet outDelta &sinks edges
+            Collections.pushAndMarkSet ctx outDelta &sinks edges
             outDelta.Clear()
 
     member private this.Apply(newValue: seq<'T>) =
@@ -448,7 +448,7 @@ type ChangeableSet<'T>(initial: seq<'T>) =
             ctx.ClaimOwner()
 
             try
-                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                ctx.AddDependency(this :> IAdaptiveObject, version)
                 data :> IReadOnlySet<'T>
             finally
                 ctx.ReleaseOwner()
@@ -515,7 +515,7 @@ type ChangeableMap<'K, 'V when 'K: equality>(initial: seq<'K * 'V>) =
     member private this.PushAndMark() =
         if not outDelta.IsEmpty then
             version <- version + 1L
-            Collections.pushAndMarkMap outDelta &sinks edges
+            Collections.pushAndMarkMap ctx outDelta &sinks edges
             outDelta.Clear()
 
     member private this.Apply(newValue: seq<'K * 'V>) =
@@ -831,7 +831,7 @@ type ChangeableMap<'K, 'V when 'K: equality>(initial: seq<'K * 'V>) =
             ctx.ClaimOwner()
 
             try
-                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                ctx.AddDependency(this :> IAdaptiveObject, version)
                 data :> IReadOnlyDictionary<'K, 'V>
             finally
                 ctx.ReleaseOwner()
@@ -933,7 +933,7 @@ type ChangeableList<'T>(initial: seq<'T>) =
     member private this.PushAndMark() =
         if not outDelta.IsEmpty then
             version <- version + 1L
-            Collections.pushAndMarkList outDelta &sinks edges
+            Collections.pushAndMarkList ctx outDelta &sinks edges
             outDelta.Clear()
 
     member private this.JournalOp(op: ListOp<'T>) =
@@ -1527,7 +1527,7 @@ type ChangeableList<'T>(initial: seq<'T>) =
             ctx.ClaimOwner()
 
             try
-                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                ctx.AddDependency(this :> IAdaptiveObject, version)
                 data :> IReadOnlyList<'T>
             finally
                 ctx.ReleaseOwner()

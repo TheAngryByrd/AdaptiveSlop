@@ -560,7 +560,7 @@ type CustomListNode<'T when 'T: equality>([<InlineIfLambda>] compute: IReadOnlyL
                     | _ -> data[op.Position] <- op.Value
 
                 version <- version + 1L
-                Collections.pushAndMarkList out &sinks edges
+                Collections.pushAndMarkList GraphContext.Current out &sinks edges
                 builder.Clear()
 
     interface IAdaptiveList<'T> with
@@ -699,7 +699,7 @@ type ToSetListNode<'T when 'T: equality>(source: IAdaptiveList<'T>) =
 
             journal.Ops.Count <- 0
             version <- version + 1L
-            Collections.pushAndMarkSet out &sinks edges
+            Collections.pushAndMarkSet GraphContext.Current out &sinks edges
 
     interface IListDeltaSink<'T> with
         member this.OnDeltas(ops: ListOp<'T>[], opCnt: int) =
@@ -769,7 +769,7 @@ type SetToListNode<'T when 'T: equality>(source: IAdaptiveSet<'T>) =
 
             if Collections.rebuildListDiff next data &out then
                 version <- version + 1L
-                Collections.pushAndMarkList out &sinks edges
+                Collections.pushAndMarkList GraphContext.Current out &sinks edges
 
             out.Clear()
 
@@ -846,7 +846,7 @@ type BindListNode<'T, 'U>(value: IAdaptiveValue<'T>, [<InlineIfLambda>] mapping:
 
                 if Collections.rebuildListDiff next data &out then
                     version <- version + 1L
-                    Collections.pushAndMarkList out &sinks edges
+                    Collections.pushAndMarkList GraphContext.Current out &sinks edges
 
                 out.Clear()
 
@@ -910,7 +910,7 @@ type ConcatListNode<'T>(sources: IAdaptiveList<'T>[]) =
 
             if Collections.rebuildListDiff next data &out then
                 version <- version + 1L
-                Collections.pushAndMarkList out &sinks edges
+                Collections.pushAndMarkList GraphContext.Current out &sinks edges
 
             out.Clear()
 
@@ -974,7 +974,7 @@ type OfAvalListNode<'T, 'S when 'S :> seq<'T>>(value: IAdaptiveValue<'S>) =
 
                 if Collections.rebuildListDiff next data &out then
                     version <- version + 1L
-                    Collections.pushAndMarkList out &sinks edges
+                    Collections.pushAndMarkList GraphContext.Current out &sinks edges
 
                 out.Clear()
 
@@ -1034,7 +1034,7 @@ type PollListSourceNode<'T, 'U>
 
             if Collections.rebuildListDiff next data &out then
                 version <- version + 1L
-                Collections.pushAndMarkList out &sinks edges
+                Collections.pushAndMarkList GraphContext.Current out &sinks edges
 
             out.Clear()
 
@@ -1121,7 +1121,7 @@ type SortListNode<'T, 'K>
 
             if Collections.rebuildListDiff rebuilt data &out then
                 version <- version + 1L
-                Collections.pushAndMarkList out &sinks edges
+                Collections.pushAndMarkList GraphContext.Current out &sinks edges
 
             out.Clear()
 
@@ -1234,7 +1234,7 @@ type MapUseListNode<'T, 'W when 'W: equality and 'W :> IDisposable>
 
             journal.Ops.Count <- 0
             version <- version + 1L
-            Collections.pushAndMarkList out &sinks edges
+            Collections.pushAndMarkList GraphContext.Current out &sinks edges
 
     interface IListDeltaSink<'T> with
         member this.OnDeltas(ops: ListOp<'T>[], opCnt: int) =
