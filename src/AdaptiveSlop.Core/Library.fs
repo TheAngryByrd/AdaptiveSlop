@@ -49,9 +49,12 @@ type IAdaptiveObject =
 /// the system checks if any dependencies have changed and recomputes if necessary.
 /// </para>
 /// <para>
-/// <strong>Threading:</strong> A graph is confined to one owner thread. All reads and
-/// writes must run on that thread. Cross-thread changes must be posted to the owner
-/// thread, never applied directly.
+/// <strong>Threading:</strong> every thread owns its ambient graph, created
+/// lazily on first use. A node belongs to the graph of the thread that
+/// created it; all reads and writes on that node must run on that thread.
+/// Cross-thread changes must be posted to the owner thread (the post
+/// machinery), never applied directly. In debug builds a direct operation on
+/// another thread's node throws.
 /// </para>
 /// </remarks>
 type IAdaptiveValue<'T> =
@@ -206,9 +209,9 @@ type internal DependencyCollector() =
         frameDepth
 
     /// Clear the whole buffer. Called when the outermost evaluation ends:
-    /// the collector lives on the static default graph context, so without
-    /// this the deepest evaluation's objects stay reachable through the
-    /// static root until a deeper evaluation overwrites the slots.
+    /// the collector lives on the ambient graph context of the thread, so
+    /// without this the deepest evaluation's objects stay reachable through
+    /// the thread-static root until a deeper evaluation overwrites the slots.
     member _.Clear() =
         if count > 0 then
             Array.Clear(depBuffer, 0, count)
@@ -400,10 +403,13 @@ type internal PostRing(capacity: int) =
 /// Internal. Holds all mutable runtime state of one adaptive graph.
 /// </summary>
 /// <remarks>
-/// The graph is confined to its owner thread: every operation must run on the
-/// thread that created the context. The core contains no locks. In debug builds
-/// an access from a foreign thread throws.
+/// Every thread owns its ambient graph, created lazily on first use. A graph
+/// is confined to its creating thread: every operation must run on that
+/// thread. The core contains no locks; the Interlocked/Volatile use is
+/// confined to the explicit handoff structure (the post rings). In debug
+/// builds an access from a foreign thread throws.
 /// </remarks>
+[<AllowNullLiteral>]
 type internal GraphContext() =
     let mutable evaluationDepth = 0
     // Incremented on every applied write. Invalidates per-evaluation dirty caches
@@ -415,6 +421,9 @@ type internal GraphContext() =
     let mutable collectorActive = false
     let txBuffer = TransactionBuffer()
     let mutable txActive = false
+    // DEBUG only: the thread that created this graph. A graph is owned by its
+    // creating thread; debug builds reject claims from any other thread.
+    let mutable debugOwnerThread = Environment.CurrentManagedThreadId
     // DEBUG only: thread id of the thread inside graph operations, plus a claim
     // depth for nested operations. 0 = idle.
     let mutable debugActiveThread = 0
@@ -428,22 +437,44 @@ type internal GraphContext() =
     let mutable notifications: INotifiable[] = Array.zeroCreate 16
     let mutable notifyCount = 0
 
-    static let defaultContext = GraphContext()
+    // The ambient graph of the calling thread. A thread-local pointer only:
+    // all mutable state lives on the context object. Created lazily on first
+    // use, so a thread that never touches the library allocates nothing.
+    [<ThreadStatic>]
+    [<DefaultValue>]
+    static val mutable private currentContext: GraphContext
 
-    /// The context of the ambient (default) graph.
-    static member internal Default = defaultContext
+    /// The ambient graph of the calling thread, created lazily on first use.
+    static member internal Current =
+        match GraphContext.currentContext with
+        | null ->
+            let created = GraphContext()
+            GraphContext.currentContext <- created
+            created
+        | ctx -> ctx
+
+    /// Legacy internal name for <see cref="Current"/>: the ambient graph of
+    /// the calling thread. Retained for the derived-node call sites, which
+    /// legitimately resolve the ambient: every legal operation on a node runs
+    /// on its creating thread, whose ambient graph is the node's graph (the
+    /// debug owner check enforces this).
+    static member internal Default = GraphContext.Current
 
     member internal _.WriteGeneration = writeGeneration
 
     /// Claim the graph for the current operation. Throws in debug builds when
-    /// another thread is inside a graph operation. Sequential use from different
-    /// threads is allowed: the claim is released when the outermost operation ends.
-    /// Pair every call with ReleaseOwner. On the outermost claim, pending posts are
-    /// drained automatically (auto-pump): they apply as one batch with one
+    /// the calling thread is not the thread that created this graph, or when
+    /// another thread is inside a graph operation. Pair every call with
+    /// ReleaseOwner. On the outermost claim, pending posts are drained
+    /// automatically (auto-pump): they apply as one batch with one
     /// notification delivery, before the operation runs.
     member internal this.ClaimOwner() =
 #if DEBUG
         let tid = Environment.CurrentManagedThreadId
+
+        if debugOwnerThread <> tid then
+            invalidOp
+                "This node belongs to the adaptive graph of another thread. Each thread owns its own graph; cross-thread changes must be posted to the owner thread."
 
         if debugActiveThread = 0 then
             debugActiveThread <- tid
@@ -609,21 +640,21 @@ type internal GraphContext() =
         | None -> ()
 
 module internal AdaptiveRuntime =
-    let internal getWriteGeneration () = GraphContext.Default.WriteGeneration
+    let internal getWriteGeneration () = GraphContext.Current.WriteGeneration
 
-    let internal enterEvaluation () = GraphContext.Default.EnterEvaluation()
-    let internal exitEvaluation () = GraphContext.Default.ExitEvaluation()
+    let internal enterEvaluation () = GraphContext.Current.EnterEvaluation()
+    let internal exitEvaluation () = GraphContext.Current.ExitEvaluation()
 
     /// Add a dependency with its current committed version.
     let internal addDependency (dep: IAdaptiveObject) (version: int64) =
-        let ctx = GraphContext.Default
+        let ctx = GraphContext.Current
 
         if ctx.CollectorActive then
             ctx.Collector.Add(dep, version)
 
     /// Collect dependencies during evaluation. Returns struct tuple to avoid heap allocation.
     let internal collect (f: unit -> 'T) =
-        let ctx = GraphContext.Default
+        let ctx = GraphContext.Current
         let collector = ctx.Collector
 
         if not ctx.CollectorActive then
@@ -648,10 +679,13 @@ module internal AdaptiveRuntime =
 /// </summary>
 /// <remarks>
 /// <para>
-/// A graph is confined to one owner thread: all reads and writes happen there.
-/// Foreign threads may only call <c>Post</c> on changeable values. Pending posts are
-/// applied automatically at the start of the next graph operation on the owner
-/// thread, as one batch with one notification delivery. No pump call is required.
+/// Each thread owns its ambient graph (created lazily on first use); the
+/// owner thread of a graph is the thread that created it. All reads and
+/// writes happen there. Foreign threads may only call <c>Post</c> on
+/// changeable values (or the collection post functions); the post lands in
+/// the node's own graph ring. Pending posts are applied automatically at the
+/// start of the next graph operation on the owner thread, as one batch with
+/// one notification delivery. No pump call is required.
 /// </para>
 /// <para>
 /// Every posted source is applied at most once per batch, with the last posted value
@@ -677,7 +711,7 @@ module Posting =
     /// <remarks>
     /// Must be called on the owner thread.
     /// </remarks>
-    let pump () = GraphContext.Default.Pump()
+    let pump () = GraphContext.Current.Pump()
 
 module Transaction =
     /// <summary>
@@ -694,7 +728,7 @@ module Transaction =
     /// </code>
     /// </example>
     let run (f: unit -> 'T) =
-        let ctx = GraphContext.Default
+        let ctx = GraphContext.Current
         ctx.ClaimOwner()
 
         try
@@ -769,6 +803,9 @@ type LazyConstantValue<'T>([<InlineIfLambda>] create: unit -> 'T) =
         member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
 
 type AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
+    // The graph this node belongs to, captured at creation (the ambient graph
+    // of the creating thread).
+    let ctx = GraphContext.Current
     let mutable version = 0L
     let mutable hasValue = false
     let mutable value = Unchecked.defaultof<'T>
@@ -962,7 +999,6 @@ type AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
                 // evaluation (a write from user code inside a compute). The mark is
                 // precise; the cache would otherwise hide it.
                 lastCheckedWriteGen <- -1L
-                let ctx = GraphContext.Default
 
                 for i in 0 .. edges.Count - 1 do
                     ctx.PushDirty(edges[i])
@@ -990,6 +1026,9 @@ type AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
                 this.UnregisterFromDeps()
 
 type ChangeableValue<'T>(initial: 'T) =
+    // The graph this node belongs to, captured at creation (the ambient graph
+    // of the creating thread).
+    let ctx = GraphContext.Current
     let mutable value = initial
     let mutable version = 0L
     let edges = ParentEdges()
@@ -1002,7 +1041,6 @@ type ChangeableValue<'T>(initial: 'T) =
     let mutable postedValue = Unchecked.defaultof<'T>
 
     member internal this.Apply(newValue: 'T) =
-        let ctx = GraphContext.Default
         ctx.ClaimOwner()
 
         try
@@ -1057,7 +1095,7 @@ type ChangeableValue<'T>(initial: 'T) =
         postedValue <- newValue
 
         if Interlocked.CompareExchange(&posted, 1, 0) = 0 then
-            GraphContext.Default.PostRing.Enqueue(this :> obj)
+            ctx.PostRing.Enqueue(this :> obj)
 
     /// Apply the pending posted value on the owner thread (called from Pump).
     member internal this.ApplyPostedValue() =
@@ -1067,8 +1105,6 @@ type ChangeableValue<'T>(initial: 'T) =
         this.Apply(postedValue)
 
     member this.Set(newValue: 'T) =
-        let ctx = GraphContext.Default
-
         if ctx.TxActive then
             pendingValue <- newValue
 
@@ -1108,7 +1144,6 @@ type ChangeableValue<'T>(initial: 'T) =
 
     interface IAdaptiveValue<'T> with
         member this.GetValue() =
-            let ctx = GraphContext.Default
             ctx.ClaimOwner()
 
             try
@@ -1132,6 +1167,9 @@ type ChangeableValue<'T>(initial: 'T) =
         member this.ApplyPosted() = this.ApplyPostedValue()
 
 type MapNNode<'T, 'U>(deps: IAdaptiveValue<'T>[], [<InlineIfLambda>] compute: 'T[] -> 'U) =
+    // The graph this node belongs to, captured at creation (the ambient graph
+    // of the creating thread).
+    let ctx = GraphContext.Current
     let mutable version = 0L
     let mutable hasValue = false
     let mutable value = Unchecked.defaultof<'U>
@@ -1261,7 +1299,6 @@ type MapNNode<'T, 'U>(deps: IAdaptiveValue<'T>[], [<InlineIfLambda>] compute: 'T
         member this.MarkDirty() =
             if dirtyState <> DirtyState.Dirty then
                 dirtyState <- DirtyState.Dirty
-                let ctx = GraphContext.Default
 
                 for i in 0 .. edges.Count - 1 do
                     ctx.PushDirty(edges[i])
@@ -1316,6 +1353,9 @@ type MapNNode<'T, 'U>(deps: IAdaptiveValue<'T>[], [<InlineIfLambda>] compute: 'T
 /// </para>
 /// </remarks>
 type ReduceNode<'T>(deps: IAdaptiveValue<'T>[], init: 'T, [<InlineIfLambda>] reduce: 'T -> 'T -> 'T) =
+    // The graph this node belongs to, captured at creation (the ambient graph
+    // of the creating thread).
+    let ctx = GraphContext.Current
     let mutable version = 0L
     let mutable hasValue = false
     let mutable value = Unchecked.defaultof<'T>
@@ -1449,7 +1489,6 @@ type ReduceNode<'T>(deps: IAdaptiveValue<'T>[], init: 'T, [<InlineIfLambda>] red
         member this.MarkDirty() =
             if dirtyState <> DirtyState.Dirty then
                 dirtyState <- DirtyState.Dirty
-                let ctx = GraphContext.Default
 
                 for i in 0 .. edges.Count - 1 do
                     ctx.PushDirty(edges[i])
@@ -1485,6 +1524,9 @@ type cval<'T> = ChangeableValue<'T>
 /// current value and invokes the callback when the version changed.
 /// </summary>
 type Observation<'T>(target: IAdaptiveValue<'T>, [<InlineIfLambda>] callback: 'T -> unit) as this =
+    // The graph this observation belongs to, captured at creation (the ambient
+    // graph of the creating thread).
+    let ctx = GraphContext.Current
     let mutable active = true
     let mutable enqueued = false
     let mutable indexInTarget = -1
@@ -1505,7 +1547,7 @@ type Observation<'T>(target: IAdaptiveValue<'T>, [<InlineIfLambda>] callback: 'T
         member this.MarkDirty() =
             if active && not enqueued then
                 enqueued <- true
-                GraphContext.Default.EnqueueNotification(this :> INotifiable)
+                ctx.EnqueueNotification(this :> INotifiable)
 
         member _.SetDepSlot(depIndex: int, parentIndex: int) =
             if depIndex = -1 then
@@ -1582,6 +1624,9 @@ module AVal =
     /// owner thread.
     /// </summary>
     type ExternalValueNode<'T when 'T: equality>([<InlineIfLambda>] read: unit -> 'T) =
+        // The graph this node belongs to, captured at creation (the ambient
+        // graph of the creating thread).
+        let ctx = GraphContext.Current
         let mutable value = Unchecked.defaultof<'T>
         let mutable hasValue = false
         let mutable version = 0L
@@ -1602,9 +1647,9 @@ module AVal =
                 // Owner thread: mark directly. MarkFrom bumps the write
                 // generation (the *A gate) and marks observers.
                 dirty <- true
-                GraphContext.Default.MarkFrom edges
+                ctx.MarkFrom edges
             else if Interlocked.CompareExchange(&posted, 1, 0) = 0 then
-                GraphContext.Default.PostRing.Enqueue(this :> obj)
+                ctx.PostRing.Enqueue(this :> obj)
 
         member private this.Poll() =
             if dirty then
@@ -1625,7 +1670,6 @@ module AVal =
 
         interface IAdaptiveValue<'T> with
             member this.GetValue() =
-                let ctx = GraphContext.Default
                 ctx.ClaimOwner()
 
                 try

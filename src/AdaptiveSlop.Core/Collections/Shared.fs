@@ -764,7 +764,7 @@ module internal Collections =
     /// already moved and downstream nodes must re-read), and the exception is
     /// rethrown after marking and delivery.
     let pushAndMarkSet (delta: SetDelta<'T>) (sinks: SinkList byref) (edges: ParentEdges) =
-        let ctx = GraphContext.Default
+        let ctx = GraphContext.Current
         let wasActive = ctx.TxActive
         ctx.TxActive <- true
 
@@ -793,7 +793,7 @@ module internal Collections =
     /// already moved and downstream nodes must re-read), and the exception is
     /// rethrown after marking and delivery.
     let pushAndMarkMap (delta: MapDelta<'K, 'V>) (sinks: SinkList byref) (edges: ParentEdges) =
-        let ctx = GraphContext.Default
+        let ctx = GraphContext.Current
         let wasActive = ctx.TxActive
         ctx.TxActive <- true
 
@@ -839,7 +839,7 @@ module internal Collections =
     /// already moved and downstream nodes must re-read), and the exception is
     /// rethrown after marking and delivery.
     let pushAndMarkList (delta: ListDelta<'T>) (sinks: SinkList byref) (edges: ParentEdges) =
-        let ctx = GraphContext.Default
+        let ctx = GraphContext.Current
         let wasActive = ctx.TxActive
         ctx.TxActive <- true
 
@@ -1078,7 +1078,7 @@ module internal Collections =
     /// notification delivery deferred (PLAN.md Section 6.5). The byref appears
     /// only at this top-level call site (a class field address: 0 allocation).
     let inline drainSetPush ([<InlineIfLambda>] map: 'T -> 'U voption) (state: SetNodeState<'T, 'U> byref) =
-        let ctx = GraphContext.Default
+        let ctx = GraphContext.Current
         let wasActive = ctx.TxActive
         ctx.TxActive <- true
 
@@ -1097,7 +1097,7 @@ module internal Collections =
 
     /// Drain a plain set node (filter) and push the reduced output delta.
     let inline drainPlainSetPush ([<InlineIfLambda>] map: 'T -> 'T voption) (state: SetNodeState<'T, 'T> byref) =
-        let ctx = GraphContext.Default
+        let ctx = GraphContext.Current
         let wasActive = ctx.TxActive
         ctx.TxActive <- true
 
@@ -1117,7 +1117,7 @@ module internal Collections =
     /// Drain a map node and push the reduced output delta to its sinks, with
     /// notification delivery deferred (PLAN.md Section 6.5).
     let inline drainMapPush ([<InlineIfLambda>] map: 'K -> 'V -> 'U voption) (state: MapNodeState<'K, 'V, 'U> byref) =
-        let ctx = GraphContext.Default
+        let ctx = GraphContext.Current
         let wasActive = ctx.TxActive
         ctx.TxActive <- true
 
@@ -1468,7 +1468,7 @@ module internal Collections =
     /// only at this top-level call site (a class field address: 0 allocation).
     /// </summary>
     let drainTwoSetPush (op: TwoSetOp) (state: TwoSetState<'T> byref) =
-        let ctx = GraphContext.Default
+        let ctx = GraphContext.Current
         let wasActive = ctx.TxActive
         ctx.TxActive <- true
 
@@ -1859,7 +1859,7 @@ module internal Collections =
         ([<InlineIfLambda>] mapping: 'K -> 'V1 voption -> 'V2 voption -> 'V3 voption)
         (state: Choose2State<'K, 'V1, 'V2, 'V3> byref)
         =
-        let ctx = GraphContext.Default
+        let ctx = GraphContext.Current
         let wasActive = ctx.TxActive
         ctx.TxActive <- true
 
@@ -2339,7 +2339,7 @@ module internal Collections =
         (mapping: 'T -> IAdaptiveSet<'U>)
         (state: CollectState<'T, 'U> byref)
         =
-        let ctx = GraphContext.Default
+        let ctx = GraphContext.Current
         let wasActive = ctx.TxActive
         ctx.TxActive <- true
 
@@ -2458,7 +2458,7 @@ module internal Collections =
     /// only at this top-level call site (a class field address: 0 allocation).
     /// </summary>
     let drainBindSetPush (state: BindSetState<'U> byref) =
-        let ctx = GraphContext.Default
+        let ctx = GraphContext.Current
         let wasActive = ctx.TxActive
         ctx.TxActive <- true
 
@@ -2581,7 +2581,7 @@ module internal Collections =
     /// only at this top-level call site (a class field address: 0 allocation).
     /// </summary>
     let drainBindMapPush (state: BindMapState<'K, 'V> byref) =
-        let ctx = GraphContext.Default
+        let ctx = GraphContext.Current
         let wasActive = ctx.TxActive
         ctx.TxActive <- true
 

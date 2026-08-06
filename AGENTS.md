@@ -50,9 +50,13 @@ Hold these in all core changes; violating any of them breaks the design:
    dynamic dependencies (`bind`) and edge self-healing depend on it.
 3. **No evaluation during marking.** Notifications are deferred until marking/transaction
    completes. Do not add level/topological-ordering machinery; this rule replaces it.
-4. **Owner-thread confinement.** Core code must not add locks, `Interlocked`, or
-   `[<ThreadStatic>]`; shared state lives on a graph context object. Cross-thread
-   interaction goes through explicit handoff (post/drain), never shared mutable access.
+4. **Owner-thread confinement.** Core code must not add locks; `Interlocked`/`Volatile`
+   use stays inside the explicit handoff structure (the post rings). Shared state
+   lives on a graph context object. Every thread owns its ambient graph (a
+   `[<ThreadStatic>]` pointer to it — the pointer only, all state stays on the
+   context); a node belongs to the graph of its creating thread. Cross-thread
+   interaction goes through explicit handoff (post/drain), never shared mutable
+   access.
 5. **Zero library-side allocation on hot paths** (clean read, mark, static recompute,
    delta delivery). Prove allocation claims with `GC.GetAllocatedBytesForCurrentThread`.
 6. **Transactions defer application**: writes inside `Transaction.run` apply at commit;
