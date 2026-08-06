@@ -537,6 +537,35 @@ module CSet =
     /// <summary>Removes an element. No-op when absent.</summary>
     let inline remove (item: 'T) (set: cset<'T>) = set.Remove item
 
+    /// <summary>
+    /// Posts an add (the <c>cval.Post</c> handoff pattern): queues the
+    /// operation and returns immediately. Safe from any thread. The owner
+    /// thread applies the queued operations at the next graph operation
+    /// (reads and writes auto-drain) or at <c>Posting.pump</c>, as one batch:
+    /// one net delta, one notification delivery. A burst is coalesced into a
+    /// single handoff.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// // worker thread
+    /// CSet.postAdd item items
+    /// // owner thread: the next read applies the post automatically
+    /// let view = ASet.force items
+    /// </code>
+    /// </example>
+    let inline postAdd (item: 'T) (set: cset<'T>) = set.PostAdd item
+
+    /// <summary>Posts a remove. Safe from any thread. See <see cref="postAdd"/> for the application contract.</summary>
+    let inline postRemove (item: 'T) (set: cset<'T>) = set.PostRemove item
+
+    /// <summary>
+    /// Posts a full replace. Safe from any thread. See <see cref="postAdd"/>
+    /// for the application contract; a posted replace supersedes the other
+    /// ops of the same pending batch (the transaction semantics of
+    /// <see cref="set"/>).
+    /// </summary>
+    let inline postSet (value: Set<'T>) (set: cset<'T>) = set.PostSet value
+
     /// <summary>Replaces the whole set.</summary>
     let inline set (value: Set<'T>) (set: cset<'T>) = set.Set value
 
@@ -1189,6 +1218,44 @@ module CMap =
 
     /// <summary>Removes an entry. No-op when absent.</summary>
     let inline remove (key: 'K) (mapValue: cmap<'K, 'V>) = mapValue.Remove key
+
+    /// <summary>
+    /// Posts an add or update (the <c>cval.Post</c> handoff pattern): queues
+    /// the operation and returns immediately. Safe from any thread. The owner
+    /// thread applies the queued operations at the next graph operation
+    /// (reads and writes auto-drain) or at <c>Posting.pump</c>, as one batch:
+    /// one net delta, one notification delivery. A burst is coalesced into a
+    /// single handoff.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// // worker thread
+    /// CMap.postAddOrUpdate key value map
+    /// // owner thread: the next read applies the post automatically
+    /// let view = AMap.force map
+    /// </code>
+    /// </example>
+    let inline postAddOrUpdate (key: 'K) (value: 'V) (mapValue: cmap<'K, 'V>) = mapValue.PostAddOrUpdate key value
+
+    /// <summary>Posts a remove. Safe from any thread. See <see cref="postAddOrUpdate"/> for the application contract.</summary>
+    let inline postRemove (key: 'K) (mapValue: cmap<'K, 'V>) = mapValue.PostRemove key
+
+    /// <summary>
+    /// Posts a full replace. Safe from any thread. See
+    /// <see cref="postAddOrUpdate"/> for the application contract; a posted
+    /// replace supersedes the other ops of the same pending batch (the
+    /// transaction semantics of <see cref="set"/>). The content is passed as
+    /// a seq so the posting thread allocates nothing: convert a <c>Map</c>
+    /// with <c>Map.toSeq</c> at the call site when needed.
+    /// </summary>
+    let inline postSet (value: seq<'K * 'V>) (mapValue: cmap<'K, 'V>) = mapValue.PostSet value
+
+    /// <summary>
+    /// Posts a clear (a full replace with the empty map). Safe from any
+    /// thread. See <see cref="postAddOrUpdate"/> for the application
+    /// contract.
+    /// </summary>
+    let inline postClear (mapValue: cmap<'K, 'V>) = mapValue.PostClear()
 
     /// <summary>Replaces the whole map.</summary>
     let inline set (value: Map<'K, 'V>) (mapValue: cmap<'K, 'V>) = mapValue.Set(Map.toSeq value)
@@ -1918,6 +1985,50 @@ module CList =
 
     /// <summary>Removes the first occurrence of the value. No-op when absent.</summary>
     let inline remove (value: 'T) (list: clist<'T>) = list.Remove value
+
+    /// <summary>
+    /// Posts an append (the <c>cval.Post</c> handoff pattern): queues the
+    /// operation and returns immediately. Safe from any thread. The owner
+    /// thread applies the queued operations at the next graph operation
+    /// (reads and writes auto-drain) or at <c>Posting.pump</c>, as one batch:
+    /// one delta, one notification delivery. A burst is coalesced into a
+    /// single handoff. The positions of the batch refer to the state built by
+    /// its earlier ops and are validated when the batch applies.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// // worker thread
+    /// CList.postAppend item items
+    /// // owner thread: the next read applies the post automatically
+    /// let view = AList.force items
+    /// </code>
+    /// </example>
+    let inline postAppend (value: 'T) (list: clist<'T>) = list.PostAppend value
+
+    /// <summary>Posts an insert at the start. Safe from any thread. See <see cref="postAppend"/> for the application contract.</summary>
+    let inline postPrepend (value: 'T) (list: clist<'T>) = list.PostPrepend value
+
+    /// <summary>Posts an insert before the element currently at the position. Safe from any thread. See <see cref="postAppend"/> for the application contract.</summary>
+    let inline postInsertAt (position: int) (value: 'T) (list: clist<'T>) = list.PostInsertAt(position, value)
+
+    /// <summary>Posts a remove at the position. Safe from any thread. See <see cref="postAppend"/> for the application contract.</summary>
+    let inline postRemoveAt (position: int) (list: clist<'T>) = list.PostRemoveAt position
+
+    /// <summary>Posts a replace at the position. Safe from any thread. See <see cref="postAppend"/> for the application contract.</summary>
+    let inline postUpdateAt (position: int) (value: 'T) (list: clist<'T>) = list.PostUpdateAt(position, value)
+
+    /// <summary>Posts a remove of the first occurrence of the value. Safe from any thread. See <see cref="postAppend"/> for the application contract.</summary>
+    let inline postRemove (value: 'T) (list: clist<'T>) = list.PostRemove value
+
+    /// <summary>Posts a clear. Safe from any thread. See <see cref="postAppend"/> for the application contract.</summary>
+    let inline postClear (list: clist<'T>) = list.PostClear()
+
+    /// <summary>
+    /// Posts a full replace. Safe from any thread. See <see cref="postAppend"/>
+    /// for the application contract; a posted replace supersedes the other ops
+    /// of the same pending batch (the transaction semantics of <see cref="set"/>).
+    /// </summary>
+    let inline postSet (values: seq<'T>) (list: clist<'T>) = list.PostSet values
 
     /// <summary>Removes all elements.</summary>
     let inline clear (list: clist<'T>) = list.Clear()

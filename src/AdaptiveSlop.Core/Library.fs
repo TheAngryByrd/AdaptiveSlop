@@ -326,8 +326,9 @@ type internal PostSlot() =
 /// <summary>
 /// Internal. Bounded multi-producer, single-consumer ring buffer for cross-thread
 /// posts. Preallocated. Each slot carries a sequence number; producers and the
-/// consumer synchronize through it. The only Interlocked/Volatile use in the core
-/// is here, inside the explicit handoff structure (PLAN.md §7.3).
+/// consumer synchronize through it. The Interlocked/Volatile use in the core is
+/// confined to the explicit handoff structure (PLAN.md §7.3): this ring and the
+/// per-node posted-op rings of the changeable collections (Changeable.fs).
 /// </summary>
 type internal PostRing(capacity: int) =
     let mask = capacity - 1
@@ -455,17 +456,29 @@ type internal GraphContext() =
         operationDepth <- operationDepth + 1
 
         if operationDepth = 1 && not this.TxActive then
-            this.DrainIfPending()
+            try
+                this.DrainIfPending()
+            with _ ->
+                // The drain failed (a posted op threw, for example an invalid
+                // posted list position). Unwind this claim before propagating
+                // so the caller's ReleaseOwner in its finally cannot underflow
+                // the depth counters; the graph stays usable.
+                this.ReleaseOwner()
+                reraise ()
 
-    /// Release one claim of ClaimOwner at the end of an operation.
+    /// Release one claim of ClaimOwner at the end of an operation. A release
+    /// past zero is a no-op: it happens when ClaimOwner unwound its own claim
+    /// before rethrowing a drain failure (the caller's finally still runs).
     member internal this.ReleaseOwner() =
 #if DEBUG
-        debugClaimDepth <- debugClaimDepth - 1
+        if debugClaimDepth > 0 then
+            debugClaimDepth <- debugClaimDepth - 1
 
         if debugClaimDepth = 0 then
             debugActiveThread <- 0
 #endif
-        operationDepth <- operationDepth - 1
+        if operationDepth > 0 then
+            operationDepth <- operationDepth - 1
 
     member internal this.EnterEvaluation() =
         this.ClaimOwner()
