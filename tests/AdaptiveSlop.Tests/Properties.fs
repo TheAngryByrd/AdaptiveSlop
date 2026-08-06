@@ -3097,7 +3097,7 @@ let ``CSet updateTo and perform match the sequential model`` () =
         for e in pendingRems do
             model.Remove e |> ignore
 
-        CSet.updateTo model viaUpdate
+        CSet.updateTo model viaUpdate |> ignore
 
         let d = SetDeltaBuilder<int>()
 
@@ -3136,7 +3136,7 @@ let ``CMap updateTo and perform match the sequential model`` () =
         for k in pendingRems do
             model.Remove k |> ignore
 
-        CMap.updateTo (Seq.map (fun (KeyValue(k, v)) -> k, v) model) viaUpdate
+        CMap.updateTo (Seq.map (fun (KeyValue(k, v)) -> k, v) model) viaUpdate |> ignore
 
         let d = MapDeltaBuilder<int, int>()
 
@@ -3182,7 +3182,7 @@ let ``CList updateTo and perform match the sequential model`` () =
                     d.Update(pos, e)
             | ListChange.SetValue _ -> ()
 
-        CList.updateTo (Array.ofSeq model) viaUpdate
+        CList.updateTo (Array.ofSeq model) viaUpdate |> ignore
         CList.perform d viaPerform
 
         let expected = List.ofSeq model
