@@ -482,4 +482,5 @@ $RECYCLE.BIN/
 
 # Vim temporary swap files
 *.swp
-.kimi-codebenchmark-results/
+.kimi-code
+benchmark-results/

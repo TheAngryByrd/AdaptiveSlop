@@ -1,36 +1,64 @@
 # AdaptiveSlop
 
-A high-performance, low-allocation incremental/adaptive computation library for F#,
-inspired by [FSharp.Data.Adaptive](https://github.com/fsprojects/FSharp.Data.Adaptive) (FDA).
+A full AI assisted library for pull-based incremental computation library in F#.
 
-AdaptiveSlop tracks dependencies automatically and recomputes only what changed, with a
-focus on memory efficiency and tight-loop (game/simulation) workloads.
+AdaptiveSlop tracks dependencies automatically. It recomputes only what changed. It
+focuses on allocation-free steady state and tight-loop workloads (games, simulations,
+real-time UIs).
 
-## Features
+The main target is the tight-loop profile: many values change between reads, and
+reads must be cheap and allocation-free.
 
-- **Automatic dependency tracking** — no manual subscription management
-- **Lazy pull evaluation** — values recompute only when read and dirty
-- **Incremental collections** — adaptive sets/maps propagate element-level deltas
-- **Low allocation** — zero allocation on steady-state reads and writes
-- **Owner-thread confinement** — one thread per graph; foreign threads send changes with lock-free `Post`, applied automatically at the owner's next graph operation (optional explicit `Posting.pump()`)
-- **Transactions** — batch updates applied atomically at commit
+The canonical shape is a derived state graph forced once per tick — for example, a
+physics-simulation cache that derives per-entity state from a set of entities.
 
-## Installation
+Write as many times as you want between reads, they're "free" until you read.
+Or do the inverse, read as many times as you want between writes, they're "free" until the next read after write.
+
+## Design
+
+- **Pull-lazy evaluation.** Writes mark. Reads compute, per dirty node, once per change.
+  Ten writes before one read cost one recompute. A read at a settled state is O(1).
+- **Zero allocation on steady state.** Delta buffers are reused. Steady-state reads and
+  writes allocate nothing.
+- **Coarse scans instead of per-entry bookkeeping.** Unobserved mapA nodes re-check every
+  entry's version on read. The trade is flat overhead in exchange for a scan after each
+  write.
+- **Transactions.** Writes inside `Transaction.run` apply at commit, with one notification
+  delivery.
+
+## When to use FSharp.Data.Adaptive instead
+
+FSharp.Data.Adaptive is the mature choice for general incremental computing:
+
+- It has the full API surface, `IndexList`, history, and Fable/JS support.
+- It wins on very wide dependency graphs and on large mapA collections, where the coarse
+  scan loses.
+
+Rule of thumb: general incremental computing → FSharp.Data.Adaptive. Tight loops with
+cheap reads → AdaptiveSlop.
+
+## Building
 
 ```bash
-dotnet add package AdaptiveSlop.Core
+dotnet build AdaptiveSlop.sln
 ```
+
+The core (`src/AdaptiveSlop.Core`) depends only on the BCL. A NuGet package is not
+published yet; reference the project or the built DLL directly.
 
 ## Quick Start
 
 ```fsharp
 open AdaptiveSlop.Core
 
-let width  = CVal.create 10.0
+let width = CVal.create 10.0
 let height = CVal.create 20.0
 
 // Computed values track dependencies automatically
-let area = AVal.map2 (*) (CVal.value width) (CVal.value height)
+let area =
+    width
+    |> AVal.map2 (fun w h -> w * h) height
 
 AVal.getValue area   // 200.0
 width.Set(15.0)
@@ -44,15 +72,26 @@ AVal.getValue area   // 300.0
 ```fsharp
 let counter = CVal.create 0
 counter.Set(42)
-let v = CVal.value counter   // IAdaptiveValue<int> view, for building computations
 ```
+
+A changeable value is already the adaptive view. Pass it directly to the combinators;
+`CVal.value` is an explicit upcast, optional except where the interface type must be
+named.
 
 ### Adaptive values (`AVal`) — computed nodes
 
 ```fsharp
-let doubled = AVal.map  (fun x -> x * 2) (CVal.value counter)
-let sum     = AVal.map2 (+) (CVal.value a) (CVal.value b)
-let rgb     = AVal.map3 (fun r g b -> (r, g, b)) (CVal.value r) (CVal.value g) (CVal.value b)
+let doubled =
+    counter
+    |> AVal.map (fun x -> x * 2)
+
+let sum =
+    a
+    |> AVal.map2 (fun a b -> a + b) b
+
+let rgb =
+    r
+    |> AVal.map3 (fun r g b -> (r, g, b)) g b
 ```
 
 Recomputation is lazy: nothing recomputes until you call `GetValue()`, and then only if a
@@ -62,10 +101,21 @@ dependency changed since the last read.
 chaining `map2`:
 
 ```fsharp
-let deps = sensors |> Array.map (fun s -> CVal.value s :> IAdaptiveValue<float>)
-let average = AVal.mapN (fun values -> Array.average values) deps
-let total   = AVal.reduce 0.0 (+) deps      // no intermediate array
-let intSum  = AVal.sum intDeps              // convenience for int
+let deps =
+    sensors
+    |> Array.map (_.Dep)
+
+let average =
+    deps
+    |> AVal.mapN (fun values -> Array.average values)
+
+let total =
+    deps
+    |> AVal.reduce 0.0 (+)      // no intermediate array
+
+let intSum =
+    intDeps
+    |> AVal.sum                 // convenience for int
 ```
 
 ### Transactions
@@ -77,8 +127,11 @@ Transaction.run (fun () ->
 // both changes apply atomically at commit
 ```
 
-Note: changes inside a transaction are applied at commit — reads *inside* the transaction
+Note: changes inside a transaction are applied at commit — reads _inside_ the transaction
 still see the pre-transaction values.
+
+However, transactions are not strictly necessary: writes outside a transaction apply immediately.
+They are useful for batching multiple writes into one notification delivery.
 
 ### Cross-thread posting
 
@@ -109,53 +162,111 @@ Posting rules:
 
 ### Adaptive collections
 
-Sets and maps propagate **element-level deltas** (added/removed) instead of recomputing
-wholesale. Writes are journaled (zero allocation); nodes process pending deltas on read:
+Sets, maps, and lists propagate **element-level deltas** (added/removed/updated) instead
+of recomputing wholesale. Writes are journaled (zero allocation); nodes process pending
+deltas on read:
 
 ```fsharp
 let items = CSet.ofSeq [1; 2; 3]
-let doubled  = ASet.map (fun x -> x * 2) (CSet.value items)
-let filtered = ASet.filter (fun x -> x > 2) (CSet.value items)
+
+let doubled =
+    items
+    |> ASet.map (fun x -> x * 2)
+
+let filtered =
+    items
+    |> ASet.filter (fun x -> x > 2)
+
 items.Add(4)    // downstream nodes process one element, not the whole set
+
+let entries = CMap.empty<int, string>
+
+let lookup =
+    entries
+    |> AMap.tryFind 1            // aval<string voption>
+
+let names =
+    entries
+    |> AMap.mapV String.length
+
+let sequence = CList.empty<int>
+
+let total =
+    sequence
+    |> AList.sum                 // aval<int>, tracks the list
+
+let sorted =
+    sequence
+    |> AList.sort                // stable, positional
 ```
 
-- `ASet.getValue` / `AMap.getValue` return a **transient view** of the internal state:
-  valid only until the next write on the owner thread. Computations consume it; do not
+Per-element adaptive mapping is available on all three collections (`mapA`/`filterA`/
+`chooseA`, plus the positional `mapiA` on lists): the mapping returns an `aval`, the
+output follows each element's aval, and entries whose aval holds `None`/`ValueNone` are
+dropped:
+
+```fsharp
+let statuses =
+    entities
+    |> ASet.mapA(fun id -> world |> AMap.tryFind id)
+    |> ASet.chooseV id
+```
+
+- `ASet.getValue` / `AMap.getValue` / `AList.getValue` return a **transient view** of the
+  internal state: valid only until the next write. Computations consume it; do not
   retain or mutate it.
-- `ASet.force` / `AMap.force` materialize an immutable `FrozenSet`/`FrozenDictionary`
-  checkpoint. This is the only collection operation that allocates, and the only result
-  safe to retain: the library never touches a forced value again.
+- `ASet.force` / `AMap.force` / `AList.force` materialize an immutable checkpoint. This
+  is the only collection operation that allocates, and the only result safe to retain:
+  the library never touches a forced value again.
 - `ASet.toSet` / `AMap.toMap` (and `CSet.toSet` / `CMap.toMap`) materialize the F#
   `Set`/`Map` counterparts for sorted iteration and F# interop.
 - Derived collections register with their dependencies lazily (first read) and are
   `IDisposable`; disposal stops all delta processing. Reading a disposed node throws.
 - The collection interfaces do not require `: comparison` (hash-based internally); the
   F#-interop helpers re-impose it at their boundary.
+- External snapshots: `AVal.ofExternal`, `ASet.ofExternal`, `AMap.ofExternal`,
+  `AList.ofExternal` wrap a foreign mutable source with an explicit `invalidate` handle.
+  Reads are O(1) until invalidated, then re-read the snapshot once.
 
-## API Reference
+## API surface
 
-| Module | Functions |
-|--------|-----------|
-| `AVal` | `constant`, `map`, `map2`, `map3`, `map4`, `mapN`, `reduce`, `sum`, `bind`, `observe`, `getValue` (+ `Task`/`ValueTask` variants) |
-| `CVal` | `create`, `value`, `set`, `post` |
-| `CSet` / `CMap` | `empty`, `ofSeq`, `add` / `addOrUpdate`, `remove`, `set`, `value`, `force`, `toSet` / `toMap` |
-| `ASet` / `AMap` | `map`, `filter` (+ `union` for sets), `getValue`, `force`, `toSet` / `toMap` |
-| `Transaction` | `run` |
-| `Posting` | `pump` |
+- **AVal** — `constant`, `delay`, `init`, `ofExternal`, `map`, `map2`, `map3`, `map4`,
+  `mapN`, `reduce`, `sum`, `bind`, `bind2`, `bind3`, `observe`, `getValue`, `force`
+  (+ `Task`/`ValueTask` variants)
+- **CVal** — `create`, `value`, `set`, `post`
+- **CSet** — `empty`, `ofSeq`, `add`, `remove`, `set`, `updateTo`, `perform`, `unionWith`,
+  `exceptWith`, `intersectWith`, `value`, `force`, `toSet`
+- **CMap** — `empty`, `ofSeq`, `addOrUpdate`, `remove`, `set`, `updateTo`, `perform`,
+  `containsKey`, `tryGetValue`, `item`, `clear`, `value`, `force`, `toMap`
+- **CList** — `empty`, `append`, `insertAt`, `removeAt`, `updateAt`, `addRange`,
+  `updateTo`, `perform`, `value`, `force`, `toArray`
+- **ASet** — `map`, `filter`, `choose`, `union`, `intersect`, `mapA`, `filterA`,
+  `chooseA`, `collect`, `collect'`, `bind`, `bind2`, `bind3`, `range`, `mapUse`, `count`,
+  `countBy`, `sum`, `average`, `sort`, `custom`, `getValue`, `force`, `toSet`, `ofSeq`,
+  `observe`
+- **AMap** — `map`, `mapV`, `filter`, `filterV`, `choose`, `chooseV`, `choose2V`,
+  `unionWith`, `intersect`, `intersectV`, `mapA`, `filterA`, `chooseA`, `mapUse`, `bind`,
+  `bind2`, `bind3`, `keys`, `toASet`, `fold`, `foldGroup`, `foldHalfGroup`, `sumBy`,
+  `averageBy`, `tryFind`, `find`, `getValue`, `force`, `toMap`, `ofSeq`, `observe`
+- **AList** — `map`, `mapi`, `filter`, `choose`, `indexed`, `mapA`, `mapiA`, `filterA`,
+  `chooseA`, `append`, `concat`, `bind`, `bind2`, `bind3`, `ofAVal`, `ofSeq`, `ofArray`,
+  `range`, `init`, `toAVal`, `tryAt`, `tryGet`, `tryFirst`, `tryLast`, `rev`, `sort`,
+  `pairwise`, `take`, `takeA`, `skip`, `skipA`, `sub`, `subA`, `reduce`, `reduceBy`,
+  `fold`, `foldGroup`, `foldHalfGroup`, `exists`, `forall`, `countBy`, `tryMin`,
+  `tryMax`, `sum`, `sumBy`, `average`, `averageBy`, `mapUse`, `custom`, `getValue`,
+  `force`, `toArray`, `observe`
+- **Transaction** — `run`
+- **Posting** — `pump`
 
 ## Performance
 
-vs FSharp.Data.Adaptive (BenchmarkDotNet):
+The library aims to be fast. Steady-state reads and writes try to allocate nothing.
 
-| Scenario | Speed | Memory |
-|----------|-------|--------|
-| Deep chains (depth 20) | 1.2x faster | 143 KB vs 230 KB |
-| Wide fan-in (100 inputs) | 3.1x faster | 3.1 KB vs 46 KB |
+Benchmarks exist in `docs/BENCHMARKS.md`. They compare the library against
+FSharp.Data.Adaptive on identical workloads.
+While the workloads are shaped for FDA, AdaptiveSlop still performs well.
 
-Main optimizations: single-node N-ary combinators, per-evaluation dirty cache, pooled
-arrays, struct tuples on hot paths.
-
-**Guidance:** `map`/`map2` for 1–2 deps, `map3`/`map4` for 3–4, `mapN`/`reduce`/`sum` for
+Guidance: `map`/`map2` for 1–2 deps, `map3`/`map4` for 3–4, `mapN`/`reduce`/`sum` for
 5+; consume collection **deltas** on hot paths rather than re-reading whole snapshots.
 
 ## Architecture
@@ -165,28 +276,33 @@ arrays, struct tuples on hot paths.
   nodes fall back to dependency version checks.
 - **Lazy edges.** Dependencies are re-discovered on every recompute, so dynamic graphs
   (`bind`) stay correct. Edge sets mutate only when they really change.
-- **Collections push deltas.** Changeable sets/maps journal added/removed elements and push
-  them to derived nodes, which update per-element (with ref-counting for shared outputs).
-- **Owner-thread confinement.** One thread owns a graph. The core has no locks.
-  Cross-thread changes go through `Post` + `Posting.pump()` (see above).
-- **Observation.** `AVal.observe` registers a strong parent edge and delivers the callback
-  after a batch or a write. Dispose the observation to stop; edges are strong, so an
-  undropped observation keeps the subgraph alive.
+- **Collections push deltas.** Changeable collections journal added/removed/updated
+  elements and push them to derived nodes, which update per-element (with ref-counting
+  for shared outputs).
+- **Observation.** `AVal.observe`/`ASet.observe`/`AMap.observe`/`AList.observe` register
+  a strong parent edge and deliver the callback after a batch or a write. Dispose the
+  observation to stop; edges are strong, so an undropped observation keeps the subgraph
+  alive.
 
-## Known Limitations
+## Limitations
 
-- Derived collection nodes register with their source at construction and are retained by
-  it (explicit lifecycle management is on the roadmap).
-- No incremental `bind` — switching the inner value recomputes it fully.
+- **mapA scan.** Unobserved mapA/filterA/chooseA nodes re-check every entry's version on
+  each read after a write — O(N) per change, deliberate in exchange for zero per-entry
+  bookkeeping.
+- **Wide fan-out.** Very wide dependency graphs re-validate each level on a write and
+  degrade exponentially with the fan-out.
+- **Large list forces.** Forcing a large list materializes the output array per read.
+- **No Fable/JS support**, no history, and a smaller API surface than
+  FSharp.Data.Adaptive.
+- The library is young. The API is covered by the unit suite and the FsCheck property
+  suite, but production mileage is limited.
 
-## Roadmap & Design Docs
+## Credit
 
-The library is being rebuilt towards a push-mark/pull-evaluate core with owner-thread
-confinement and zero-allocation hot paths. See:
-
-- `docs/PLAN.md` — the phased rebuild plan and threading model
-- `docs/ANALYSIS-FDA.md` — verified analysis of FDA's internals
-- `docs/SIGNALS-COMPARISON.md` — comparison with JS signals and the underlying research
+AdaptiveSlop is inspired by
+[FSharp.Data.Adaptive](https://github.com/fsprojects/FSharp.Data.Adaptive). The API
+follows its conventions (`mapA`/`filterA`/`chooseA`, `AdaptiveReduction`, transactions, deltas).
+Credit and thanks to the FDA authors.
 
 ## License
 

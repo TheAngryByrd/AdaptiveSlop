@@ -13,12 +13,12 @@ Guidance for AI agents working in this repo. For API/usage documentation see @RE
 Suggestion:
 sub agents running in parallel should not build or test as they may trip each other's results. Orchestrate, send work in parallel and verify/fix in the main agent when subagents are done.
 
-
 ## Commands
 
 ```bash
 dotnet build AdaptiveSlop.sln
 dotnet test tests/AdaptiveSlop.Tests/AdaptiveSlop.Tests.fsproj
+dotnet test tests/AdaptiveSlop.Tests/AdaptiveSlop.Tests.fsproj -c Release   # before release claims
 cd benchmarks/AdaptiveSlop.Benchmarks && dotnet run -c Release -- --filter "*" --job short
 ```
 
@@ -26,10 +26,17 @@ cd benchmarks/AdaptiveSlop.Benchmarks && dotnet run -c Release -- --filter "*" -
 
 - `src/AdaptiveSlop.Core/Library.fs` — scalar core: `ChangeableValue`, `AdaptiveNode`
   (generic), `Map3/4/N/ReduceNode`, `Transaction`, `DependencyCollector`, `AVal`/`CVal`
-- `src/AdaptiveSlop.Core/AdaptiveCollections.fs` — `ChangeableSet/Map`, derived
-  map/filter/union nodes, `ASet`/`AMap`/`CSet`/`CMap`
-- `tests/AdaptiveSlop.Tests/Tests.fs` — xUnit, single file
-- `benchmarks/AdaptiveSlop.Benchmarks/` — BenchmarkDotNet; run before/after any perf change
+- `src/AdaptiveSlop.Core/Collections/` — the collection layer, in compile order:
+  `Shared.fs` (delta buffers, `Collections` internal module), `Changeable.fs`
+  (`ChangeableSet/Map/List`), `ElementSetNode.fs`, `ElementMapNode.fs`,
+  `ElementListNode.fs` (the per-element mapA/filterA/chooseA nodes), `SetNodes.fs`,
+  `MapNodes.fs`, `ListNodes.fs`, `Reductions.fs`, `ExternalNodes.fs`
+  (ofExternal/custom), `ObserveNodes.fs`, `Api.fs` (the public modules)
+- `tests/AdaptiveSlop.Tests/Tests.fs` — xUnit unit tests
+- `tests/AdaptiveSlop.Tests/Properties.fs` — the FsCheck property suite (reference
+  models, algebraic laws, incremental laws, scenario generators)
+- `benchmarks/AdaptiveSlop.Benchmarks/` — BenchmarkDotNet; run before/after any perf change;
+  raw run output goes to `benchmark-results/` (gitignored), summaries to `docs/BENCHMARKS.md`
 - `src/AdaptiveSlop.{Demo,Tui,Mibo}` — consumers of the core
 - `docs/` — design research and planning documents, when present
 
@@ -66,3 +73,7 @@ from the user before proceeding.
 - No new dependencies without asking; the core currently depends only on the BCL.
 - Performance claims require a BenchmarkDotNet before/after; allocation claims require
   measurement evidence.
+- **Test at the public API level only.** Never test node internals. Property tests use the
+  DSL (module functions: `CVal.set`, `CSet.add`, `CList.insertAt`, `CMap.addOrUpdate`,
+  `AVal.map`), never instance methods, and live in `Properties.fs` (100 iterations;
+  the op models must mirror the real semantics, not the library's implementation).
