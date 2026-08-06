@@ -220,9 +220,9 @@ type SetReduceNode<'a, 'b, 's, 'v when 'a: equality>
     /// pending delta, so the whole journal is consumed.
     member private this.Rebuild() =
         let mutable acc = reduction.seed
-        // The view is always a HashSet in this implementation; interface
+        // The view is a HashSet in this implementation; interface
         // iteration would box the enumerator (measured 40 B per element).
-        let data = source.GetValue() :?> HashSet<'a>
+        let data = Collections.asHashSet (source.GetValue())
 
         for x in data do
             acc <- reduction.add acc (mapping x)
@@ -424,9 +424,17 @@ type ListReduceNode<'a, 'b, 's, 'v>
 
                 match op.Kind with
                 | ListOpKind.Insert ->
-                    let m = mapping op.Value
-                    mirror.Insert(p, struct (op.Value, m))
-                    red <- reduction.add red m
+                    if p >= mirror.Count then
+                        // Append: the incremental add is valid for every reduction.
+                        let m = mapping op.Value
+                        mirror.Insert(p, struct (op.Value, m))
+                        red <- reduction.add red m
+                    else
+                        // Mid-list insert: the incremental add assumes an
+                        // append (or a commutative reduction); the protocol
+                        // does not expose commutativity, so rebuild.
+                        this.Rebuild()
+                        rebuilt <- true
                 | ListOpKind.Remove ->
                     if p >= 0 && p < mirror.Count then
                         let struct (_, mappedOld) = mirror[p]
@@ -556,9 +564,9 @@ type MapReduceNode<'k, 'a, 'b, 's, 'v when 'k: equality>
     member private this.Rebuild() =
         mirror.Clear()
         let mutable acc = reduction.seed
-        // The view is always a Dictionary in this implementation; interface
+        // The view is a Dictionary in this implementation; interface
         // iteration would box the enumerator (measured 48 B per entry).
-        let data = source.GetValue() :?> Dictionary<'k, 'a>
+        let data = Collections.asDictionary (source.GetValue())
 
         for KeyValue(k, v) in data do
             let m = mapping k v

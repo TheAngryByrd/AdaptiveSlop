@@ -10,6 +10,7 @@ open System
 open System.Collections.Generic
 open global.Xunit
 open FsCheck
+open FsCheck.FSharp
 open AdaptiveSlop.Core
 
 // =============================================================================
@@ -73,6 +74,936 @@ let ``FsCheck smoke: AList append builds the sequence`` () =
         AList.force (CList.value l) = List.toArray xs
 
     Check.QuickThrowOnFailure builds
+
+// =============================================================================
+// Algebraic laws over generated data. These are the real property tests: the
+// law is a clean universal statement, FsCheck generates the data directly
+// (built-in arbitraries), and a failure shrinks to a minimal concrete value.
+// =============================================================================
+
+[<Fact>]
+let ``law: AList.map preserves the mapped content`` () =
+    let law (xs: int list) =
+        AList.force (AList.map ((+) 1) (AList.ofSeq xs)) = Array.map ((+) 1) (List.toArray xs)
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: AList.append concatenates`` () =
+    let law (a: int list, b: int list) =
+        AList.force (AList.append (AList.ofSeq a) (AList.ofSeq b)) = Array.append (List.toArray a) (List.toArray b)
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: AList.rev reverses and is involutive`` () =
+    let law (xs: int list) =
+        let reversed = AList.force (AList.rev (AList.ofSeq xs))
+        let twice = AList.force (AList.rev (AList.rev (AList.ofSeq xs)))
+        reversed = Array.rev (List.toArray xs) && twice = List.toArray xs
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: AList.sort sorts and is idempotent`` () =
+    let law (xs: int list) =
+        let sorted = AList.force (AList.sort (AList.ofSeq xs))
+        let twice = AList.force (AList.sort (AList.sort (AList.ofSeq xs)))
+        sorted = Array.sort (List.toArray xs) && twice = sorted
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: AList.take truncates`` () =
+    let law (n: int, xs: int list) =
+        let count = abs n % (List.length xs + 1)
+        AList.force (AList.take count (AList.ofSeq xs)) = Array.truncate count (List.toArray xs)
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: AList.skip skips and clamps`` () =
+    let law (n: int, xs: int list) =
+        let count = abs n % (List.length xs + 2)
+
+        let expected =
+            if count >= List.length xs then [||]
+            else Array.skip count (List.toArray xs)
+
+        AList.force (AList.skip count (AList.ofSeq xs)) = expected
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: AList.sub slices`` () =
+    let law (o: int, c: int, xs: int list) =
+        let len = List.length xs
+        let offset = abs o % (len + 1)
+        let count = abs c % (len + 2)
+
+        let expected =
+            let from = min offset len
+            let take = max 0 (min count (len - from))
+            Array.sub (List.toArray xs) from take
+
+        AList.force (AList.sub offset count (AList.ofSeq xs)) = expected
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: AList.pairwise pairs adjacent elements`` () =
+    let law (xs: int list) =
+        let arr = List.toArray xs
+
+        let expected =
+            seq {
+                for i in 0 .. arr.Length - 2 do
+                    struct (arr[i], arr[i + 1])
+            }
+            |> Array.ofSeq
+
+        AList.force (AList.pairwise (AList.ofSeq xs)) = expected
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: AList.concat flattens`` () =
+    let law (xss: int list list) =
+        AList.force (AList.concat (List.map AList.ofSeq xss)) = Array.concat (List.map List.toArray xss)
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: AList.choose selects`` () =
+    let law (xs: int list) =
+        let f x = if x % 2 = 0 then Some(x * 10) else None
+        AList.force (AList.choose f (AList.ofSeq xs)) = Array.choose f (List.toArray xs)
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: AList.indexed pairs positions`` () =
+    let law (xs: int list) =
+        AList.force (AList.indexed (AList.ofSeq xs)) = Array.mapi (fun i x -> struct (i, x)) (List.toArray xs)
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: AList.mapA with constants maps`` () =
+    let law (xs: int list) =
+        AList.force (AList.mapA (fun x -> AVal.constant (x * 2)) (AList.ofSeq xs)) = Array.map ((*) 2) (List.toArray xs)
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: AList reductions match the forced content`` () =
+    let law (xs: int list) =
+        let arr = List.toArray xs
+
+        (AVal.getValue (AList.sum (AList.ofSeq xs)) = Array.sum arr)
+        && (AVal.getValue (AList.countBy (fun x -> x % 2 = 0) (AList.ofSeq xs)) = (Array.filter (fun x -> x % 2 = 0) arr).Length)
+        && (AVal.getValue (AList.tryMin (AList.ofSeq xs)) = (if arr.Length = 0 then ValueNone else ValueSome(Array.min arr)))
+        && (AVal.getValue (AList.tryMax (AList.ofSeq xs)) = (if arr.Length = 0 then ValueNone else ValueSome(Array.max arr)))
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: ASet.map and filter preserve content`` () =
+    let law (s: Set<int>) =
+        (ASet.toSet (ASet.map ((+) 1) (ASet.ofSeq s)) = Set.map ((+) 1) s)
+        && (ASet.toSet (ASet.filter (fun x -> x % 2 = 0) (ASet.ofSeq s)) = Set.filter (fun x -> x % 2 = 0) s)
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: ASet union and intersect`` () =
+    let law (a: Set<int>, b: Set<int>) =
+        (ASet.toSet (ASet.union (ASet.ofSeq a) (ASet.ofSeq b)) = Set.union a b)
+        && (ASet.toSet (ASet.intersect (ASet.ofSeq a) (ASet.ofSeq b)) = Set.intersect a b)
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: ASet choose and count`` () =
+    let law (s: Set<int>) =
+        let f x = if x % 3 = 0 then Some(x / 3) else None
+
+        (ASet.toSet (ASet.choose f (ASet.ofSeq s)) = Set.ofSeq (Seq.choose f s))
+        && (AVal.getValue (ASet.count (ASet.ofSeq s)) = Set.count s)
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: ASet reductions over constant sources`` () =
+    let law (s: Set<int>) =
+        (AVal.getValue (ASet.sum (ASet.ofSeq s)) = Seq.sum s)
+        && (AVal.getValue (ASet.countBy (fun x -> x % 2 = 0) (ASet.ofSeq s)) = (Seq.filter (fun x -> x % 2 = 0) s |> Seq.length))
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: AMap reductions over constant sources`` () =
+    let law (m: Map<int, int>) =
+        AVal.getValue (AMap.fold (fun acc _ v -> acc + v) 0 (AMap.ofSeq (Map.toSeq m))) = (m |> Map.toSeq |> Seq.sumBy snd)
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: ASet mapA with constants maps`` () =
+    let law (s: Set<int>) =
+        ASet.toSet (ASet.mapA (fun x -> AVal.constant (x * 2)) (ASet.ofSeq s)) = Set.map ((*) 2) s
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: AMap mapV and filter preserve content`` () =
+    let law (m: Map<int, int>) =
+        (AMap.toMap (AMap.mapV ((+) 1) (AMap.ofSeq (Map.toSeq m))) = Map.map (fun _ v -> v + 1) m)
+        && (AMap.toMap (AMap.filter (fun _ v -> v % 2 = 0) (AMap.ofSeq (Map.toSeq m))) = Map.filter (fun _ v -> v % 2 = 0) m)
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: AMap keys and toASet`` () =
+    let law (m: Map<int, int>) =
+        ASet.toSet (AMap.keys (AMap.ofSeq (Map.toSeq m))) = Set.ofSeq (Map.keys m)
+
+        let pairs =
+            m |> Map.toSeq |> Seq.map (fun (k, v) -> struct (k, v)) |> Set.ofSeq
+
+        ASet.toSet (AMap.toASet (AMap.ofSeq (Map.toSeq m))) = pairs
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: AMap chooseV selects`` () =
+    let law (m: Map<int, int>) =
+        let f (k: int) (v: int) = if v % 2 = 0 then ValueSome(k * 100 + v) else ValueNone
+
+        let expected =
+            m
+            |> Map.toSeq
+            |> Seq.choose (fun (k, v) -> if v % 2 = 0 then Some(k, k * 100 + v) else None)
+            |> Map.ofSeq
+
+        AMap.toMap (AMap.chooseV f (AMap.ofSeq (Map.toSeq m))) = expected
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: changeable roundtrips`` () =
+    let law (xs: (int * int) list, s: Set<int>) =
+        AMap.toMap (CMap.value (CMap.ofSeq xs)) = Map.ofSeq xs
+        && ASet.toSet (CSet.value (CSet.ofSeq s)) = s
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: AVal constant, map and map2`` () =
+    let law (a: int, b: int) =
+        AVal.getValue (AVal.constant a) = a
+        && AVal.getValue (AVal.map ((+) 1) (AVal.constant a)) = a + 1
+        && AVal.getValue (AVal.map2 (fun x y -> x * y) (AVal.constant a) (AVal.constant b)) = a * b
+
+    Check.QuickThrowOnFailure law
+
+// =============================================================================
+// Incremental laws: the same algebraic laws re-asserted after EVERY mutation
+// of a changeable source. The one-shot laws above check the load path only;
+// these check the incremental path (drain, deltas, version gates). The forced
+// source content is the oracle; the mirrors exist only for position decoding.
+// =============================================================================
+
+/// Applies one op (kind = op % 3: insert / removeAt / updateAt) to a changeable
+/// list and its mirror. The position is derived from the mirror length, so it
+/// is always valid for the current state.
+let applyListMutation (op: int) (l: ChangeableList<int>) (model: ResizeArray<int>) =
+    let kind = op % 3
+    let rest = op / 3
+    let element = rest % 10
+
+    let position =
+        let p = (rest / 10) % (model.Count + 1)
+        if p < 0 then p + (model.Count + 1) else p
+
+    match kind with
+    | 0 ->
+        CList.insertAt position element l
+        model.Insert(position, element)
+    | 1 ->
+        if model.Count > 0 && position < model.Count then
+            CList.removeAt position l
+            model.RemoveAt position
+    | _ ->
+        if model.Count > 0 && position < model.Count then
+            CList.updateAt position element l
+            model[position] <- element
+
+/// Applies one op (kind = op % 2: add / remove) to a changeable set.
+let applySetMutation (op: int) (s: ChangeableSet<int>) =
+    let kind = op % 2
+    let rest = op / 2
+    let element = rest % 20
+
+    match kind with
+    | 0 -> CSet.add element s
+    | _ -> CSet.remove element s
+
+/// Applies one op (kind = op % 2: upsert / remove) to a changeable map.
+let applyMapMutation (op: int) (m: ChangeableMap<int, int>) =
+    let kind = op % 2
+    let rest = op / 2
+    let key = rest % 10
+    let value = (rest / 10) % 100
+
+    match kind with
+    | 0 -> CMap.addOrUpdate key value m
+    | _ -> CMap.remove key m
+
+[<Fact>]
+let ``incremental law: AList.sort stays sorted`` () =
+    let prop (ops: int list) =
+        let l = CList.empty<int>
+        let model = ResizeArray<int>()
+        let sorted = AList.sort (CList.value l)
+        let mutable ok = true
+
+        for op in ops do
+            applyListMutation op l model
+
+            if AList.force sorted <> Array.sort (AList.force (CList.value l)) then
+                ok <- false
+
+        ok
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``incremental law: AList.rev stays reversed`` () =
+    let prop (ops: int list) =
+        let l = CList.empty<int>
+        let model = ResizeArray<int>()
+        let reversed = AList.rev (CList.value l)
+        let mutable ok = true
+
+        for op in ops do
+            applyListMutation op l model
+
+            if AList.force reversed <> Array.rev (AList.force (CList.value l)) then
+                ok <- false
+
+        ok
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``incremental law: AList.map stays mapped`` () =
+    let prop (ops: int list) =
+        let l = CList.empty<int>
+        let model = ResizeArray<int>()
+        let mapped = AList.map ((+) 1) (CList.value l)
+        let mutable ok = true
+
+        for op in ops do
+            applyListMutation op l model
+
+            if AList.force mapped <> Array.map ((+) 1) (AList.force (CList.value l)) then
+                ok <- false
+
+        ok
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``incremental law: AList.take stays truncated`` () =
+    let prop (ops: int list) =
+        let l = CList.empty<int>
+        let model = ResizeArray<int>()
+        let count = List.length ops % 5
+        let taken = AList.take count (CList.value l)
+        let mutable ok = true
+
+        for op in ops do
+            applyListMutation op l model
+
+            if AList.force taken <> Array.truncate count (AList.force (CList.value l)) then
+                ok <- false
+
+        ok
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``incremental law: AList.skip stays skipped`` () =
+    let prop (ops: int list) =
+        let l = CList.empty<int>
+        let model = ResizeArray<int>()
+        let count = List.length ops % 5
+        let skipped = AList.skip count (CList.value l)
+        let mutable ok = true
+
+        for op in ops do
+            applyListMutation op l model
+
+            let source = AList.force (CList.value l)
+
+            let expected =
+                if count >= source.Length then [||]
+                else Array.skip count source
+
+            if AList.force skipped <> expected then
+                ok <- false
+
+        ok
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``incremental law: AList.sub stays sliced`` () =
+    let prop (ops: int list) =
+        let l = CList.empty<int>
+        let model = ResizeArray<int>()
+        let offset = List.length ops % 3
+        let count = List.length ops % 5
+        let sliced = AList.sub offset count (CList.value l)
+        let mutable ok = true
+
+        for op in ops do
+            applyListMutation op l model
+
+            let source = AList.force (CList.value l)
+
+            let expected =
+                let from = min offset source.Length
+                let take = max 0 (min count (source.Length - from))
+                Array.sub source from take
+
+            if AList.force sliced <> expected then
+                ok <- false
+
+        ok
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``incremental law: AList.pairwise stays paired`` () =
+    let prop (ops: int list) =
+        let l = CList.empty<int>
+        let model = ResizeArray<int>()
+        let pairs = AList.pairwise (CList.value l)
+        let mutable ok = true
+
+        for op in ops do
+            applyListMutation op l model
+
+            let source = AList.force (CList.value l)
+
+            let expected =
+                seq {
+                    for i in 0 .. source.Length - 2 do
+                        struct (source[i], source[i + 1])
+                }
+                |> Array.ofSeq
+
+            if AList.force pairs <> expected then
+                ok <- false
+
+        ok
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``incremental law: AList.indexed stays indexed`` () =
+    let prop (ops: int list) =
+        let l = CList.empty<int>
+        // Mirror: element -> the index its mapping ran at (positions stick).
+        let model = ResizeArray<struct (int * int)>()
+        let indexed = AList.indexed (CList.value l)
+        let mutable ok = true
+
+        for op in ops do
+            let kind = op % 3
+            let rest = op / 3
+            let element = rest % 10
+
+            let position =
+                let p = (rest / 10) % (model.Count + 1)
+                if p < 0 then p + (model.Count + 1) else p
+
+            match kind with
+            | 0 ->
+                CList.insertAt position element l
+                model.Insert(position, struct (element, position))
+            | 1 ->
+                if model.Count > 0 && position < model.Count then
+                    CList.removeAt position l
+                    model.RemoveAt position
+            | _ -> // Update: equal values are a no-op (no re-map, the index sticks).
+                if model.Count > 0 && position < model.Count then
+                    let struct (oldE, _) = model[position]
+
+                    if oldE <> element then
+                        CList.updateAt position element l
+                        model[position] <- struct (element, position)
+
+            let expected = model |> Seq.map (fun struct (e, i) -> struct (i, e)) |> Array.ofSeq
+
+            if AList.force indexed <> expected then
+                ok <- false
+
+        ok
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``incremental law: AList.mapA stays mapped`` () =
+    let prop (ops: int list) =
+        let l = CList.empty<int>
+        let model = ResizeArray<int>()
+        let mapped = AList.mapA (fun x -> AVal.constant (x * 2)) (CList.value l)
+        let mutable ok = true
+
+        for op in ops do
+            applyListMutation op l model
+
+            if AList.force mapped <> Array.map ((*) 2) (AList.force (CList.value l)) then
+                ok <- false
+
+        ok
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``incremental law: AList.choose stays chosen`` () =
+    let prop (ops: int list) =
+        let l = CList.empty<int>
+        let model = ResizeArray<int>()
+        let f x = if x % 2 = 0 then Some(x * 10) else None
+        let chosen = AList.choose f (CList.value l)
+        let mutable ok = true
+
+        for op in ops do
+            applyListMutation op l model
+
+            if AList.force chosen <> Array.choose f (AList.force (CList.value l)) then
+                ok <- false
+
+        ok
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``incremental law: AList reductions stay correct`` () =
+    let prop (ops: int list) =
+        let l = CList.empty<int>
+        let model = ResizeArray<int>()
+        let total = AList.sum (CList.value l)
+        let evenCount = AList.countBy (fun x -> x % 2 = 0) (CList.value l)
+        let acc = AList.fold (fun s x -> s * 10 + x) 0 (CList.value l)
+        let mutable ok = true
+
+        for op in ops do
+            applyListMutation op l model
+
+            let source = AList.force (CList.value l)
+
+            if
+                AVal.getValue total <> Array.sum source
+                || AVal.getValue evenCount <> (Array.filter (fun x -> x % 2 = 0) source).Length
+                || AVal.getValue acc <> Array.fold (fun s x -> s * 10 + x) 0 source
+            then
+                ok <- false
+
+        ok
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``incremental law: ASet.map and filter stay correct`` () =
+    let prop (ops: int list) =
+        let s = CSet.empty<int>
+        let mapped = ASet.map ((+) 1) (CSet.value s)
+        let filtered = ASet.filter (fun x -> x % 2 = 0) (CSet.value s)
+        let mutable ok = true
+
+        for op in ops do
+            applySetMutation op s
+
+            let source = Set.ofSeq (ASet.toSet (CSet.value s))
+
+            if ASet.toSet mapped <> Set.map ((+) 1) source || ASet.toSet filtered <> Set.filter (fun x -> x % 2 = 0) source then
+                ok <- false
+
+        ok
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``incremental law: ASet union and intersect stay correct`` () =
+    let prop (ops: int list) =
+        let a = CSet.empty<int>
+        let b = CSet.empty<int>
+        let union = ASet.union (CSet.value a) (CSet.value b)
+        let intersect = ASet.intersect (CSet.value a) (CSet.value b)
+        let mutable ok = true
+
+        for op in ops do
+            let kind = op % 3
+            let rest = op / 3
+            let element = rest % 20
+            let which = (rest / 20) % 2
+            let target = if which = 0 then a else b
+
+            match kind with
+            | 0 -> CSet.add element target
+            | 1 -> CSet.remove element target
+            | _ -> () // no-op
+
+            let sourceA = Set.ofSeq (ASet.toSet (CSet.value a))
+            let sourceB = Set.ofSeq (ASet.toSet (CSet.value b))
+
+            if ASet.toSet union <> Set.union sourceA sourceB || ASet.toSet intersect <> Set.intersect sourceA sourceB then
+                ok <- false
+
+        ok
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``incremental law: ASet mapA and count stay correct`` () =
+    let prop (ops: int list) =
+        let s = CSet.empty<int>
+        let mapped = ASet.mapA (fun x -> AVal.constant (x * 2)) (CSet.value s)
+        let count = ASet.count (CSet.value s)
+        let mutable ok = true
+
+        for op in ops do
+            applySetMutation op s
+
+            let source = Set.ofSeq (ASet.toSet (CSet.value s))
+
+            if ASet.toSet mapped <> Set.map ((*) 2) source || AVal.getValue count <> Set.count source then
+                ok <- false
+
+        ok
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``incremental law: ASet sum stays correct`` () =
+    let prop (ops: int list) =
+        let s = CSet.empty<int>
+        let total = ASet.sum (CSet.value s)
+        let mutable ok = true
+
+        for op in ops do
+            applySetMutation op s
+
+            let source = Set.ofSeq (ASet.toSet (CSet.value s))
+
+            if AVal.getValue total <> Seq.sum source then
+                ok <- false
+
+        ok
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``incremental law: AMap mapV and filter stay correct`` () =
+    let prop (ops: int list) =
+        let m = CMap.empty<int, int>
+        let mapped = AMap.mapV ((+) 1) (CMap.value m)
+        let filtered = AMap.filter (fun _ v -> v % 2 = 0) (CMap.value m)
+        let mutable ok = true
+
+        for op in ops do
+            applyMapMutation op m
+
+            let source = AMap.toMap (CMap.value m)
+
+            if
+                AMap.toMap mapped <> Map.map (fun _ v -> v + 1) source
+                || AMap.toMap filtered <> Map.filter (fun _ v -> v % 2 = 0) source
+            then
+                ok <- false
+
+        ok
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``incremental law: AMap keys stay correct`` () =
+    let prop (ops: int list) =
+        let m = CMap.empty<int, int>
+        let keys = AMap.keys (CMap.value m)
+        let mutable ok = true
+
+        for op in ops do
+            applyMapMutation op m
+
+            let source = AMap.toMap (CMap.value m)
+
+            if ASet.toSet keys <> Set.ofSeq (Map.keys source) then
+                ok <- false
+
+        ok
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``incremental law: AMap fold stays correct`` () =
+    let prop (ops: int list) =
+        let m = CMap.empty<int, int>
+        let total = AMap.fold (fun acc _ v -> acc + v) 0 (CMap.value m)
+        let mutable ok = true
+
+        for op in ops do
+            applyMapMutation op m
+
+            let source = AMap.toMap (CMap.value m)
+
+            if AVal.getValue total <> (source |> Map.toSeq |> Seq.sumBy snd) then
+                ok <- false
+
+        ok
+
+    Check.QuickThrowOnFailure prop
+
+// =============================================================================
+// Scalar combinators with a dedicated generator. The scalar layer (map,
+// map2/3/4/N, bind/bind2/bind3) is the foundation of the collections (mapA
+// mappings are avals, tryFind returns an aval); its dynamic behavior must be
+// proven the same way. A typed op generator replaces the int decoding.
+// =============================================================================
+
+/// One scalar write: which input to set and to what value.
+type ScalarOp =
+    | SetInput of inputIndex: int * value: int
+
+/// Generates a sequence of scalar writes over four inputs, values in [0, 100).
+let scalarOpsGen: Gen<ScalarOp list> =
+    Gen.listOf (
+        gen {
+            let! idx = Gen.choose(0, 3)
+            let! value = Gen.choose(0, 99)
+            return SetInput(idx, value)
+        }
+    )
+
+/// The registered arbitrary: FsCheck resolves the property parameter by type.
+type ScalarArbs =
+    static member ScalarOpList() : Arbitrary<ScalarOp list> = Arb.fromGen scalarOpsGen
+
+let private scalarConfig = Config.Quick.WithArbitrary([| typeof<ScalarArbs> |])
+
+[<Fact>]
+let ``scalar map tracks its input`` () =
+    let prop (ops: ScalarOp list) =
+        let inputs = [| CVal.create 0; CVal.create 0; CVal.create 0; CVal.create 0 |]
+        let derived = AVal.map (fun x -> x * 2 + 1) (CVal.value inputs[0])
+        let model = [| 0; 0; 0; 0 |]
+        let mutable ok = true
+
+        for op in ops do
+            match op with
+            | SetInput(i, v) ->
+                CVal.set v inputs[i]
+                model[i] <- v
+
+            if AVal.getValue derived <> model[0] * 2 + 1 then
+                ok <- false
+
+        ok
+
+    Check.One (scalarConfig, prop)
+
+[<Fact>]
+let ``scalar map2 tracks its inputs`` () =
+    let prop (ops: ScalarOp list) =
+        let inputs = [| CVal.create 0; CVal.create 0; CVal.create 0; CVal.create 0 |]
+        let derived = AVal.map2 (fun x y -> x * 10 + y) (CVal.value inputs[0]) (CVal.value inputs[1])
+        let model = [| 0; 0; 0; 0 |]
+        let mutable ok = true
+
+        for op in ops do
+            match op with
+            | SetInput(i, v) ->
+                CVal.set v inputs[i]
+                model[i] <- v
+
+            if AVal.getValue derived <> model[0] * 10 + model[1] then
+                ok <- false
+
+        ok
+
+    Check.One (scalarConfig, prop)
+
+[<Fact>]
+let ``scalar map3 tracks its inputs`` () =
+    let prop (ops: ScalarOp list) =
+        let inputs = [| CVal.create 0; CVal.create 0; CVal.create 0; CVal.create 0 |]
+
+        let derived =
+            AVal.map3
+                (fun x y z -> x * 100 + y * 10 + z)
+                (CVal.value inputs[0])
+                (CVal.value inputs[1])
+                (CVal.value inputs[2])
+
+        let model = [| 0; 0; 0; 0 |]
+        let mutable ok = true
+
+        for op in ops do
+            match op with
+            | SetInput(i, v) ->
+                CVal.set v inputs[i]
+                model[i] <- v
+
+            if AVal.getValue derived <> model[0] * 100 + model[1] * 10 + model[2] then
+                ok <- false
+
+        ok
+
+    Check.One (scalarConfig, prop)
+
+[<Fact>]
+let ``scalar map4 tracks its inputs`` () =
+    let prop (ops: ScalarOp list) =
+        let inputs = [| CVal.create 0; CVal.create 0; CVal.create 0; CVal.create 0 |]
+
+        let derived =
+            AVal.map4
+                (fun w x y z -> w * 1000 + x * 100 + y * 10 + z)
+                (CVal.value inputs[0])
+                (CVal.value inputs[1])
+                (CVal.value inputs[2])
+                (CVal.value inputs[3])
+
+        let model = [| 0; 0; 0; 0 |]
+        let mutable ok = true
+
+        for op in ops do
+            match op with
+            | SetInput(i, v) ->
+                CVal.set v inputs[i]
+                model[i] <- v
+
+            if AVal.getValue derived <> model[0] * 1000 + model[1] * 100 + model[2] * 10 + model[3] then
+                ok <- false
+
+        ok
+
+    Check.One (scalarConfig, prop)
+
+[<Fact>]
+let ``scalar mapN tracks its inputs`` () =
+    let prop (ops: ScalarOp list) =
+        let inputs = [| CVal.create 0; CVal.create 0; CVal.create 0; CVal.create 0 |]
+
+        let derived =
+            AVal.mapN
+                (fun (arr: int[]) -> arr[0] * 1000 + arr[1] * 100 + arr[2] * 10 + arr[3])
+                [| CVal.value inputs[0]; CVal.value inputs[1]; CVal.value inputs[2]; CVal.value inputs[3] |]
+
+        let model = [| 0; 0; 0; 0 |]
+        let mutable ok = true
+
+        for op in ops do
+            match op with
+            | SetInput(i, v) ->
+                CVal.set v inputs[i]
+                model[i] <- v
+
+            if AVal.getValue derived <> model[0] * 1000 + model[1] * 100 + model[2] * 10 + model[3] then
+                ok <- false
+
+        ok
+
+    Check.One (scalarConfig, prop)
+
+[<Fact>]
+let ``scalar bind tracks its input and its inner`` () =
+    let prop (ops: ScalarOp list) =
+        let inputs = [| CVal.create 0; CVal.create 0; CVal.create 0; CVal.create 0 |]
+
+        // The inner aval reads input 1; the bind's value (input 0) swaps it.
+        let derived =
+            AVal.bind
+                (fun x -> AVal.map (fun y -> x * 10 + y) (CVal.value inputs[1]))
+                (CVal.value inputs[0])
+
+        let model = [| 0; 0; 0; 0 |]
+        let mutable ok = true
+
+        for op in ops do
+            match op with
+            | SetInput(i, v) ->
+                CVal.set v inputs[i]
+                model[i] <- v
+
+            if AVal.getValue derived <> model[0] * 10 + model[1] then
+                ok <- false
+
+        ok
+
+    Check.One (scalarConfig, prop)
+
+[<Fact>]
+let ``scalar bind2 tracks its inputs and its inner`` () =
+    let prop (ops: ScalarOp list) =
+        let inputs = [| CVal.create 0; CVal.create 0; CVal.create 0; CVal.create 0 |]
+
+        // The inner aval reads input 2; the bind's values (inputs 0, 1) swap it.
+        let derived =
+            AVal.bind2
+                (fun x y -> AVal.map (fun z -> x * 100 + y * 10 + z) (CVal.value inputs[2]))
+                (CVal.value inputs[0])
+                (CVal.value inputs[1])
+
+        let model = [| 0; 0; 0; 0 |]
+        let mutable ok = true
+
+        for op in ops do
+            match op with
+            | SetInput(i, v) ->
+                CVal.set v inputs[i]
+                model[i] <- v
+
+            if AVal.getValue derived <> model[0] * 100 + model[1] * 10 + model[2] then
+                ok <- false
+
+        ok
+
+    Check.One (scalarConfig, prop)
+
+[<Fact>]
+let ``scalar bind3 tracks its inputs and its inner`` () =
+    let prop (ops: ScalarOp list) =
+        let inputs = [| CVal.create 0; CVal.create 0; CVal.create 0; CVal.create 0 |]
+
+        // The inner aval reads input 3; the bind's values (inputs 0, 1, 2) swap it.
+        let derived =
+            AVal.bind3
+                (fun x y z -> AVal.map (fun w -> x * 1000 + y * 100 + z * 10 + w) (CVal.value inputs[3]))
+                (CVal.value inputs[0])
+                (CVal.value inputs[1])
+                (CVal.value inputs[2])
+
+        let model = [| 0; 0; 0; 0 |]
+        let mutable ok = true
+
+        for op in ops do
+            match op with
+            | SetInput(i, v) ->
+                CVal.set v inputs[i]
+                model[i] <- v
+
+            if AVal.getValue derived <> model[0] * 1000 + model[1] * 100 + model[2] * 10 + model[3] then
+                ok <- false
+
+        ok
+
+    Check.One (scalarConfig, prop)
 
 // =============================================================================
 // Reference-impl model: ASet.mapA (MAPA-DESIGN §12).
@@ -786,12 +1717,14 @@ let ``physics cache refresh matches a fresh computation`` () =
             let computed = Dictionary<int, float>()
 
             for id in members do
+                let mutable p = 0.0
+                pos.TryGetValue(id, &p) |> ignore
                 let mutable v = 0.0
 
                 if vel.TryGetValue(id, &v) then
-                    computed[id] <- pos[id] + v * dt
+                    computed[id] <- p + v * dt
                 else
-                    computed[id] <- pos[id]
+                    computed[id] <- p
 
             computed
 
@@ -800,18 +1733,20 @@ let ``physics cache refresh matches a fresh computation`` () =
             let computed = Dictionary<int, float>()
 
             for id in modelMembers do
+                let mutable p = 0.0
+                modelPos.TryGetValue(id, &p) |> ignore
                 let mutable v = 0.0
 
                 if modelVel.TryGetValue(id, &v) then
-                    computed[id] <- modelPos[id] + v * dt
+                    computed[id] <- p + v * dt
                 else
-                    computed[id] <- modelPos[id]
+                    computed[id] <- p
 
             computed
 
         let apply (op: int) =
-            let kind = op % 3
-            let rest = op / 3
+            let kind = op % 5
+            let rest = op / 5
             let id = rest % 10
             let value = float ((rest / 10) % 100)
 
@@ -824,9 +1759,15 @@ let ``physics cache refresh matches a fresh computation`` () =
             | 1 -> // Upsert the velocity.
                 CMap.addOrUpdate id value velocities
                 modelVel[id] <- value
-            | _ -> // Remove the entity from the scenario.
+            | 2 -> // Remove the entity from the scenario.
                 CSet.remove id inScenario
                 modelMembers.Remove id |> ignore
+            | 3 -> // Remove the position (the entity keeps its velocity).
+                CMap.remove id positions
+                modelPos.Remove id |> ignore
+            | _ -> // Remove the velocity.
+                CMap.remove id velocities
+                modelVel.Remove id |> ignore
 
         let mutable ok = true
 
@@ -886,12 +1827,14 @@ let ``physics cache snapshot agrees with the adaptive derivation`` () =
             let computed = Dictionary<int, float>()
 
             for id in members do
+                let mutable p = 0.0
+                pos.TryGetValue(id, &p) |> ignore
                 let mutable v = 0.0
 
                 if vel.TryGetValue(id, &v) then
-                    computed[id] <- pos[id] + v * dt
+                    computed[id] <- p + v * dt
                 else
-                    computed[id] <- pos[id]
+                    computed[id] <- p
 
             computed
 
@@ -900,18 +1843,20 @@ let ``physics cache snapshot agrees with the adaptive derivation`` () =
             let computed = Dictionary<int, float>()
 
             for id in modelMembers do
+                let mutable p = 0.0
+                modelPos.TryGetValue(id, &p) |> ignore
                 let mutable v = 0.0
 
                 if modelVel.TryGetValue(id, &v) then
-                    computed[id] <- modelPos[id] + v * dt
+                    computed[id] <- p + v * dt
                 else
-                    computed[id] <- modelPos[id]
+                    computed[id] <- p
 
             computed
 
         let apply (op: int) =
-            let kind = op % 3
-            let rest = op / 3
+            let kind = op % 5
+            let rest = op / 5
             let id = rest % 10
             let value = float ((rest / 10) % 100)
 
@@ -924,9 +1869,15 @@ let ``physics cache snapshot agrees with the adaptive derivation`` () =
             | 1 -> // Upsert the velocity.
                 CMap.addOrUpdate id value velocities
                 modelVel[id] <- value
-            | _ -> // Remove the entity from the scenario.
+            | 2 -> // Remove the entity from the scenario.
                 CSet.remove id inScenario
                 modelMembers.Remove id |> ignore
+            | 3 -> // Remove the position (the entity keeps its velocity).
+                CMap.remove id positions
+                modelPos.Remove id |> ignore
+            | _ -> // Remove the velocity.
+                CMap.remove id velocities
+                modelVel.Remove id |> ignore
 
         let mutable ok = true
 
@@ -1105,6 +2056,744 @@ let ``AList choose matches the combat-status model`` () =
             let expected = Array.ofSeq (Seq.choose effectKindToStatus model)
 
             if actual <> expected then
+                ok <- false
+
+        ok
+
+    Check.QuickThrowOnFailure prop
+
+// =============================================================================
+// Gap coverage: transactions, the external nodes, the AList positional and
+// reduction families, bind/concat, mapiA positions, and physics removals.
+// =============================================================================
+
+[<Fact>]
+let ``Transaction.run defers application until commit`` () =
+    let prop (ops: int list) =
+        let m = CMap.empty<int, int>
+        let model = Dictionary<int, int>()
+
+        let apply (op: int) =
+            let kind = op % 2
+            let rest = op / 2
+            let key = rest % 10
+            let value = (rest / 10) % 100
+            let key2 = (key + 5) % 10
+
+            // The state visible inside the transaction is the PRE state.
+            let expectedPre = Map.ofSeq (seq { for KeyValue(k, v) in model -> k, v })
+
+            let actualPre =
+                Transaction.run (fun () ->
+                    match kind with
+                    | 0 -> // Batch: two upserts.
+                        CMap.addOrUpdate key value m
+                        CMap.addOrUpdate key2 (value + 1) m
+                    | _ -> // Batch: an upsert and a remove.
+                        CMap.addOrUpdate key value m
+                        CMap.remove key2 m
+
+                    AMap.toMap (CMap.value m))
+
+            match kind with
+            | 0 ->
+                model[key] <- value
+                model[key2] <- value + 1
+            | _ ->
+                model[key] <- value
+                model.Remove key2 |> ignore
+
+            let expectedPost = Map.ofSeq (seq { for KeyValue(k, v) in model -> k, v })
+            let actualPost = AMap.toMap (CMap.value m)
+            actualPre = expectedPre && actualPost = expectedPost
+
+        let mutable ok = true
+
+        for op in ops do
+            if not (apply op) then
+                ok <- false
+
+        ok
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``AMap ofExternal matches the reference model`` () =
+    let prop (ops: int list) =
+        let mutable snapshot = Map.empty<int, int>
+
+        let ext, invalidate =
+            AMap.ofExternal (fun () -> snapshot :> IReadOnlyDictionary<int, int>)
+
+        // Model: whether an invalidate is pending, and the last read snapshot.
+        let mutable dirty = true
+        let mutable lastSeen = Map.empty<int, int>
+
+        let apply (op: int) =
+            let kind = op % 2
+            let rest = op / 2
+            let key = rest % 10
+            let value = (rest / 10) % 100
+
+            match kind with
+            | 0 -> // Replace the external snapshot.
+                snapshot <- Map.ofList [ key, value ]
+
+                if key % 4 = 0 then
+                    snapshot <- Map.add ((key + 1) % 10) (value + 1) snapshot
+            | _ -> // Invalidate: the next read re-reads the snapshot.
+                invalidate ()
+                dirty <- true
+
+            let expected = if dirty then snapshot else lastSeen
+            let actual = AMap.toMap ext
+
+            if actual <> expected then
+                false
+            else
+                dirty <- false
+                lastSeen <- expected
+                true
+
+        let mutable ok = true
+
+        for op in ops do
+            if not (apply op) then
+                ok <- false
+
+        ok
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``AList ofExternal matches the reference model`` () =
+    let prop (ops: int list) =
+        let mutable snapshot: int list = []
+
+        let ext, invalidate =
+            AList.ofExternal (fun () -> snapshot :> IReadOnlyList<int>)
+
+        // Model: whether an invalidate is pending, and the last read snapshot.
+        let mutable dirty = true
+        let mutable lastSeen: int[] = [||]
+
+        let apply (op: int) =
+            let kind = op % 2
+            let rest = op / 2
+            let value = rest % 20
+
+            match kind with
+            | 0 -> // Replace the external snapshot.
+                snapshot <- [ value; value * 2 ]
+            | _ -> // Invalidate: the next read re-reads the snapshot.
+                invalidate ()
+                dirty <- true
+
+            let expected = if dirty then List.toArray snapshot else lastSeen
+            let actual = AList.force ext
+
+            if actual <> expected then
+                false
+            else
+                dirty <- false
+                lastSeen <- expected
+                true
+
+        let mutable ok = true
+
+        for op in ops do
+            if not (apply op) then
+                ok <- false
+
+        ok
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``AList take matches the model`` () =
+    let prop (ops: int list) =
+        let l = CList.empty<int>
+        let model = ResizeArray<int>()
+        let count = List.length ops % 5
+        let taken = AList.take count (CList.value l)
+
+        let apply (op: int) =
+            let kind = op % 3
+            let rest = op / 3
+            let element = rest % 10
+
+            let position =
+                let p = (rest / 10) % (model.Count + 1)
+                if p < 0 then p + (model.Count + 1) else p
+
+            match kind with
+            | 0 ->
+                CList.insertAt position element l
+                model.Insert(position, element)
+            | 1 ->
+                if model.Count > 0 && position < model.Count then
+                    CList.removeAt position l
+                    model.RemoveAt position
+            | _ ->
+                if model.Count > 0 && position < model.Count then
+                    CList.updateAt position element l
+                    model[position] <- element
+
+            let expected = Array.ofSeq (Seq.truncate count model)
+            AList.force taken = expected
+
+        let mutable ok = true
+
+        for op in ops do
+            if not (apply op) then
+                ok <- false
+
+        ok
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``AList skip matches the model`` () =
+    let prop (ops: int list) =
+        let l = CList.empty<int>
+        let model = ResizeArray<int>()
+        let count = List.length ops % 5
+        let skipped = AList.skip count (CList.value l)
+
+        let apply (op: int) =
+            let kind = op % 3
+            let rest = op / 3
+            let element = rest % 10
+
+            let position =
+                let p = (rest / 10) % (model.Count + 1)
+                if p < 0 then p + (model.Count + 1) else p
+
+            match kind with
+            | 0 ->
+                CList.insertAt position element l
+                model.Insert(position, element)
+            | 1 ->
+                if model.Count > 0 && position < model.Count then
+                    CList.removeAt position l
+                    model.RemoveAt position
+            | _ ->
+                if model.Count > 0 && position < model.Count then
+                    CList.updateAt position element l
+                    model[position] <- element
+
+            let expected =
+                if model.Count <= count then [||]
+                else Array.ofSeq (Seq.skip count model)
+
+            AList.force skipped = expected
+
+        let mutable ok = true
+
+        for op in ops do
+            if not (apply op) then
+                ok <- false
+
+        ok
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``AList sub matches the model`` () =
+    let prop (ops: int list) =
+        let l = CList.empty<int>
+        let model = ResizeArray<int>()
+        let offset = List.length ops % 3
+        let count = List.length ops % 5
+        let sliced = AList.sub offset count (CList.value l)
+
+        let apply (op: int) =
+            let kind = op % 3
+            let rest = op / 3
+            let element = rest % 10
+
+            let position =
+                let p = (rest / 10) % (model.Count + 1)
+                if p < 0 then p + (model.Count + 1) else p
+
+            match kind with
+            | 0 ->
+                CList.insertAt position element l
+                model.Insert(position, element)
+            | 1 ->
+                if model.Count > 0 && position < model.Count then
+                    CList.removeAt position l
+                    model.RemoveAt position
+            | _ ->
+                if model.Count > 0 && position < model.Count then
+                    CList.updateAt position element l
+                    model[position] <- element
+
+            let expected =
+                let from = min offset model.Count
+                let take = max 0 (min count (model.Count - from))
+                Array.ofSeq (Seq.skip from model |> Seq.truncate take)
+
+            AList.force sliced = expected
+
+        let mutable ok = true
+
+        for op in ops do
+            if not (apply op) then
+                ok <- false
+
+        ok
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``AList sort matches the model`` () =
+    let prop (ops: int list) =
+        let l = CList.empty<int>
+        let model = ResizeArray<int>()
+        let sorted = AList.sort (CList.value l)
+
+        let apply (op: int) =
+            let kind = op % 3
+            let rest = op / 3
+            let element = rest % 10
+
+            let position =
+                let p = (rest / 10) % (model.Count + 1)
+                if p < 0 then p + (model.Count + 1) else p
+
+            match kind with
+            | 0 ->
+                CList.insertAt position element l
+                model.Insert(position, element)
+            | 1 ->
+                if model.Count > 0 && position < model.Count then
+                    CList.removeAt position l
+                    model.RemoveAt position
+            | _ ->
+                if model.Count > 0 && position < model.Count then
+                    CList.updateAt position element l
+                    model[position] <- element
+
+            let expected = model |> Seq.sort |> Array.ofSeq
+            AList.force sorted = expected
+
+        let mutable ok = true
+
+        for op in ops do
+            if not (apply op) then
+                ok <- false
+
+        ok
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``AList rev matches the model`` () =
+    let prop (ops: int list) =
+        let l = CList.empty<int>
+        let model = ResizeArray<int>()
+        let reversed = AList.rev (CList.value l)
+
+        let apply (op: int) =
+            let kind = op % 3
+            let rest = op / 3
+            let element = rest % 10
+
+            let position =
+                let p = (rest / 10) % (model.Count + 1)
+                if p < 0 then p + (model.Count + 1) else p
+
+            match kind with
+            | 0 ->
+                CList.insertAt position element l
+                model.Insert(position, element)
+            | 1 ->
+                if model.Count > 0 && position < model.Count then
+                    CList.removeAt position l
+                    model.RemoveAt position
+            | _ ->
+                if model.Count > 0 && position < model.Count then
+                    CList.updateAt position element l
+                    model[position] <- element
+
+            let expected = model |> Seq.rev |> Array.ofSeq
+            AList.force reversed = expected
+
+        let mutable ok = true
+
+        for op in ops do
+            if not (apply op) then
+                ok <- false
+
+        ok
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``AList pairwise matches the model`` () =
+    let prop (ops: int list) =
+        let l = CList.empty<int>
+        let model = ResizeArray<int>()
+        let pairs = AList.pairwise (CList.value l)
+
+        let apply (op: int) =
+            let kind = op % 3
+            let rest = op / 3
+            let element = rest % 10
+
+            let position =
+                let p = (rest / 10) % (model.Count + 1)
+                if p < 0 then p + (model.Count + 1) else p
+
+            match kind with
+            | 0 ->
+                CList.insertAt position element l
+                model.Insert(position, element)
+            | 1 ->
+                if model.Count > 0 && position < model.Count then
+                    CList.removeAt position l
+                    model.RemoveAt position
+            | _ ->
+                if model.Count > 0 && position < model.Count then
+                    CList.updateAt position element l
+                    model[position] <- element
+
+            let expected =
+                seq {
+                    for i in 0 .. model.Count - 2 do
+                        struct (model[i], model[i + 1])
+                }
+                |> Array.ofSeq
+
+            AList.force pairs = expected
+
+        let mutable ok = true
+
+        for op in ops do
+            if not (apply op) then
+                ok <- false
+
+        ok
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``AList sum matches the model`` () =
+    let prop (ops: int list) =
+        let l = CList.empty<int>
+        let model = ResizeArray<int>()
+        let total = AList.sum (CList.value l)
+
+        let apply (op: int) =
+            let kind = op % 3
+            let rest = op / 3
+            let element = rest % 10
+
+            let position =
+                let p = (rest / 10) % (model.Count + 1)
+                if p < 0 then p + (model.Count + 1) else p
+
+            match kind with
+            | 0 ->
+                CList.insertAt position element l
+                model.Insert(position, element)
+            | 1 ->
+                if model.Count > 0 && position < model.Count then
+                    CList.removeAt position l
+                    model.RemoveAt position
+            | _ ->
+                if model.Count > 0 && position < model.Count then
+                    CList.updateAt position element l
+                    model[position] <- element
+
+            AVal.getValue total = Seq.sum model
+
+        let mutable ok = true
+
+        for op in ops do
+            if not (apply op) then
+                ok <- false
+
+        ok
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``AList countBy matches the model`` () =
+    let prop (ops: int list) =
+        let l = CList.empty<int>
+        let model = ResizeArray<int>()
+        let evenCount = AList.countBy (fun x -> x % 2 = 0) (CList.value l)
+
+        let apply (op: int) =
+            let kind = op % 3
+            let rest = op / 3
+            let element = rest % 10
+
+            let position =
+                let p = (rest / 10) % (model.Count + 1)
+                if p < 0 then p + (model.Count + 1) else p
+
+            match kind with
+            | 0 ->
+                CList.insertAt position element l
+                model.Insert(position, element)
+            | 1 ->
+                if model.Count > 0 && position < model.Count then
+                    CList.removeAt position l
+                    model.RemoveAt position
+            | _ ->
+                if model.Count > 0 && position < model.Count then
+                    CList.updateAt position element l
+                    model[position] <- element
+
+            AVal.getValue evenCount = (model |> Seq.filter (fun x -> x % 2 = 0) |> Seq.length)
+
+        let mutable ok = true
+
+        for op in ops do
+            if not (apply op) then
+                ok <- false
+
+        ok
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``AList tryMin and tryMax match the model`` () =
+    let prop (ops: int list) =
+        let l = CList.empty<int>
+        let model = ResizeArray<int>()
+        let mn = AList.tryMin (CList.value l)
+        let mx = AList.tryMax (CList.value l)
+
+        let apply (op: int) =
+            let kind = op % 3
+            let rest = op / 3
+            let element = rest % 10
+
+            let position =
+                let p = (rest / 10) % (model.Count + 1)
+                if p < 0 then p + (model.Count + 1) else p
+
+            match kind with
+            | 0 ->
+                CList.insertAt position element l
+                model.Insert(position, element)
+            | 1 ->
+                if model.Count > 0 && position < model.Count then
+                    CList.removeAt position l
+                    model.RemoveAt position
+            | _ ->
+                if model.Count > 0 && position < model.Count then
+                    CList.updateAt position element l
+                    model[position] <- element
+
+            let expectedMin = if model.Count = 0 then ValueNone else ValueSome(Seq.min model)
+            let expectedMax = if model.Count = 0 then ValueNone else ValueSome(Seq.max model)
+            AVal.getValue mn = expectedMin && AVal.getValue mx = expectedMax
+
+        let mutable ok = true
+
+        for op in ops do
+            if not (apply op) then
+                ok <- false
+
+        ok
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``AList fold matches the model`` () =
+    let prop (ops: int list) =
+        let l = CList.empty<int>
+        let model = ResizeArray<int>()
+        let acc = AList.fold (fun s x -> s * 10 + x) 0 (CList.value l)
+
+        let apply (op: int) =
+            let kind = op % 3
+            let rest = op / 3
+            let element = rest % 10
+
+            let position =
+                let p = (rest / 10) % (model.Count + 1)
+                if p < 0 then p + (model.Count + 1) else p
+
+            match kind with
+            | 0 ->
+                CList.insertAt position element l
+                model.Insert(position, element)
+            | 1 ->
+                if model.Count > 0 && position < model.Count then
+                    CList.removeAt position l
+                    model.RemoveAt position
+            | _ ->
+                if model.Count > 0 && position < model.Count then
+                    CList.updateAt position element l
+                    model[position] <- element
+
+            let expected = model |> Seq.fold (fun s x -> s * 10 + x) 0
+            AVal.getValue acc = expected
+
+        let mutable ok = true
+
+        for op in ops do
+            if not (apply op) then
+                ok <- false
+
+        ok
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``AList bind matches the model`` () =
+    let prop (ops: int list) =
+        let l1 = CList.empty<int>
+        let l2 = CList.empty<int>
+        let selector = CVal.create 0
+        let model1 = ResizeArray<int>()
+        let model2 = ResizeArray<int>()
+
+        // The bind switches the whole output when the selector aval changes.
+        let bound =
+            AList.bind
+                (fun n -> if n = 0 then CList.value l1 else CList.value l2)
+                (CVal.value selector)
+
+        let apply (op: int) =
+            let kind = op % 4
+            let rest = op / 4
+            let element = rest % 10
+            let which = (rest / 10) % 2
+            let target = if which = 0 then l1 else l2
+            let model = if which = 0 then model1 else model2
+
+            let position =
+                let p = (rest / 100) % (model.Count + 1)
+                if p < 0 then p + (model.Count + 1) else p
+
+            match kind with
+            | 0 ->
+                CList.insertAt position element target
+                model.Insert(position, element)
+            | 1 ->
+                if model.Count > 0 && position < model.Count then
+                    CList.removeAt position target
+                    model.RemoveAt position
+            | 2 ->
+                if model.Count > 0 && position < model.Count then
+                    CList.updateAt position element target
+                    model[position] <- element
+            | _ -> // Switch the selector.
+                CVal.set (if which = 0 then 0 else 1) selector
+
+            let expected =
+                if AVal.getValue (CVal.value selector) = 0 then
+                    Array.ofSeq model1
+                else
+                    Array.ofSeq model2
+
+            AList.force bound = expected
+
+        let mutable ok = true
+
+        for op in ops do
+            if not (apply op) then
+                ok <- false
+
+        ok
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``AList concat matches the model`` () =
+    let prop (ops: int list) =
+        let l1 = CList.empty<int>
+        let l2 = CList.empty<int>
+        let model1 = ResizeArray<int>()
+        let model2 = ResizeArray<int>()
+        let concat = AList.concat [ CList.value l1; CList.value l2 ]
+
+        let apply (op: int) =
+            let kind = op % 3
+            let rest = op / 3
+            let element = rest % 10
+            let which = (rest / 10) % 2
+            let target = if which = 0 then l1 else l2
+            let model = if which = 0 then model1 else model2
+
+            let position =
+                let p = (rest / 100) % (model.Count + 1)
+                if p < 0 then p + (model.Count + 1) else p
+
+            match kind with
+            | 0 ->
+                CList.insertAt position element target
+                model.Insert(position, element)
+            | 1 ->
+                if model.Count > 0 && position < model.Count then
+                    CList.removeAt position target
+                    model.RemoveAt position
+            | _ ->
+                if model.Count > 0 && position < model.Count then
+                    CList.updateAt position element target
+                    model[position] <- element
+
+            let expected = Array.ofSeq (Seq.append model1 model2)
+            AList.force concat = expected
+
+        let mutable ok = true
+
+        for op in ops do
+            if not (apply op) then
+                ok <- false
+
+        ok
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``AList mapiA passes the mapping-time position`` () =
+    let prop (ops: int list) =
+        let l = CList.empty<int>
+        // The mapping encodes the position it was invoked with into the value.
+        let mapped = AList.mapiA (fun i v -> AVal.constant (v * 100 + i)) (CList.value l)
+        // Model: element -> the position its mapping ran at (positions stick).
+        let model = ResizeArray<struct (int * int)>()
+
+        let apply (op: int) =
+            let kind = op % 3
+            let rest = op / 3
+            let element = rest % 10
+
+            let position =
+                let p = (rest / 10) % (model.Count + 1)
+                if p < 0 then p + (model.Count + 1) else p
+
+            match kind with
+            | 0 ->
+                CList.insertAt position element l
+                model.Insert(position, struct (element, position))
+            | 1 ->
+                if model.Count > 0 && position < model.Count then
+                    CList.removeAt position l
+                    model.RemoveAt position
+            | _ -> // Update: equal values are a no-op (no re-map, the position sticks).
+                if model.Count > 0 && position < model.Count then
+                    let struct (oldE, _) = model[position]
+
+                    if oldE <> element then
+                        CList.updateAt position element l
+                        model[position] <- struct (element, position)
+
+            let expected = model |> Seq.map (fun struct (e, i) -> e * 100 + i) |> Array.ofSeq
+            AList.force mapped = expected
+
+        let mutable ok = true
+
+        for op in ops do
+            if not (apply op) then
                 ok <- false
 
         ok

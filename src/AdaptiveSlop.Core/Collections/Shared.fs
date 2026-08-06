@@ -1485,11 +1485,31 @@ module internal Collections =
         if not wasActive then
             ctx.DeliverNotifications()
 
+    /// <summary>
+    /// The concrete HashSet view of a set node when available (the hot path,
+    /// zero allocation); constant nodes hold FrozenSets, so a foreign view is
+    /// materialized once.
+    /// </summary>
+    let inline asHashSet (view: IReadOnlySet<'T>) =
+        match view with
+        | :? HashSet<'T> as h -> h
+        | other -> HashSet<'T>(other)
+
+    /// <summary>
+    /// The concrete Dictionary view of a map node when available (the hot
+    /// path, zero allocation); constant nodes hold FrozenDictionaries, so a
+    /// foreign view is materialized once.
+    /// </summary>
+    let inline asDictionary (view: IReadOnlyDictionary<'K, 'V>) =
+        match view with
+        | :? Dictionary<'K, 'V> as d -> d
+        | other -> Dictionary<'K, 'V>(other)
+
     /// <summary>Initial load of a two-source set node: build the state from both source views.</summary>
     let loadTwoSet (op: TwoSetOp) (left: IAdaptiveSet<'T>) (right: IAdaptiveSet<'T>) (state: TwoSetState<'T> byref) =
-        // The views are always HashSets in this implementation; interface
+        // The views are HashSets in this implementation; interface
         // iteration would box the enumerator (measured 40 B per element).
-        let leftView = left.GetValue() :?> HashSet<'T>
+        let leftView = asHashSet (left.GetValue())
 
         for x in leftView do
             let struct (set2, _) = refAdd state.Left x
@@ -1500,7 +1520,7 @@ module internal Collections =
             | Xor -> state.Out.Add x |> ignore
             | Intersect -> () // the right loop seeds the intersection
 
-        let rightView = right.GetValue() :?> HashSet<'T>
+        let rightView = asHashSet (right.GetValue())
 
         for x in rightView do
             let struct (set2, _) = refAdd state.Right x
@@ -2173,10 +2193,10 @@ module internal Collections =
                     // sees only deltas that follow this point in time.
                     let view = inner.GetValue()
                     let mutable entry = CollectEntry<'U>(inner)
-                    // The view is always a HashSet in this implementation; an
+                    // The view is a HashSet in this implementation; an
                     // interface iteration would box the enumerator (measured
                     // 40 B per element).
-                    let data = view :?> HashSet<'U>
+                    let data = asHashSet view
 
                     for u in data do
                         if not (s.Scratch.ContainsKey u) then
