@@ -59,7 +59,8 @@ let ``FsCheck smoke: reverse is involutive`` () =
 let ``FsCheck smoke: ASet roundtrip`` () =
     let roundtrip (xs: int list) =
         let s = CSet.ofSeq xs
-        Set.ofSeq (ASet.force (CSet.value s)) = Set.ofList xs
+        let actual = s |> CSet.value |> ASet.toSet
+        actual = Set.ofList xs
 
     Check.QuickThrowOnFailure roundtrip
 
@@ -71,7 +72,8 @@ let ``FsCheck smoke: AList append builds the sequence`` () =
         for x in xs do
             CList.append x l
 
-        AList.force (CList.value l) = List.toArray xs
+        let actual = l |> CList.value |> AList.toList
+        actual = xs
 
     Check.QuickThrowOnFailure builds
 
@@ -84,32 +86,45 @@ let ``FsCheck smoke: AList append builds the sequence`` () =
 [<Fact>]
 let ``law: AList.map preserves the mapped content`` () =
     let law (xs: int list) =
-        AList.force (AList.map ((+) 1) (AList.ofSeq xs)) = Array.map ((+) 1) (List.toArray xs)
+        let actual = xs |> AList.ofSeq |> AList.map ((+) 1) |> AList.force |> List.ofArray
+
+        let expected = xs |> List.map ((+) 1)
+        actual = expected
 
     Check.QuickThrowOnFailure law
 
 [<Fact>]
 let ``law: AList.append concatenates`` () =
     let law (a: int list, b: int list) =
-        AList.force (AList.append (AList.ofSeq a) (AList.ofSeq b)) = Array.append (List.toArray a) (List.toArray b)
+        let actual =
+            (AList.ofSeq a, AList.ofSeq b) ||> AList.append |> AList.force |> List.ofArray
+
+        let expected = a @ b
+        actual = expected
 
     Check.QuickThrowOnFailure law
 
 [<Fact>]
 let ``law: AList.rev reverses and is involutive`` () =
     let law (xs: int list) =
-        let reversed = AList.force (AList.rev (AList.ofSeq xs))
-        let twice = AList.force (AList.rev (AList.rev (AList.ofSeq xs)))
-        reversed = Array.rev (List.toArray xs) && twice = List.toArray xs
+        let reversed = xs |> AList.ofSeq |> AList.rev |> AList.force |> List.ofArray
+
+        let twice =
+            xs |> AList.ofSeq |> AList.rev |> AList.rev |> AList.force |> List.ofArray
+
+        reversed = List.rev xs && twice = xs
 
     Check.QuickThrowOnFailure law
 
 [<Fact>]
 let ``law: AList.sort sorts and is idempotent`` () =
     let law (xs: int list) =
-        let sorted = AList.force (AList.sort (AList.ofSeq xs))
-        let twice = AList.force (AList.sort (AList.sort (AList.ofSeq xs)))
-        sorted = Array.sort (List.toArray xs) && twice = sorted
+        let sorted = xs |> AList.ofSeq |> AList.sort |> AList.force |> List.ofArray
+
+        let twice =
+            xs |> AList.ofSeq |> AList.sort |> AList.sort |> AList.force |> List.ofArray
+
+        sorted = List.sort xs && twice = sorted
 
     Check.QuickThrowOnFailure law
 
@@ -117,7 +132,11 @@ let ``law: AList.sort sorts and is idempotent`` () =
 let ``law: AList.take truncates`` () =
     let law (n: int, xs: int list) =
         let count = abs n % (List.length xs + 1)
-        AList.force (AList.take count (AList.ofSeq xs)) = Array.truncate count (List.toArray xs)
+
+        let actual = xs |> AList.ofSeq |> AList.take count |> AList.force |> List.ofArray
+
+        let expected = xs |> List.truncate count
+        actual = expected
 
     Check.QuickThrowOnFailure law
 
@@ -126,11 +145,15 @@ let ``law: AList.skip skips and clamps`` () =
     let law (n: int, xs: int list) =
         let count = abs n % (List.length xs + 2)
 
-        let expected =
-            if count >= List.length xs then [||]
-            else Array.skip count (List.toArray xs)
+        let actual = xs |> AList.ofSeq |> AList.skip count |> AList.force |> List.ofArray
 
-        AList.force (AList.skip count (AList.ofSeq xs)) = expected
+        let expected =
+            if count >= List.length xs then
+                []
+            else
+                xs |> List.skip count
+
+        actual = expected
 
     Check.QuickThrowOnFailure law
 
@@ -141,85 +164,136 @@ let ``law: AList.sub slices`` () =
         let offset = abs o % (len + 1)
         let count = abs c % (len + 2)
 
+        let actual =
+            xs |> AList.ofSeq |> AList.sub offset count |> AList.force |> List.ofArray
+
         let expected =
             let from = min offset len
             let take = max 0 (min count (len - from))
-            Array.sub (List.toArray xs) from take
+            xs |> List.skip from |> List.truncate take
 
-        AList.force (AList.sub offset count (AList.ofSeq xs)) = expected
+        actual = expected
 
     Check.QuickThrowOnFailure law
 
 [<Fact>]
 let ``law: AList.pairwise pairs adjacent elements`` () =
     let law (xs: int list) =
-        let arr = List.toArray xs
+        let actual = xs |> AList.ofSeq |> AList.pairwise |> AList.force |> List.ofArray
 
-        let expected =
-            seq {
-                for i in 0 .. arr.Length - 2 do
-                    struct (arr[i], arr[i + 1])
-            }
-            |> Array.ofSeq
+        let expected = xs |> List.pairwise |> List.map (fun (a, b) -> struct (a, b))
 
-        AList.force (AList.pairwise (AList.ofSeq xs)) = expected
+        actual = expected
 
     Check.QuickThrowOnFailure law
 
 [<Fact>]
 let ``law: AList.concat flattens`` () =
     let law (xss: int list list) =
-        AList.force (AList.concat (List.map AList.ofSeq xss)) = Array.concat (List.map List.toArray xss)
+        let actual =
+            xss |> List.map AList.ofSeq |> AList.concat |> AList.force |> List.ofArray
+
+        let expected = xss |> List.concat
+        actual = expected
 
     Check.QuickThrowOnFailure law
 
 [<Fact>]
 let ``law: AList.choose selects`` () =
     let law (xs: int list) =
-        let f x = if x % 2 = 0 then Some(x * 10) else None
-        AList.force (AList.choose f (AList.ofSeq xs)) = Array.choose f (List.toArray xs)
+        let f x =
+            if x % 2 = 0 then Some(x * 10) else None
+
+        let actual = xs |> AList.ofSeq |> AList.choose f |> AList.force |> List.ofArray
+
+        let expected = xs |> List.choose f
+        actual = expected
 
     Check.QuickThrowOnFailure law
 
 [<Fact>]
 let ``law: AList.indexed pairs positions`` () =
     let law (xs: int list) =
-        AList.force (AList.indexed (AList.ofSeq xs)) = Array.mapi (fun i x -> struct (i, x)) (List.toArray xs)
+        let actual = xs |> AList.ofSeq |> AList.indexed |> AList.force |> List.ofArray
+
+        let expected = xs |> List.indexed |> List.map (fun (i, x) -> struct (i, x))
+
+        actual = expected
 
     Check.QuickThrowOnFailure law
 
 [<Fact>]
 let ``law: AList.mapA with constants maps`` () =
     let law (xs: int list) =
-        AList.force (AList.mapA (fun x -> AVal.constant (x * 2)) (AList.ofSeq xs)) = Array.map ((*) 2) (List.toArray xs)
+        let actual =
+            xs
+            |> AList.ofSeq
+            |> AList.mapA (fun x -> AVal.constant (x * 2))
+            |> AList.force
+            |> List.ofArray
+
+        let expected = xs |> List.map (fun x -> x * 2)
+        actual = expected
 
     Check.QuickThrowOnFailure law
 
 [<Fact>]
 let ``law: AList reductions match the forced content`` () =
     let law (xs: int list) =
-        let arr = List.toArray xs
+        let actualSum = xs |> AList.ofSeq |> AList.sum |> AVal.getValue
+        let expectedSum = xs |> List.sum
 
-        (AVal.getValue (AList.sum (AList.ofSeq xs)) = Array.sum arr)
-        && (AVal.getValue (AList.countBy (fun x -> x % 2 = 0) (AList.ofSeq xs)) = (Array.filter (fun x -> x % 2 = 0) arr).Length)
-        && (AVal.getValue (AList.tryMin (AList.ofSeq xs)) = (if arr.Length = 0 then ValueNone else ValueSome(Array.min arr)))
-        && (AVal.getValue (AList.tryMax (AList.ofSeq xs)) = (if arr.Length = 0 then ValueNone else ValueSome(Array.max arr)))
+        let actualEvenCount =
+            xs |> AList.ofSeq |> AList.countBy (fun x -> x % 2 = 0) |> AVal.getValue
+
+        let expectedEvenCount = xs |> List.filter (fun x -> x % 2 = 0) |> List.length
+
+        let actualMin = xs |> AList.ofSeq |> AList.tryMin |> AVal.getValue
+
+        let expectedMin =
+            if List.isEmpty xs then
+                ValueNone
+            else
+                ValueSome(List.min xs)
+
+        let actualMax = xs |> AList.ofSeq |> AList.tryMax |> AVal.getValue
+
+        let expectedMax =
+            if List.isEmpty xs then
+                ValueNone
+            else
+                ValueSome(List.max xs)
+
+        actualSum = expectedSum
+        && actualEvenCount = expectedEvenCount
+        && actualMin = expectedMin
+        && actualMax = expectedMax
 
     Check.QuickThrowOnFailure law
 
 [<Fact>]
 let ``law: ASet.map and filter preserve content`` () =
     let law (s: Set<int>) =
-        (ASet.toSet (ASet.map ((+) 1) (ASet.ofSeq s)) = Set.map ((+) 1) s)
-        && (ASet.toSet (ASet.filter (fun x -> x % 2 = 0) (ASet.ofSeq s)) = Set.filter (fun x -> x % 2 = 0) s)
+        let actualMapped = s |> ASet.ofSeq |> ASet.map ((+) 1) |> ASet.toSet
+        let expectedMapped = s |> Set.map ((+) 1)
+
+        let actualFiltered =
+            s |> ASet.ofSeq |> ASet.filter (fun x -> x % 2 = 0) |> ASet.toSet
+
+        let expectedFiltered = s |> Set.filter (fun x -> x % 2 = 0)
+        actualMapped = expectedMapped && actualFiltered = expectedFiltered
 
     Check.QuickThrowOnFailure law
 
 [<Fact>]
 let ``law: ASet union and intersect`` () =
     let law (a: Set<int>, b: Set<int>) =
-        (ASet.toSet (ASet.union (ASet.ofSeq a) (ASet.ofSeq b)) = Set.union a b)
-        && (ASet.toSet (ASet.intersect (ASet.ofSeq a) (ASet.ofSeq b)) = Set.intersect a b)
+        let actualUnion = (ASet.ofSeq a, ASet.ofSeq b) ||> ASet.union |> ASet.toSet
+        let expectedUnion = Set.union a b
+
+        let actualIntersect = (ASet.ofSeq a, ASet.ofSeq b) ||> ASet.intersect |> ASet.toSet
+        let expectedIntersect = Set.intersect a b
+        actualUnion = expectedUnion && actualIntersect = expectedIntersect
 
     Check.QuickThrowOnFailure law
 
@@ -228,57 +302,92 @@ let ``law: ASet choose and count`` () =
     let law (s: Set<int>) =
         let f x = if x % 3 = 0 then Some(x / 3) else None
 
-        (ASet.toSet (ASet.choose f (ASet.ofSeq s)) = Set.ofSeq (Seq.choose f s))
-        && (AVal.getValue (ASet.count (ASet.ofSeq s)) = Set.count s)
+        let actualChosen = s |> ASet.ofSeq |> ASet.choose f |> ASet.toSet
+        let expectedChosen = s |> Seq.choose f |> Set.ofSeq
+
+        let actualCount = s |> ASet.ofSeq |> ASet.count |> AVal.getValue
+        let expectedCount = Set.count s
+        actualChosen = expectedChosen && actualCount = expectedCount
 
     Check.QuickThrowOnFailure law
 
 [<Fact>]
 let ``law: ASet reductions over constant sources`` () =
     let law (s: Set<int>) =
-        (AVal.getValue (ASet.sum (ASet.ofSeq s)) = Seq.sum s)
-        && (AVal.getValue (ASet.countBy (fun x -> x % 2 = 0) (ASet.ofSeq s)) = (Seq.filter (fun x -> x % 2 = 0) s |> Seq.length))
+        let actualSum = s |> ASet.ofSeq |> ASet.sum |> AVal.getValue
+        let expectedSum = s |> Seq.sum
+
+        let actualCount =
+            s |> ASet.ofSeq |> ASet.countBy (fun x -> x % 2 = 0) |> AVal.getValue
+
+        let expectedCount = s |> Seq.filter (fun x -> x % 2 = 0) |> Seq.length
+        actualSum = expectedSum && actualCount = expectedCount
 
     Check.QuickThrowOnFailure law
 
 [<Fact>]
 let ``law: AMap reductions over constant sources`` () =
     let law (m: Map<int, int>) =
-        AVal.getValue (AMap.fold (fun acc _ v -> acc + v) 0 (AMap.ofSeq (Map.toSeq m))) = (m |> Map.toSeq |> Seq.sumBy snd)
+        let actual =
+            m
+            |> Map.toSeq
+            |> AMap.ofSeq
+            |> AMap.fold (fun acc _ v -> acc + v) 0
+            |> AVal.getValue
+
+        let expected = m |> Map.toSeq |> Seq.sumBy snd
+        actual = expected
 
     Check.QuickThrowOnFailure law
 
 [<Fact>]
 let ``law: ASet mapA with constants maps`` () =
     let law (s: Set<int>) =
-        ASet.toSet (ASet.mapA (fun x -> AVal.constant (x * 2)) (ASet.ofSeq s)) = Set.map ((*) 2) s
+        let actual =
+            s |> ASet.ofSeq |> ASet.mapA (fun x -> AVal.constant (x * 2)) |> ASet.toSet
+
+        let expected = s |> Set.map ((*) 2)
+        actual = expected
 
     Check.QuickThrowOnFailure law
 
 [<Fact>]
 let ``law: AMap mapV and filter preserve content`` () =
     let law (m: Map<int, int>) =
-        (AMap.toMap (AMap.mapV ((+) 1) (AMap.ofSeq (Map.toSeq m))) = Map.map (fun _ v -> v + 1) m)
-        && (AMap.toMap (AMap.filter (fun _ v -> v % 2 = 0) (AMap.ofSeq (Map.toSeq m))) = Map.filter (fun _ v -> v % 2 = 0) m)
+        let actualMapped = m |> Map.toSeq |> AMap.ofSeq |> AMap.mapV ((+) 1) |> AMap.toMap
+
+        let expectedMapped = m |> Map.map (fun _ v -> v + 1)
+
+        let actualFiltered =
+            m |> Map.toSeq |> AMap.ofSeq |> AMap.filter (fun _ v -> v % 2 = 0) |> AMap.toMap
+
+        let expectedFiltered = m |> Map.filter (fun _ v -> v % 2 = 0)
+        actualMapped = expectedMapped && actualFiltered = expectedFiltered
 
     Check.QuickThrowOnFailure law
 
 [<Fact>]
 let ``law: AMap keys and toASet`` () =
     let law (m: Map<int, int>) =
-        ASet.toSet (AMap.keys (AMap.ofSeq (Map.toSeq m))) = Set.ofSeq (Map.keys m)
+        let actualKeys = m |> Map.toSeq |> AMap.ofSeq |> AMap.keys |> ASet.toSet
+        let expectedKeys = m |> Map.keys |> Set.ofSeq
 
-        let pairs =
+        let actualPairs = m |> Map.toSeq |> AMap.ofSeq |> AMap.toASet |> ASet.toSet
+
+        let expectedPairs =
             m |> Map.toSeq |> Seq.map (fun (k, v) -> struct (k, v)) |> Set.ofSeq
 
-        ASet.toSet (AMap.toASet (AMap.ofSeq (Map.toSeq m))) = pairs
+        actualKeys = expectedKeys && actualPairs = expectedPairs
 
     Check.QuickThrowOnFailure law
 
 [<Fact>]
 let ``law: AMap chooseV selects`` () =
     let law (m: Map<int, int>) =
-        let f (k: int) (v: int) = if v % 2 = 0 then ValueSome(k * 100 + v) else ValueNone
+        let f (k: int) (v: int) =
+            if v % 2 = 0 then ValueSome(k * 100 + v) else ValueNone
+
+        let actual = m |> Map.toSeq |> AMap.ofSeq |> AMap.chooseV f |> AMap.toMap
 
         let expected =
             m
@@ -286,24 +395,33 @@ let ``law: AMap chooseV selects`` () =
             |> Seq.choose (fun (k, v) -> if v % 2 = 0 then Some(k, k * 100 + v) else None)
             |> Map.ofSeq
 
-        AMap.toMap (AMap.chooseV f (AMap.ofSeq (Map.toSeq m))) = expected
+        actual = expected
 
     Check.QuickThrowOnFailure law
 
 [<Fact>]
 let ``law: changeable roundtrips`` () =
     let law (xs: (int * int) list, s: Set<int>) =
-        AMap.toMap (CMap.value (CMap.ofSeq xs)) = Map.ofSeq xs
-        && ASet.toSet (CSet.value (CSet.ofSeq s)) = s
+        let actualMap = xs |> CMap.ofSeq |> CMap.value |> AMap.toMap
+        let expectedMap = Map.ofSeq xs
+
+        let actualSet = s |> CSet.ofSeq |> CSet.value |> ASet.toSet
+        actualMap = expectedMap && actualSet = s
 
     Check.QuickThrowOnFailure law
 
 [<Fact>]
 let ``law: AVal constant, map and map2`` () =
     let law (a: int, b: int) =
-        AVal.getValue (AVal.constant a) = a
-        && AVal.getValue (AVal.map ((+) 1) (AVal.constant a)) = a + 1
-        && AVal.getValue (AVal.map2 (fun x y -> x * y) (AVal.constant a) (AVal.constant b)) = a * b
+        let actualConstant = a |> AVal.constant |> AVal.getValue
+        let actualMapped = a |> AVal.constant |> AVal.map ((+) 1) |> AVal.getValue
+
+        let actualMapped2 =
+            (AVal.constant a, AVal.constant b)
+            ||> AVal.map2 (fun x y -> x * y)
+            |> AVal.getValue
+
+        actualConstant = a && actualMapped = a + 1 && actualMapped2 = a * b
 
     Check.QuickThrowOnFailure law
 
@@ -371,7 +489,10 @@ let ``incremental law: AList.sort stays sorted`` () =
         for op in ops do
             applyListMutation op l model
 
-            if AList.force sorted <> Array.sort (AList.force (CList.value l)) then
+            let actual = AList.toList sorted
+            let expected = l |> CList.value |> AList.toList |> List.sort
+
+            if actual <> expected then
                 ok <- false
 
         ok
@@ -389,7 +510,10 @@ let ``incremental law: AList.rev stays reversed`` () =
         for op in ops do
             applyListMutation op l model
 
-            if AList.force reversed <> Array.rev (AList.force (CList.value l)) then
+            let actual = AList.toList reversed
+            let expected = l |> CList.value |> AList.toList |> List.rev
+
+            if actual <> expected then
                 ok <- false
 
         ok
@@ -407,7 +531,10 @@ let ``incremental law: AList.map stays mapped`` () =
         for op in ops do
             applyListMutation op l model
 
-            if AList.force mapped <> Array.map ((+) 1) (AList.force (CList.value l)) then
+            let actual = AList.toList mapped
+            let expected = l |> CList.value |> AList.toList |> List.map ((+) 1)
+
+            if actual <> expected then
                 ok <- false
 
         ok
@@ -426,7 +553,10 @@ let ``incremental law: AList.take stays truncated`` () =
         for op in ops do
             applyListMutation op l model
 
-            if AList.force taken <> Array.truncate count (AList.force (CList.value l)) then
+            let actual = AList.toList taken
+            let expected = l |> CList.value |> AList.toList |> List.truncate count
+
+            if actual <> expected then
                 ok <- false
 
         ok
@@ -445,13 +575,15 @@ let ``incremental law: AList.skip stays skipped`` () =
         for op in ops do
             applyListMutation op l model
 
-            let source = AList.force (CList.value l)
+            let source = l |> CList.value |> AList.toList
 
             let expected =
-                if count >= source.Length then [||]
-                else Array.skip count source
+                if count >= List.length source then
+                    []
+                else
+                    source |> List.skip count
 
-            if AList.force skipped <> expected then
+            if AList.toList skipped <> expected then
                 ok <- false
 
         ok
@@ -471,14 +603,14 @@ let ``incremental law: AList.sub stays sliced`` () =
         for op in ops do
             applyListMutation op l model
 
-            let source = AList.force (CList.value l)
+            let source = l |> CList.value |> AList.toList
 
             let expected =
-                let from = min offset source.Length
-                let take = max 0 (min count (source.Length - from))
-                Array.sub source from take
+                let from = min offset (List.length source)
+                let take = max 0 (min count (List.length source - from))
+                source |> List.skip from |> List.truncate take
 
-            if AList.force sliced <> expected then
+            if AList.toList sliced <> expected then
                 ok <- false
 
         ok
@@ -496,16 +628,11 @@ let ``incremental law: AList.pairwise stays paired`` () =
         for op in ops do
             applyListMutation op l model
 
-            let source = AList.force (CList.value l)
+            let source = l |> CList.value |> AList.toList
 
-            let expected =
-                seq {
-                    for i in 0 .. source.Length - 2 do
-                        struct (source[i], source[i + 1])
-                }
-                |> Array.ofSeq
+            let expected = source |> List.pairwise |> List.map (fun (a, b) -> struct (a, b))
 
-            if AList.force pairs <> expected then
+            if AList.toList pairs <> expected then
                 ok <- false
 
         ok
@@ -546,9 +673,9 @@ let ``incremental law: AList.indexed stays indexed`` () =
                         CList.updateAt position element l
                         model[position] <- struct (element, position)
 
-            let expected = model |> Seq.map (fun struct (e, i) -> struct (i, e)) |> Array.ofSeq
+            let expected = model |> Seq.map (fun struct (e, i) -> struct (i, e)) |> List.ofSeq
 
-            if AList.force indexed <> expected then
+            if AList.toList indexed <> expected then
                 ok <- false
 
         ok
@@ -566,7 +693,10 @@ let ``incremental law: AList.mapA stays mapped`` () =
         for op in ops do
             applyListMutation op l model
 
-            if AList.force mapped <> Array.map ((*) 2) (AList.force (CList.value l)) then
+            let actual = AList.toList mapped
+            let expected = l |> CList.value |> AList.toList |> List.map ((*) 2)
+
+            if actual <> expected then
                 ok <- false
 
         ok
@@ -578,14 +708,20 @@ let ``incremental law: AList.choose stays chosen`` () =
     let prop (ops: int list) =
         let l = CList.empty<int>
         let model = ResizeArray<int>()
-        let f x = if x % 2 = 0 then Some(x * 10) else None
+
+        let f x =
+            if x % 2 = 0 then Some(x * 10) else None
+
         let chosen = AList.choose f (CList.value l)
         let mutable ok = true
 
         for op in ops do
             applyListMutation op l model
 
-            if AList.force chosen <> Array.choose f (AList.force (CList.value l)) then
+            let actual = AList.toList chosen
+            let expected = l |> CList.value |> AList.toList |> List.choose f
+
+            if actual <> expected then
                 ok <- false
 
         ok
@@ -605,12 +741,22 @@ let ``incremental law: AList reductions stay correct`` () =
         for op in ops do
             applyListMutation op l model
 
-            let source = AList.force (CList.value l)
+            let source = l |> CList.value |> AList.toList
+
+            let actualTotal = AVal.getValue total
+            let expectedTotal = List.sum source
+
+            let actualEvenCount = AVal.getValue evenCount
+
+            let expectedEvenCount = source |> List.filter (fun x -> x % 2 = 0) |> List.length
+
+            let actualAcc = AVal.getValue acc
+            let expectedAcc = source |> List.fold (fun s x -> s * 10 + x) 0
 
             if
-                AVal.getValue total <> Array.sum source
-                || AVal.getValue evenCount <> (Array.filter (fun x -> x % 2 = 0) source).Length
-                || AVal.getValue acc <> Array.fold (fun s x -> s * 10 + x) 0 source
+                actualTotal <> expectedTotal
+                || actualEvenCount <> expectedEvenCount
+                || actualAcc <> expectedAcc
             then
                 ok <- false
 
@@ -631,7 +777,13 @@ let ``incremental law: ASet.map and filter stay correct`` () =
 
             let source = Set.ofSeq (ASet.toSet (CSet.value s))
 
-            if ASet.toSet mapped <> Set.map ((+) 1) source || ASet.toSet filtered <> Set.filter (fun x -> x % 2 = 0) source then
+            let actualMapped = ASet.toSet mapped
+            let expectedMapped = Set.map ((+) 1) source
+
+            let actualFiltered = ASet.toSet filtered
+            let expectedFiltered = Set.filter (fun x -> x % 2 = 0) source
+
+            if actualMapped <> expectedMapped || actualFiltered <> expectedFiltered then
                 ok <- false
 
         ok
@@ -662,7 +814,13 @@ let ``incremental law: ASet union and intersect stay correct`` () =
             let sourceA = Set.ofSeq (ASet.toSet (CSet.value a))
             let sourceB = Set.ofSeq (ASet.toSet (CSet.value b))
 
-            if ASet.toSet union <> Set.union sourceA sourceB || ASet.toSet intersect <> Set.intersect sourceA sourceB then
+            let actualUnion = ASet.toSet union
+            let expectedUnion = Set.union sourceA sourceB
+
+            let actualIntersect = ASet.toSet intersect
+            let expectedIntersect = Set.intersect sourceA sourceB
+
+            if actualUnion <> expectedUnion || actualIntersect <> expectedIntersect then
                 ok <- false
 
         ok
@@ -682,7 +840,13 @@ let ``incremental law: ASet mapA and count stay correct`` () =
 
             let source = Set.ofSeq (ASet.toSet (CSet.value s))
 
-            if ASet.toSet mapped <> Set.map ((*) 2) source || AVal.getValue count <> Set.count source then
+            let actualMapped = ASet.toSet mapped
+            let expectedMapped = Set.map ((*) 2) source
+
+            let actualCount = AVal.getValue count
+            let expectedCount = Set.count source
+
+            if actualMapped <> expectedMapped || actualCount <> expectedCount then
                 ok <- false
 
         ok
@@ -721,10 +885,13 @@ let ``incremental law: AMap mapV and filter stay correct`` () =
 
             let source = AMap.toMap (CMap.value m)
 
-            if
-                AMap.toMap mapped <> Map.map (fun _ v -> v + 1) source
-                || AMap.toMap filtered <> Map.filter (fun _ v -> v % 2 = 0) source
-            then
+            let actualMapped = AMap.toMap mapped
+            let expectedMapped = Map.map (fun _ v -> v + 1) source
+
+            let actualFiltered = AMap.toMap filtered
+            let expectedFiltered = Map.filter (fun _ v -> v % 2 = 0) source
+
+            if actualMapped <> expectedMapped || actualFiltered <> expectedFiltered then
                 ok <- false
 
         ok
@@ -777,15 +944,14 @@ let ``incremental law: AMap fold stays correct`` () =
 // =============================================================================
 
 /// One scalar write: which input to set and to what value.
-type ScalarOp =
-    | SetInput of inputIndex: int * value: int
+type ScalarOp = SetInput of inputIndex: int * value: int
 
 /// Generates a sequence of scalar writes over four inputs, values in [0, 100).
 let scalarOpsGen: Gen<ScalarOp list> =
     Gen.listOf (
         gen {
-            let! idx = Gen.choose(0, 3)
-            let! value = Gen.choose(0, 99)
+            let! idx = Gen.choose (0, 3)
+            let! value = Gen.choose (0, 99)
             return SetInput(idx, value)
         }
     )
@@ -815,13 +981,16 @@ let ``scalar map tracks its input`` () =
 
         ok
 
-    Check.One (scalarConfig, prop)
+    Check.One(scalarConfig, prop)
 
 [<Fact>]
 let ``scalar map2 tracks its inputs`` () =
     let prop (ops: ScalarOp list) =
         let inputs = [| CVal.create 0; CVal.create 0; CVal.create 0; CVal.create 0 |]
-        let derived = AVal.map2 (fun x y -> x * 10 + y) (CVal.value inputs[0]) (CVal.value inputs[1])
+
+        let derived =
+            AVal.map2 (fun x y -> x * 10 + y) (CVal.value inputs[0]) (CVal.value inputs[1])
+
         let model = [| 0; 0; 0; 0 |]
         let mutable ok = true
 
@@ -836,7 +1005,7 @@ let ``scalar map2 tracks its inputs`` () =
 
         ok
 
-    Check.One (scalarConfig, prop)
+    Check.One(scalarConfig, prop)
 
 [<Fact>]
 let ``scalar map3 tracks its inputs`` () =
@@ -864,7 +1033,7 @@ let ``scalar map3 tracks its inputs`` () =
 
         ok
 
-    Check.One (scalarConfig, prop)
+    Check.One(scalarConfig, prop)
 
 [<Fact>]
 let ``scalar map4 tracks its inputs`` () =
@@ -888,12 +1057,15 @@ let ``scalar map4 tracks its inputs`` () =
                 CVal.set v inputs[i]
                 model[i] <- v
 
-            if AVal.getValue derived <> model[0] * 1000 + model[1] * 100 + model[2] * 10 + model[3] then
+            if
+                AVal.getValue derived
+                <> model[0] * 1000 + model[1] * 100 + model[2] * 10 + model[3]
+            then
                 ok <- false
 
         ok
 
-    Check.One (scalarConfig, prop)
+    Check.One(scalarConfig, prop)
 
 [<Fact>]
 let ``scalar mapN tracks its inputs`` () =
@@ -903,7 +1075,10 @@ let ``scalar mapN tracks its inputs`` () =
         let derived =
             AVal.mapN
                 (fun (arr: int[]) -> arr[0] * 1000 + arr[1] * 100 + arr[2] * 10 + arr[3])
-                [| CVal.value inputs[0]; CVal.value inputs[1]; CVal.value inputs[2]; CVal.value inputs[3] |]
+                [| CVal.value inputs[0]
+                   CVal.value inputs[1]
+                   CVal.value inputs[2]
+                   CVal.value inputs[3] |]
 
         let model = [| 0; 0; 0; 0 |]
         let mutable ok = true
@@ -914,12 +1089,15 @@ let ``scalar mapN tracks its inputs`` () =
                 CVal.set v inputs[i]
                 model[i] <- v
 
-            if AVal.getValue derived <> model[0] * 1000 + model[1] * 100 + model[2] * 10 + model[3] then
+            if
+                AVal.getValue derived
+                <> model[0] * 1000 + model[1] * 100 + model[2] * 10 + model[3]
+            then
                 ok <- false
 
         ok
 
-    Check.One (scalarConfig, prop)
+    Check.One(scalarConfig, prop)
 
 [<Fact>]
 let ``scalar bind tracks its input and its inner`` () =
@@ -928,9 +1106,7 @@ let ``scalar bind tracks its input and its inner`` () =
 
         // The inner aval reads input 1; the bind's value (input 0) swaps it.
         let derived =
-            AVal.bind
-                (fun x -> AVal.map (fun y -> x * 10 + y) (CVal.value inputs[1]))
-                (CVal.value inputs[0])
+            AVal.bind (fun x -> AVal.map (fun y -> x * 10 + y) (CVal.value inputs[1])) (CVal.value inputs[0])
 
         let model = [| 0; 0; 0; 0 |]
         let mutable ok = true
@@ -946,7 +1122,7 @@ let ``scalar bind tracks its input and its inner`` () =
 
         ok
 
-    Check.One (scalarConfig, prop)
+    Check.One(scalarConfig, prop)
 
 [<Fact>]
 let ``scalar bind2 tracks its inputs and its inner`` () =
@@ -974,7 +1150,7 @@ let ``scalar bind2 tracks its inputs and its inner`` () =
 
         ok
 
-    Check.One (scalarConfig, prop)
+    Check.One(scalarConfig, prop)
 
 [<Fact>]
 let ``scalar bind3 tracks its inputs and its inner`` () =
@@ -998,12 +1174,15 @@ let ``scalar bind3 tracks its inputs and its inner`` () =
                 CVal.set v inputs[i]
                 model[i] <- v
 
-            if AVal.getValue derived <> model[0] * 1000 + model[1] * 100 + model[2] * 10 + model[3] then
+            if
+                AVal.getValue derived
+                <> model[0] * 1000 + model[1] * 100 + model[2] * 10 + model[3]
+            then
                 ok <- false
 
         ok
 
-    Check.One (scalarConfig, prop)
+    Check.One(scalarConfig, prop)
 
 // =============================================================================
 // Collection scenario generators: typed, weighted op sequences with a random
@@ -1042,9 +1221,18 @@ type ExternalOp =
     | Replace of int
     | Invalidate
 
-type SetScenario = { initial: (int * int) list; ops: SetOp list }
-type MapScenario = { initial: (int * int) list; ops: MapOp list }
-type ListScenario = { initial: (int * int) list; ops: ListChange list }
+type SetScenario =
+    { initial: (int * int) list
+      ops: SetOp list }
+
+type MapScenario =
+    { initial: (int * int) list
+      ops: MapOp list }
+
+type ListScenario =
+    { initial: (int * int) list
+      ops: ListChange list }
+
 type CrossScenario =
     { initialEntities: (int * int) list
       initialLookups: (int * int) list
@@ -1059,8 +1247,8 @@ type ExternalScenario = { ops: ExternalOp list }
 
 let pairGen =
     gen {
-        let! k = Gen.choose(0, 19)
-        let! v = Gen.choose(0, 99)
+        let! k = Gen.choose (0, 19)
+        let! v = Gen.choose (0, 99)
         return k, v
     }
 
@@ -1075,113 +1263,126 @@ let dedupPairs (xs: (int * int) list) =
     [ for KeyValue(k, v) in d -> k, v ]
 
 let setOpGen: Gen<SetOp> =
-    Gen.frequency [
-        (3, gen {
-            let! e = Gen.choose(0, 19)
-            let! v = Gen.choose(0, 99)
-            return Add(e, v)
-        })
-        (2, gen {
-            let! e = Gen.choose(0, 19)
-            return SetOp.Remove e
-        })
-        (2, gen {
-            let! e = Gen.choose(0, 19)
-            let! v = Gen.choose(0, 99)
-            return SetOp.SetValue(e, v)
-        })
-    ]
+    Gen.frequency
+        [ (3,
+           gen {
+               let! e = Gen.choose (0, 19)
+               let! v = Gen.choose (0, 99)
+               return Add(e, v)
+           })
+          (2,
+           gen {
+               let! e = Gen.choose (0, 19)
+               return SetOp.Remove e
+           })
+          (2,
+           gen {
+               let! e = Gen.choose (0, 19)
+               let! v = Gen.choose (0, 99)
+               return SetOp.SetValue(e, v)
+           }) ]
 
 let mapOpGen: Gen<MapOp> =
-    Gen.frequency [
-        (3, gen {
-            let! k = Gen.choose(0, 9)
-            let! v = Gen.choose(0, 99)
-            return Upsert(k, v)
-        })
-        (2, gen {
-            let! k = Gen.choose(0, 9)
-            return MapOp.Remove k
-        })
-        (2, gen {
-            let! k = Gen.choose(0, 9)
-            let! v = Gen.choose(0, 99)
-            return MapOp.SetValue(k, v)
-        })
-    ]
+    Gen.frequency
+        [ (3,
+           gen {
+               let! k = Gen.choose (0, 9)
+               let! v = Gen.choose (0, 99)
+               return Upsert(k, v)
+           })
+          (2,
+           gen {
+               let! k = Gen.choose (0, 9)
+               return MapOp.Remove k
+           })
+          (2,
+           gen {
+               let! k = Gen.choose (0, 9)
+               let! v = Gen.choose (0, 99)
+               return MapOp.SetValue(k, v)
+           }) ]
 
 let listChangeGen: Gen<ListChange> =
-    Gen.frequency [
-        (3, gen {
-            let! e = Gen.choose(0, 9)
-            let! p = Gen.choose(0, 200)
-            return Insert(e, p)
-        })
-        (2, gen {
-            let! p = Gen.choose(0, 200)
-            return RemoveAt p
-        })
-        (2, gen {
-            let! e = Gen.choose(0, 9)
-            let! p = Gen.choose(0, 200)
-            return UpdateAt(e, p)
-        })
-        (1, gen {
-            let! e = Gen.choose(0, 9)
-            let! v = Gen.choose(0, 99)
-            return ListChange.SetValue(e, v)
-        })
-    ]
+    Gen.frequency
+        [ (3,
+           gen {
+               let! e = Gen.choose (0, 9)
+               let! p = Gen.choose (0, 200)
+               return Insert(e, p)
+           })
+          (2,
+           gen {
+               let! p = Gen.choose (0, 200)
+               return RemoveAt p
+           })
+          (2,
+           gen {
+               let! e = Gen.choose (0, 9)
+               let! p = Gen.choose (0, 200)
+               return UpdateAt(e, p)
+           })
+          (1,
+           gen {
+               let! e = Gen.choose (0, 9)
+               let! v = Gen.choose (0, 99)
+               return ListChange.SetValue(e, v)
+           }) ]
 
 let crossOpGen: Gen<CrossOp> =
-    Gen.frequency [
-        (2, gen {
-            let! k = Gen.choose(0, 9)
-            let! v = Gen.choose(0, 99)
-            return EntityUpsert(k, v)
-        })
-        (1, gen {
-            let! k = Gen.choose(0, 9)
-            return EntityRemove k
-        })
-        (2, gen {
-            let! k = Gen.choose(0, 9)
-            let! v = Gen.choose(0, 99)
-            return LookupUpsert(k, v)
-        })
-        (1, gen {
-            let! k = Gen.choose(0, 9)
-            return LookupRemove k
-        })
-    ]
+    Gen.frequency
+        [ (2,
+           gen {
+               let! k = Gen.choose (0, 9)
+               let! v = Gen.choose (0, 99)
+               return EntityUpsert(k, v)
+           })
+          (1,
+           gen {
+               let! k = Gen.choose (0, 9)
+               return EntityRemove k
+           })
+          (2,
+           gen {
+               let! k = Gen.choose (0, 9)
+               let! v = Gen.choose (0, 99)
+               return LookupUpsert(k, v)
+           })
+          (1,
+           gen {
+               let! k = Gen.choose (0, 9)
+               return LookupRemove k
+           }) ]
 
 let joinOpGen: Gen<JoinOp> =
-    Gen.frequency [
-        (2, Gen.map LeftEdit mapOpGen)
-        (2, Gen.map RightEdit mapOpGen)
-    ]
+    Gen.frequency [ (2, Gen.map LeftEdit mapOpGen); (2, Gen.map RightEdit mapOpGen) ]
 
 let externalOpGen: Gen<ExternalOp> =
-    Gen.frequency [
-        (3, gen {
-            let! v = Gen.choose(0, 99)
-            return Replace v
-        })
-        (1, Gen.constant Invalidate)
-    ]
+    Gen.frequency
+        [ (3,
+           gen {
+               let! v = Gen.choose (0, 99)
+               return Replace v
+           })
+          (1, Gen.constant Invalidate) ]
 
 let setScenarioGen: Gen<SetScenario> =
     gen {
         let! initial = Gen.listOf pairGen
         let! ops = Gen.listOf setOpGen
-        return { initial = dedupPairs initial; ops = ops }
+
+        return
+            { initial = dedupPairs initial
+              ops = ops }
     }
 
 let mapScenarioGen: Gen<MapScenario> =
     gen {
         let! initial = Gen.listOf pairGen
         let! ops = Gen.listOf mapOpGen
-        return { initial = dedupPairs initial; ops = ops }
+
+        return
+            { initial = dedupPairs initial
+              ops = ops }
     }
 
 let listScenarioGen: Gen<ListScenario> =
@@ -1208,7 +1409,11 @@ let joinScenarioGen: Gen<JoinScenario> =
         let! initialA = Gen.listOf pairGen
         let! initialB = Gen.listOf pairGen
         let! ops = Gen.listOf joinOpGen
-        return { initialA = dedupPairs initialA; initialB = dedupPairs initialB; ops = ops }
+
+        return
+            { initialA = dedupPairs initialA
+              initialB = dedupPairs initialB
+              ops = ops }
     }
 
 let externalScenarioGen: Gen<ExternalScenario> =
@@ -1229,7 +1434,8 @@ type ScenarioArbs =
     static member MapOpList() : Arbitrary<MapOp list> = Arb.fromGen (Gen.listOf mapOpGen)
     static member ListChangeList() : Arbitrary<ListChange list> = Arb.fromGen (Gen.listOf listChangeGen)
 
-let private scenarioConfig = Config.QuickThrowOnFailure.WithArbitrary([| typeof<ScenarioArbs> |])
+let private scenarioConfig =
+    Config.QuickThrowOnFailure.WithArbitrary([| typeof<ScenarioArbs> |])
 
 // =============================================================================
 // Reference-impl model: ASet.mapA (MAPA-DESIGN §12).
@@ -1328,7 +1534,7 @@ let ``ASet mapA matches the reference model`` () =
 
         ok
 
-    Check.One (scenarioConfig, prop)
+    Check.One(scenarioConfig, prop)
 
 // =============================================================================
 // Reference-impl model: AList.mapA (MAPA-DESIGN §12).
@@ -1395,15 +1601,15 @@ let ``AList mapA matches the reference model`` () =
         for op in sc.ops do
             apply op
 
-            let actual = AList.toArray mapped
-            let expected = Array.ofSeq (Seq.map (fun e -> elementValue[e]) elements)
+            let actual = AList.toList mapped
+            let expected = elements |> Seq.map (fun e -> elementValue[e]) |> List.ofSeq
 
             if actual <> expected then
                 ok <- false
 
         ok
 
-    Check.One (scenarioConfig, prop)
+    Check.One(scenarioConfig, prop)
 
 // =============================================================================
 // Reference-impl model: AMap.mapA.
@@ -1461,7 +1667,7 @@ let ``AMap mapA matches the reference model`` () =
 
         ok
 
-    Check.One (scenarioConfig, prop)
+    Check.One(scenarioConfig, prop)
 
 // =============================================================================
 // Reference-impl model: ASet.filterA and ASet.chooseA.
@@ -1529,7 +1735,7 @@ let ``ASet filterA matches the reference model`` () =
 
         ok
 
-    Check.One (scenarioConfig, prop)
+    Check.One(scenarioConfig, prop)
 
 [<Fact>]
 let ``ASet chooseA matches the reference model`` () =
@@ -1592,7 +1798,7 @@ let ``ASet chooseA matches the reference model`` () =
 
         ok
 
-    Check.One (scenarioConfig, prop)
+    Check.One(scenarioConfig, prop)
 
 // =============================================================================
 // Reference-impl model: ASet.ofExternal (MAPA-DESIGN §1.1).
@@ -1619,7 +1825,7 @@ let ``ASet ofExternal matches the reference model`` () =
                 snapshot <- HashSet<int>([ value ])
 
                 if value % 4 = 0 then
-                    snapshot.Add (value / 2) |> ignore // sometimes two elements
+                    snapshot.Add(value / 2) |> ignore // sometimes two elements
             | Invalidate -> // Invalidate: the next read re-reads the snapshot.
                 invalidate ()
                 dirty <- true
@@ -1643,7 +1849,7 @@ let ``ASet ofExternal matches the reference model`` () =
 
         ok
 
-    Check.One (scenarioConfig, prop)
+    Check.One(scenarioConfig, prop)
 
 // =============================================================================
 // Kipo usage shapes (E:\Kipo Pomo.Core\Projections.fs):
@@ -1728,7 +1934,7 @@ let ``AMap join choose2V with mapA matches the model`` () =
 
         ok
 
-    Check.One (scenarioConfig, prop)
+    Check.One(scenarioConfig, prop)
 
 [<Fact>]
 let ``AMap mapA with cross-map lookup matches the model`` () =
@@ -1793,7 +1999,7 @@ let ``AMap mapA with cross-map lookup matches the model`` () =
 
         ok
 
-    Check.One (scenarioConfig, prop)
+    Check.One(scenarioConfig, prop)
 
 [<Fact>]
 let ``ASet mapA with cross-map lookup matches the model`` () =
@@ -1855,7 +2061,7 @@ let ``ASet mapA with cross-map lookup matches the model`` () =
 
         ok
 
-    Check.One (scenarioConfig, prop)
+    Check.One(scenarioConfig, prop)
 
 [<Fact>]
 let ``AList mapA with cross-map lookup matches the model`` () =
@@ -1904,10 +2110,10 @@ let ``AList mapA with cross-map lookup matches the model`` () =
         for op in sc.ops do
             apply op
 
-            let actual = AList.toArray contexts
+            let actual = AList.toList contexts
 
             let expected =
-                Array.ofSeq (
+                List.ofSeq (
                     seq {
                         for id in modelEntities do
                             match modelLookups.TryGetValue id with
@@ -1921,7 +2127,7 @@ let ``AList mapA with cross-map lookup matches the model`` () =
 
         ok
 
-    Check.One (scenarioConfig, prop)
+    Check.One(scenarioConfig, prop)
 
 [<Fact>]
 let ``AMap filter with keys matches the model`` () =
@@ -2324,8 +2530,8 @@ let ``AList choose matches the combat-status model`` () =
         for op in ops do
             apply op
 
-            let actual = AList.toArray statuses
-            let expected = Array.ofSeq (Seq.choose effectKindToStatus model)
+            let actual = AList.toList statuses
+            let expected = model |> Seq.choose effectKindToStatus |> List.ofSeq
 
             if actual <> expected then
                 ok <- false
@@ -2430,19 +2636,18 @@ let ``AMap ofExternal matches the reference model`` () =
 
         ok
 
-    Check.One (scenarioConfig, prop)
+    Check.One(scenarioConfig, prop)
 
 [<Fact>]
 let ``AList ofExternal matches the reference model`` () =
     let prop (sc: ExternalScenario) =
         let mutable snapshot: int list = []
 
-        let ext, invalidate =
-            AList.ofExternal (fun () -> snapshot :> IReadOnlyList<int>)
+        let ext, invalidate = AList.ofExternal (fun () -> snapshot :> IReadOnlyList<int>)
 
         // Model: whether an invalidate is pending, and the last read snapshot.
         let mutable dirty = true
-        let mutable lastSeen: int[] = [||]
+        let mutable lastSeen: int list = []
 
         let apply (op: ExternalOp) =
             match op with
@@ -2452,8 +2657,8 @@ let ``AList ofExternal matches the reference model`` () =
                 invalidate ()
                 dirty <- true
 
-            let expected = if dirty then List.toArray snapshot else lastSeen
-            let actual = AList.force ext
+            let expected = if dirty then snapshot else lastSeen
+            let actual = AList.toList ext
 
             if actual <> expected then
                 false
@@ -2470,7 +2675,7 @@ let ``AList ofExternal matches the reference model`` () =
 
         ok
 
-    Check.One (scenarioConfig, prop)
+    Check.One(scenarioConfig, prop)
 
 [<Fact>]
 let ``AList take matches the model`` () =
@@ -2502,8 +2707,8 @@ let ``AList take matches the model`` () =
                     CList.updateAt position element l
                     model[position] <- element
 
-            let expected = Array.ofSeq (Seq.truncate count model)
-            AList.force taken = expected
+            let expected = model |> Seq.truncate count |> List.ofSeq
+            AList.toList taken = expected
 
         let mutable ok = true
 
@@ -2546,10 +2751,12 @@ let ``AList skip matches the model`` () =
                     model[position] <- element
 
             let expected =
-                if model.Count <= count then [||]
-                else Array.ofSeq (Seq.skip count model)
+                if model.Count <= count then
+                    []
+                else
+                    model |> Seq.skip count |> List.ofSeq
 
-            AList.force skipped = expected
+            AList.toList skipped = expected
 
         let mutable ok = true
 
@@ -2595,9 +2802,9 @@ let ``AList sub matches the model`` () =
             let expected =
                 let from = min offset model.Count
                 let take = max 0 (min count (model.Count - from))
-                Array.ofSeq (Seq.skip from model |> Seq.truncate take)
+                model |> Seq.skip from |> Seq.truncate take |> List.ofSeq
 
-            AList.force sliced = expected
+            AList.toList sliced = expected
 
         let mutable ok = true
 
@@ -2638,8 +2845,8 @@ let ``AList sort matches the model`` () =
                     CList.updateAt position element l
                     model[position] <- element
 
-            let expected = model |> Seq.sort |> Array.ofSeq
-            AList.force sorted = expected
+            let expected = model |> Seq.sort |> List.ofSeq
+            AList.toList sorted = expected
 
         let mutable ok = true
 
@@ -2680,8 +2887,8 @@ let ``AList rev matches the model`` () =
                     CList.updateAt position element l
                     model[position] <- element
 
-            let expected = model |> Seq.rev |> Array.ofSeq
-            AList.force reversed = expected
+            let expected = model |> Seq.rev |> List.ofSeq
+            AList.toList reversed = expected
 
         let mutable ok = true
 
@@ -2727,9 +2934,9 @@ let ``AList pairwise matches the model`` () =
                     for i in 0 .. model.Count - 2 do
                         struct (model[i], model[i + 1])
                 }
-                |> Array.ofSeq
+                |> List.ofSeq
 
-            AList.force pairs = expected
+            AList.toList pairs = expected
 
         let mutable ok = true
 
@@ -2853,8 +3060,18 @@ let ``AList tryMin and tryMax match the model`` () =
                     CList.updateAt position element l
                     model[position] <- element
 
-            let expectedMin = if model.Count = 0 then ValueNone else ValueSome(Seq.min model)
-            let expectedMax = if model.Count = 0 then ValueNone else ValueSome(Seq.max model)
+            let expectedMin =
+                if model.Count = 0 then
+                    ValueNone
+                else
+                    ValueSome(Seq.min model)
+
+            let expectedMax =
+                if model.Count = 0 then
+                    ValueNone
+                else
+                    ValueSome(Seq.max model)
+
             AVal.getValue mn = expectedMin && AVal.getValue mx = expectedMax
 
         let mutable ok = true
@@ -2920,9 +3137,7 @@ let ``AList bind matches the model`` () =
 
         // The bind switches the whole output when the selector aval changes.
         let bound =
-            AList.bind
-                (fun n -> if n = 0 then CList.value l1 else CList.value l2)
-                (CVal.value selector)
+            AList.bind (fun n -> if n = 0 then CList.value l1 else CList.value l2) (CVal.value selector)
 
         let apply (op: int) =
             let kind = op % 4
@@ -2953,11 +3168,11 @@ let ``AList bind matches the model`` () =
 
             let expected =
                 if AVal.getValue (CVal.value selector) = 0 then
-                    Array.ofSeq model1
+                    List.ofSeq model1
                 else
-                    Array.ofSeq model2
+                    List.ofSeq model2
 
-            AList.force bound = expected
+            AList.toList bound = expected
 
         let mutable ok = true
 
@@ -3003,8 +3218,8 @@ let ``AList concat matches the model`` () =
                     CList.updateAt position element target
                     model[position] <- element
 
-            let expected = Array.ofSeq (Seq.append model1 model2)
-            AList.force concat = expected
+            let expected = Seq.append model1 model2 |> List.ofSeq
+            AList.toList concat = expected
 
         let mutable ok = true
 
@@ -3050,8 +3265,8 @@ let ``AList mapiA passes the mapping-time position`` () =
                         CList.updateAt position element l
                         model[position] <- struct (element, position)
 
-            let expected = model |> Seq.map (fun struct (e, i) -> e * 100 + i) |> Array.ofSeq
-            AList.force mapped = expected
+            let expected = model |> Seq.map (fun struct (e, i) -> e * 100 + i) |> List.ofSeq
+            AList.toList mapped = expected
 
         let mutable ok = true
 
@@ -3103,7 +3318,7 @@ let ``AVal ofExternal matches the reference model`` () =
 
         ok
 
-    Check.One (scenarioConfig, prop)
+    Check.One(scenarioConfig, prop)
 
 [<Fact>]
 let ``CSet updateTo and perform match the sequential model`` () =
@@ -3137,10 +3352,12 @@ let ``CSet updateTo and perform match the sequential model`` () =
         CSet.perform d viaPerform
 
         let expected = Set.ofSeq model
-        Set.ofSeq (ASet.toSet (CSet.value viaUpdate)) = expected
-        && Set.ofSeq (ASet.toSet (CSet.value viaPerform)) = expected
 
-    Check.One (scenarioConfig, prop)
+        let actualUpdate = viaUpdate |> CSet.value |> ASet.toSet
+        let actualPerform = viaPerform |> CSet.value |> ASet.toSet
+        actualUpdate = expected && actualPerform = expected
+
+    Check.One(scenarioConfig, prop)
 
 [<Fact>]
 let ``CMap updateTo and perform match the sequential model`` () =
@@ -3174,10 +3391,12 @@ let ``CMap updateTo and perform match the sequential model`` () =
         CMap.perform d viaPerform
 
         let expected = [ for KeyValue(k, v) in model -> k, v ] |> Map.ofList
-        AMap.toMap (CMap.value viaUpdate) = expected
-        && AMap.toMap (CMap.value viaPerform) = expected
 
-    Check.One (scenarioConfig, prop)
+        let actualUpdate = viaUpdate |> CMap.value |> AMap.toMap
+        let actualPerform = viaPerform |> CMap.value |> AMap.toMap
+        actualUpdate = expected && actualPerform = expected
+
+    Check.One(scenarioConfig, prop)
 
 [<Fact>]
 let ``CList updateTo and perform match the sequential model`` () =
@@ -3208,18 +3427,21 @@ let ``CList updateTo and perform match the sequential model`` () =
         CList.updateTo (Array.ofSeq model) viaUpdate
         CList.perform d viaPerform
 
-        let expected = Array.ofSeq model
-        AList.force (CList.value viaUpdate) = expected
-        && AList.force (CList.value viaPerform) = expected
+        let expected = List.ofSeq model
 
-    Check.One (scenarioConfig, prop)
+        let actualUpdate = viaUpdate |> CList.value |> AList.toList
+        let actualPerform = viaPerform |> CList.value |> AList.toList
+        actualUpdate = expected && actualPerform = expected
+
+    Check.One(scenarioConfig, prop)
 
 [<Fact>]
 let ``CList addRange appends the items`` () =
     let prop (xs: int list) =
         let l = CList.empty<int>
         CList.addRange xs l
-        AList.force (CList.value l) = List.toArray xs
+        let actual = l |> CList.value |> AList.toList
+        actual = xs
 
     Check.QuickThrowOnFailure prop
 
@@ -3232,7 +3454,10 @@ let ``ASet observe delivers the model content after every op`` () =
             CSet.add e source
 
         let mutable observed = Set.ofSeq (ASet.toSet (CSet.value source))
-        let obs = ASet.observe (fun view _ -> observed <- Set.ofSeq view) (CSet.value source)
+
+        let obs =
+            ASet.observe (fun view _ -> observed <- Set.ofSeq view) (CSet.value source)
+
         let model = HashSet<int>(List.map fst sc.initial)
         let mutable ok = true
 
@@ -3254,7 +3479,7 @@ let ``ASet observe delivers the model content after every op`` () =
         obs.Dispose()
         ok
 
-    Check.One (scenarioConfig, prop)
+    Check.One(scenarioConfig, prop)
 
 [<Fact>]
 let ``AMap observe delivers the model content after every op`` () =
@@ -3265,7 +3490,12 @@ let ``AMap observe delivers the model content after every op`` () =
             CMap.addOrUpdate k v source
 
         let mutable observed = AMap.toMap (CMap.value source)
-        let obs = AMap.observe (fun view _ -> observed <- [ for KeyValue(k, v) in view -> k, v ] |> Map.ofList) (CMap.value source)
+
+        let obs =
+            AMap.observe
+                (fun view _ -> observed <- [ for KeyValue(k, v) in view -> k, v ] |> Map.ofList)
+                (CMap.value source)
+
         let model = Dictionary<int, int>()
 
         for (k, v) in sc.initial do
@@ -3291,7 +3521,7 @@ let ``AMap observe delivers the model content after every op`` () =
         obs.Dispose()
         ok
 
-    Check.One (scenarioConfig, prop)
+    Check.One(scenarioConfig, prop)
 
 [<Fact>]
 let ``AList observe delivers the model content after every op`` () =
@@ -3303,8 +3533,11 @@ let ``AList observe delivers the model content after every op`` () =
             CList.append e source
             model.Add e
 
-        let mutable observed = AList.toArray (CList.value source)
-        let obs = AList.observe (fun view _ -> observed <- Seq.toArray view) (CList.value source)
+        let mutable observed = source |> CList.value |> AList.toList
+
+        let obs =
+            AList.observe (fun view _ -> observed <- List.ofSeq view) (CList.value source)
+
         let mutable ok = true
 
         for op in sc.ops do
@@ -3325,10 +3558,10 @@ let ``AList observe delivers the model content after every op`` () =
                     model[pos] <- e
             | SetValue _ -> ()
 
-            if observed <> Array.ofSeq model then
+            if observed <> List.ofSeq model then
                 ok <- false
 
         obs.Dispose()
         ok
 
-    Check.One (scenarioConfig, prop)
+    Check.One(scenarioConfig, prop)

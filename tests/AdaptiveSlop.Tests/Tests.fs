@@ -2383,12 +2383,12 @@ let ``sequential transactions each apply their collection writes`` () =
     let setSource = CSet.empty<int>
     Transaction.run (fun () -> CSet.add 1 setSource)
     Transaction.run (fun () -> CSet.add 2 setSource)
-    Assert.Equal(2, (ASet.force (CSet.value setSource)).Count)
+    Assert.Equal(2, (setSource |> CSet.value |> ASet.force).Count)
 
     let mapSource = CMap.empty<string, int>
     Transaction.run (fun () -> CMap.addOrUpdate "a" 1 mapSource)
     Transaction.run (fun () -> CMap.addOrUpdate "b" 2 mapSource)
-    Assert.Equal(2, (AMap.force (CMap.value mapSource)).Count)
+    Assert.Equal(2, (mapSource |> CMap.value |> AMap.force).Count)
 
 // =============================================================================
 // Phase 7.2 — Incremental reductions and derived checks
@@ -2414,7 +2414,7 @@ let ``ASet count isEmpty contains track the state`` () =
     CSet.remove 5 source
     Assert.Equal(1, AVal.getValue count)
     Assert.False(AVal.getValue hasFive)
-    Assert.True(AVal.getValue (ASet.contains 7 (CSet.value source)))
+    Assert.True(source |> CSet.value |> ASet.contains 7 |> AVal.getValue)
 
 [<Fact>]
 let ``ASet exists forall countBy are delta-driven`` () =
@@ -2537,7 +2537,7 @@ let ``AMap tryFind find track entries`` () =
     Assert.Equal(9, AVal.getValue findValue)
 
     Assert.Throws<System.Collections.Generic.KeyNotFoundException>(fun () ->
-        AVal.getValue (AMap.find "missing" (CMap.value source)) |> ignore)
+        source |> CMap.value |> AMap.find "missing" |> AVal.getValue |> ignore)
 
 [<Fact>]
 let ``AMap reduce updates subtract the old value`` () =
@@ -4112,11 +4112,11 @@ let ``AList count and isEmpty`` () =
 let ``AList constructors`` () =
     Assert.Equal<int list>([], AList.toList (AList.empty: alist<int>))
     Assert.Equal<int list>([ 1 ], AList.toList (AList.single 1))
-    Assert.Equal<int list>([ 1; 2; 3 ], AList.toList (AList.ofSeq [ 1; 2; 3 ]))
-    Assert.Equal<int list>([ 1; 2 ], AList.toList (AList.ofArray [| 1; 2 |]))
-    Assert.Equal<int list>([ 1; 2 ], AList.toList (AList.ofList [ 1; 2 ]))
-    Assert.Equal<int list>([ 1; 2 ], AList.toList (AList.ofResizeArray (ResizeArray [ 1; 2 ])))
-    Assert.Equal<int[]>([| 1; 2 |], AList.force (AList.ofSeq [ 1; 2 ]))
+    Assert.Equal<int list>([ 1; 2; 3 ], [ 1; 2; 3 ] |> AList.ofSeq |> AList.toList)
+    Assert.Equal<int list>([ 1; 2 ], [| 1; 2 |] |> AList.ofArray |> AList.toList)
+    Assert.Equal<int list>([ 1; 2 ], [ 1; 2 ] |> AList.ofList |> AList.toList)
+    Assert.Equal<int list>([ 1; 2 ], ResizeArray [ 1; 2 ] |> AList.ofResizeArray |> AList.toList)
+    Assert.Equal<int[]>([| 1; 2 |], [ 1; 2 ] |> AList.ofSeq |> AList.force)
 
     let mutable count = 0
 
@@ -4456,7 +4456,7 @@ let ``ChangeableSet.Set supersedes the whole batch`` () =
         CSet.set (Set.ofList [ 2; 3 ]) s
         CSet.add 4 s)
 
-    Assert.Equal<Set<_>>(Set.ofList [ 2; 3 ], Set.ofSeq (ASet.force (CSet.value s)))
+    Assert.Equal<Set<_>>(Set.ofList [ 2; 3 ], s |> CSet.value |> ASet.force |> Set.ofSeq)
 
     let m = CMap.ofSeq [ "a", 1 ]
 
@@ -4949,12 +4949,13 @@ let ``ASet mapUse refcounts duplicate mapped values`` () =
 [<Fact>]
 let ``ASet average and averageBy`` () =
     let s = CSet.ofSeq [ 1.0; 2.0; 3.0 ]
+    let source = CSet.value s
 
-    Assert.Equal(2.0, AVal.getValue (ASet.average (CSet.value s)))
-    Assert.Equal(4.0, AVal.getValue (ASet.averageBy (fun v -> v * 2.0) (CSet.value s)))
+    Assert.Equal(2.0, source |> ASet.average |> AVal.getValue)
+    Assert.Equal(4.0, source |> ASet.averageBy (fun v -> v * 2.0) |> AVal.getValue)
 
     CSet.add 5.0 s
-    Assert.Equal(2.75, AVal.getValue (ASet.average (CSet.value s)))
+    Assert.Equal(2.75, source |> ASet.average |> AVal.getValue)
 
 // =============================================================================
 // Bring list — AMap group (docs/2026-08-05-FDA-API-GAPS.md §4): map',
@@ -5207,21 +5208,22 @@ let ``AList rev follows the source`` () =
 [<Fact>]
 let ``AList sort family is stable`` () =
     let l = CList.ofSeq [ 3; 1; 2; 1 ]
+    let source = CList.value l
 
-    Assert.Equal<int[]>([| 1; 1; 2; 3 |], AList.toArray (AList.sort (CList.value l)))
-    Assert.Equal<int[]>([| 3; 2; 1; 1 |], AList.toArray (AList.sortDescending (CList.value l)))
-    Assert.Equal<int[]>([| 1; 1; 2; 3 |], AList.toArray (AList.sortBy (fun v -> v) (CList.value l)))
-    Assert.Equal<int[]>([| 1; 1; 2; 3 |], AList.toArray (AList.sortWith (fun a b -> compare a b) (CList.value l)))
+    Assert.Equal<int[]>([| 1; 1; 2; 3 |], source |> AList.sort |> AList.toArray)
+    Assert.Equal<int[]>([| 3; 2; 1; 1 |], source |> AList.sortDescending |> AList.toArray)
+    Assert.Equal<int[]>([| 1; 1; 2; 3 |], source |> AList.sortBy (fun v -> v) |> AList.toArray)
+    Assert.Equal<int[]>([| 1; 1; 2; 3 |], source |> AList.sortWith (fun a b -> compare a b) |> AList.toArray)
 
     // sortByi: the projection sees the input position at poll time; stable.
-    let bySum = AList.sortByi (fun i v -> i + v) (CList.value l)
+    let bySum = l |> CList.value |> AList.sortByi (fun i v -> i + v)
     Assert.Equal<int[]>([| 1; 3; 2; 1 |], AList.toArray bySum) // keys: 3, 2, 4, 4
 
     let l2 = CList.ofSeq [ 1; 2; 3 ]
-    let byDesc = AList.sortByDescending (fun v -> v) (CList.value l2)
+    let byDesc = l2 |> CList.value |> AList.sortByDescending (fun v -> v)
     Assert.Equal<int[]>([| 3; 2; 1 |], AList.toArray byDesc)
 
-    let byDesci = AList.sortByDescendingi (fun i v -> i + v) (CList.value l2)
+    let byDesci = l2 |> CList.value |> AList.sortByDescendingi (fun i v -> i + v)
     Assert.Equal<int[]>([| 3; 2; 1 |], AList.toArray byDesci) // keys: 1, 3, 5
 
 [<Fact>]
@@ -5481,28 +5483,30 @@ let ``AList exists forall and countBy`` () =
 [<Fact>]
 let ``AList tryMin tryMax sum average`` () =
     let l = CList.ofSeq [ 3; 1; 2 ]
+    let source = CList.value l
 
-    Assert.Equal(ValueSome 1, AVal.getValue (AList.tryMin (CList.value l)))
-    Assert.Equal(ValueSome 3, AVal.getValue (AList.tryMax (CList.value l)))
-    Assert.Equal(6, AVal.getValue (AList.sum (CList.value l)))
+    Assert.Equal(ValueSome 1, source |> AList.tryMin |> AVal.getValue)
+    Assert.Equal(ValueSome 3, source |> AList.tryMax |> AVal.getValue)
+    Assert.Equal(6, source |> AList.sum |> AVal.getValue)
 
     let lf = CList.ofSeq [ 1.0; 2.0; 3.0 ]
-    Assert.Equal(2.0, AVal.getValue (AList.average (CList.value lf)))
-    Assert.Equal(4.0, AVal.getValue (AList.averageBy (fun v -> v * 2.0) (CList.value lf)))
+    let sourceF = CList.value lf
+    Assert.Equal(2.0, sourceF |> AList.average |> AVal.getValue)
+    Assert.Equal(4.0, sourceF |> AList.averageBy (fun v -> v * 2.0) |> AVal.getValue)
 
     CList.removeAt 1 l // [ 3; 2 ]
-    Assert.Equal(ValueSome 2, AVal.getValue (AList.tryMin (CList.value l)))
-    Assert.Equal(ValueSome 3, AVal.getValue (AList.tryMax (CList.value l)))
-    Assert.Equal(5, AVal.getValue (AList.sum (CList.value l)))
+    Assert.Equal(ValueSome 2, source |> AList.tryMin |> AVal.getValue)
+    Assert.Equal(ValueSome 3, source |> AList.tryMax |> AVal.getValue)
+    Assert.Equal(5, source |> AList.sum |> AVal.getValue)
 
     CList.removeAt 0 lf // [ 2.0; 3.0 ]
-    Assert.Equal(2.5, AVal.getValue (AList.average (CList.value lf)))
+    Assert.Equal(2.5, sourceF |> AList.average |> AVal.getValue)
 
     CList.removeAt 0 l
     CList.removeAt 0 l // empty
-    Assert.Equal(ValueNone, AVal.getValue (AList.tryMin (CList.value l)))
-    Assert.Equal(ValueNone, AVal.getValue (AList.tryMax (CList.value l)))
-    Assert.Equal(0, AVal.getValue (AList.sum (CList.value l)))
+    Assert.Equal(ValueNone, source |> AList.tryMin |> AVal.getValue)
+    Assert.Equal(ValueNone, source |> AList.tryMax |> AVal.getValue)
+    Assert.Equal(0, source |> AList.sum |> AVal.getValue)
 
 // =============================================================================
 // Bring list — Changeables group (gap sheet §6): cset UpdateTo/Perform/
@@ -5661,14 +5665,15 @@ let ``AMap toAList and ofAList`` () =
 [<Fact>]
 let ``ASet sort family returns sorted lists`` () =
     let s = CSet.ofSeq [ 3; 1; 2; 1 ] // the set dedups to { 1; 2; 3 }
+    let source = CSet.value s
 
-    Assert.Equal<int[]>([| 1; 2; 3 |], AList.toArray (ASet.sort (CSet.value s)))
-    Assert.Equal<int[]>([| 3; 2; 1 |], AList.toArray (ASet.sortDescending (CSet.value s)))
-    Assert.Equal<int[]>([| 1; 2; 3 |], AList.toArray (ASet.sortBy (fun v -> v) (CSet.value s)))
-    Assert.Equal<int[]>([| 3; 2; 1 |], AList.toArray (ASet.sortByDescending (fun v -> v) (CSet.value s)))
+    Assert.Equal<int[]>([| 1; 2; 3 |], source |> ASet.sort |> AList.toArray)
+    Assert.Equal<int[]>([| 3; 2; 1 |], source |> ASet.sortDescending |> AList.toArray)
+    Assert.Equal<int[]>([| 1; 2; 3 |], source |> ASet.sortBy (fun v -> v) |> AList.toArray)
+    Assert.Equal<int[]>([| 3; 2; 1 |], source |> ASet.sortByDescending (fun v -> v) |> AList.toArray)
 
     CSet.add 0 s
-    Assert.Equal<int[]>([| 0; 1; 2; 3 |], AList.toArray (ASet.sort (CSet.value s)))
+    Assert.Equal<int[]>([| 0; 1; 2; 3 |], source |> ASet.sort |> AList.toArray)
 
 [<Fact>]
 let ``AList slicing syntax`` () =
