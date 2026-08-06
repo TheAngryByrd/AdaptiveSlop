@@ -1244,9 +1244,11 @@ module CMap =
     /// Posts a full replace. Safe from any thread. See
     /// <see cref="postAddOrUpdate"/> for the application contract; a posted
     /// replace supersedes the other ops of the same pending batch (the
-    /// transaction semantics of <see cref="set"/>).
+    /// transaction semantics of <see cref="set"/>). The content is passed as
+    /// a seq so the posting thread allocates nothing: convert a <c>Map</c>
+    /// with <c>Map.toSeq</c> at the call site when needed.
     /// </summary>
-    let inline postSet (value: Map<'K, 'V>) (mapValue: cmap<'K, 'V>) = mapValue.PostSet(Map.toSeq value)
+    let inline postSet (value: seq<'K * 'V>) (mapValue: cmap<'K, 'V>) = mapValue.PostSet value
 
     /// <summary>
     /// Posts a clear (a full replace with the empty map). Safe from any

@@ -790,7 +790,7 @@ type ChangeableMap<'K, 'V when 'K: equality>(initial: seq<'K * 'V>) =
     /// <example>
     /// <code>
     /// // worker thread
-    /// CMap.postSet (Map.ofList [ 1, "a" ]) map
+    /// CMap.postSet (Map.toSeq (Map.ofList [ 1, "a" ])) map
     /// </code>
     /// </example>
     member this.PostSet(newValue: seq<'K * 'V>) = this.PostOp(MapPostOp.Replace newValue)

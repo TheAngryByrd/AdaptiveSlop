@@ -5844,6 +5844,36 @@ let ``CMap posts apply as one net delta`` () =
     Assert.Equal<Map<int, string>>(Map.ofList [ 2, "b" ], AMap.toMap mapValue)
 
 [<Fact>]
+let ``CMap postSet and postClear replace the content`` () =
+    let mapValue = CMap.ofSeq [ 1, "a"; 2, "b" ]
+    let doneSignal = new ManualResetEventSlim(false)
+
+    let worker =
+        Task.Run(fun () ->
+            CMap.postAddOrUpdate 3 "c" mapValue
+            CMap.postSet (Map.toSeq (Map.ofList [ 9, "z" ])) mapValue // supersedes the batch
+            doneSignal.Set())
+
+    doneSignal.Wait()
+    worker.Wait()
+    Posting.pump ()
+
+    Assert.Equal<Map<int, string>>(Map.ofList [ 9, "z" ], AMap.toMap mapValue)
+
+    let doneSignal2 = new ManualResetEventSlim(false)
+
+    let worker2 =
+        Task.Run(fun () ->
+            CMap.postClear mapValue
+            doneSignal2.Set())
+
+    doneSignal2.Wait()
+    worker2.Wait()
+    Posting.pump ()
+
+    Assert.Equal<Map<int, string>>(Map.empty, AMap.toMap mapValue)
+
+[<Fact>]
 let ``CList posts preserve order and apply-time positions`` () =
     let items = CList.empty<int>
     let doneSignal = new ManualResetEventSlim(false)
