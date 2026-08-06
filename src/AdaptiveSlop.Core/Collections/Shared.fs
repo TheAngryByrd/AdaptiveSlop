@@ -385,6 +385,29 @@ type ListDelta<'T> =
         this.Ops.Items[this.Ops.Count] <- ListOp(ListOpKind.Update, position, value, 0uy)
         this.Ops.Count <- this.Ops.Count + 1
 
+/// <summary>
+/// A class-based delta builder for <see cref="AList.custom"/> computes. The
+/// struct <see cref="ListDelta&lt;'T&gt;"/> is passed by value (its counter
+/// would be copied); this class keeps the appends visible to the node.
+/// </summary>
+type ListDeltaBuilder<'T>() =
+    let mutable delta = ListDelta<'T>.Create()
+
+    member internal _.IsEmpty = delta.IsEmpty
+
+    member internal this.Clear() = delta.Clear()
+
+    member internal this.Snapshot() = delta
+
+    /// <summary>Appends an insert operation. Positions refer to the state as of the previous operation.</summary>
+    member this.Insert(position: int, value: 'T) = delta.Insert(position, value)
+
+    /// <summary>Appends a remove operation. Positions refer to the state as of the previous operation.</summary>
+    member this.Remove(position: int) = delta.Remove(position)
+
+    /// <summary>Appends an update operation. Positions refer to the state as of the previous operation.</summary>
+    member this.Update(position: int, value: 'T) = delta.Update(position, value)
+
 /// <summary>Internal. Receives deltas from a list dependency.</summary>
 type internal IListDeltaSink<'T> =
     abstract member OnDeltas: ops: ListOp<'T>[] * opCount: int -> unit
@@ -519,6 +542,30 @@ type internal MapNodeState<'K, 'V, 'U when 'K: equality> =
             MapDelta<_, _>.Create(),
             MapDelta<_, _>.Create()
         )
+
+/// <summary>
+/// Per-element cache entry of the <c>*A</c> nodes (mapA/chooseA/filterA,
+/// docs/2026-08-05-MAPA-DESIGN.md). Holds the element's aval, its version at
+/// the last force (the version read BEFORE the force: a mid-force write then
+/// leaves the stored version stale, so the next scan re-forces), its last
+/// contribution to the output, and the registration state with the aval's
+/// edge list. <see cref="Id"/> disambiguates <c>SetDepSlot</c> updates when
+/// the aval's edge list is reordered by another dependent.
+/// </summary>
+[<Struct>]
+type internal ElementEntry<'U> =
+    val mutable Aval: aval<'U voption>
+    val mutable Version: int64
+    val mutable Last: 'U voption
+    val mutable Id: int
+    val mutable EdgeIndex: int
+
+    new(aval: aval<'U voption>, version: int64, last: 'U voption, id: int, edgeIndex: int) =
+        { Aval = aval
+          Version = version
+          Last = last
+          Id = id
+          EdgeIndex = edgeIndex }
 
 // =============================================================================
 // Shared operations
@@ -1438,11 +1485,31 @@ module internal Collections =
         if not wasActive then
             ctx.DeliverNotifications()
 
+    /// <summary>
+    /// The concrete HashSet view of a set node when available (the hot path,
+    /// zero allocation); constant nodes hold FrozenSets, so a foreign view is
+    /// materialized once.
+    /// </summary>
+    let inline asHashSet (view: IReadOnlySet<'T>) =
+        match view with
+        | :? HashSet<'T> as h -> h
+        | other -> HashSet<'T>(other)
+
+    /// <summary>
+    /// The concrete Dictionary view of a map node when available (the hot
+    /// path, zero allocation); constant nodes hold FrozenDictionaries, so a
+    /// foreign view is materialized once.
+    /// </summary>
+    let inline asDictionary (view: IReadOnlyDictionary<'K, 'V>) =
+        match view with
+        | :? Dictionary<'K, 'V> as d -> d
+        | other -> Dictionary<'K, 'V>(other)
+
     /// <summary>Initial load of a two-source set node: build the state from both source views.</summary>
     let loadTwoSet (op: TwoSetOp) (left: IAdaptiveSet<'T>) (right: IAdaptiveSet<'T>) (state: TwoSetState<'T> byref) =
-        // The views are always HashSets in this implementation; interface
+        // The views are HashSets in this implementation; interface
         // iteration would box the enumerator (measured 40 B per element).
-        let leftView = left.GetValue() :?> HashSet<'T>
+        let leftView = asHashSet (left.GetValue())
 
         for x in leftView do
             let struct (set2, _) = refAdd state.Left x
@@ -1453,7 +1520,7 @@ module internal Collections =
             | Xor -> state.Out.Add x |> ignore
             | Intersect -> () // the right loop seeds the intersection
 
-        let rightView = right.GetValue() :?> HashSet<'T>
+        let rightView = asHashSet (right.GetValue())
 
         for x in rightView do
             let struct (set2, _) = refAdd state.Right x
@@ -1910,6 +1977,56 @@ module internal Collections =
 
         changed
 
+    /// <summary>
+    /// Replace the state of a list node with <paramref name="next"/> and
+    /// collect the positional diff as the output delta (prefix/suffix, the
+    /// <c>ChangeableList.ApplyDiff</c> algorithm). Returns whether anything
+    /// changed. The ops are appended via the public <see cref="ListDelta"/>
+    /// helpers (application order: removals then inserts for the structural
+    /// case, updates in place for the equal-count case).
+    /// </summary>
+    let rebuildListDiff (next: IReadOnlyList<'T>) (data: ResizeArray<'T>) (out: ListDelta<'T> byref) : bool =
+        let oldCount = data.Count
+        let newCount = next.Count
+        let mutable prefix = 0
+        let limit = min oldCount newCount
+
+        while prefix < limit
+              && EqualityComparer<'T>.Default.Equals(data[prefix], next[prefix]) do
+            prefix <- prefix + 1
+
+        let mutable suffix = 0
+        let mutable trimming = true
+
+        while trimming do
+            if
+                suffix < limit - prefix
+                && EqualityComparer<'T>.Default.Equals(data[oldCount - 1 - suffix], next[newCount - 1 - suffix])
+            then
+                suffix <- suffix + 1
+            else
+                trimming <- false
+
+        let oldMid = oldCount - prefix - suffix
+        let newMid = newCount - prefix - suffix
+
+        if oldMid = newMid then
+            for i in 0 .. oldMid - 1 do
+                let v = next[prefix + i]
+                data[prefix + i] <- v
+                out.Update(prefix + i, v)
+        else
+            for i in oldMid - 1 .. -1 .. 0 do
+                data.RemoveAt(prefix + i)
+                out.Remove(prefix + i)
+
+            for i in 0 .. newMid - 1 do
+                let v = next[prefix + i]
+                data.Insert(prefix + i, v)
+                out.Insert(prefix + i, v)
+
+        not out.IsEmpty
+
     // =============================================================================
     // Dynamic dependencies (PLAN.md Section 7.4): collect and bind.
     //
@@ -2076,10 +2193,10 @@ module internal Collections =
                     // sees only deltas that follow this point in time.
                     let view = inner.GetValue()
                     let mutable entry = CollectEntry<'U>(inner)
-                    // The view is always a HashSet in this implementation; an
+                    // The view is a HashSet in this implementation; an
                     // interface iteration would box the enumerator (measured
                     // 40 B per element).
-                    let data = view :?> HashSet<'U>
+                    let data = asHashSet view
 
                     for u in data do
                         if not (s.Scratch.ContainsKey u) then

@@ -61,6 +61,29 @@ module ASet =
     let inline filter ([<InlineIfLambda>] predicate: 'T -> bool) (set: aset<'T>) : aset<'T> =
         new FilterSetNode<'T>(set, predicate)
 
+    /// <summary>
+    /// Adaptively maps every element of the set to an adaptive value (FDA
+    /// <c>ASet.mapA</c> parity). The output follows the aval returned for
+    /// each element; writes to the avals deliver targeted deltas.
+    /// </summary>
+    let inline mapA ([<InlineIfLambda>] mapping: 'T -> aval<'U>) (set: aset<'T>) : aset<'U> =
+        new ElementSetNode<'T, 'U>(set, fun x -> AVal.map ValueSome (mapping x))
+
+    /// <summary>
+    /// Adaptively maps every element of the set to an adaptive value, keeping
+    /// only the elements whose aval holds <c>Some</c> (FDA
+    /// <c>ASet.chooseA</c> parity).
+    /// </summary>
+    let inline chooseA ([<InlineIfLambda>] mapping: 'T -> aval<'U option>) (set: aset<'T>) : aset<'U> =
+        new ElementSetNode<'T, 'U>(set, fun x -> AVal.map Option.toValueOption (mapping x))
+
+    /// <summary>
+    /// Adaptively keeps the elements whose predicate aval holds <c>true</c>
+    /// (FDA <c>ASet.filterA</c> parity).
+    /// </summary>
+    let inline filterA ([<InlineIfLambda>] predicate: 'T -> aval<bool>) (set: aset<'T>) : aset<'T> =
+        new ElementSetNode<'T, 'T>(set, fun x -> AVal.map (fun b -> if b then ValueSome x else ValueNone) (predicate x))
+
     /// <summary>The union of two sets.</summary>
     let inline union (left: aset<'T>) (right: aset<'T>) : aset<'T> = new UnionSetNode<'T>(left, right)
 
@@ -111,6 +134,33 @@ module ASet =
     let inline collect ([<InlineIfLambda>] mapping: 'T -> aset<'U>) (set: aset<'T>) : aset<'U> =
         new CollectSetNode<'T, 'U>(set, mapping)
 
+    /// <summary>
+    /// Flattens the set by statically expanding each element to a sequence
+    /// (FDA <c>ASet.collect'</c> parity). The expansion runs per source
+    /// element change; the inner sequences are constant.
+    /// </summary>
+    let inline collect' ([<InlineIfLambda>] mapping: 'T -> seq<'U>) (set: aset<'T>) : aset<'U> =
+        collect (mapping >> ofSeq) set
+
+    /// <summary>
+    /// Maps every element, disposing the mapped value when its last source
+    /// occurrence leaves (FDA <c>ASet.mapUse</c> parity). The mapped values
+    /// are stable (the mapping runs once per source element). Disposing the
+    /// returned disposable disposes all live mapped values and clears the
+    /// output set.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// let src = CSet.ofSeq [ 1; 2 ]
+    /// let cleanup, mapped = src |> ASet.mapUse (fun id -&gt; Resource(id))
+    /// CSet.remove 1 src          // the resource for 1 is disposed
+    /// cleanup.Dispose()          // all remaining resources are disposed
+    /// </code>
+    /// </example>
+    let inline mapUse ([<InlineIfLambda>] mapping: 'A -> 'B) (set: aset<'A>) : IDisposable * aset<'B> =
+        let node = new MapUseSetNode<'A, 'B>(set, mapping)
+        (node :> IDisposable, node :> aset<'B>)
+
     /// <summary>The elements of the left set that are not in the right set.</summary>
     let inline difference (left: aset<'T>) (right: aset<'T>) : aset<'T> =
         new TwoSourceSetNode<'T>(TwoSetOp.Difference, left, right)
@@ -153,6 +203,36 @@ module ASet =
         new BindSetNode<'T, 'U>(value, mapping)
 
     /// <summary>
+    /// An adaptive numeric range (FDA <c>ASet.range</c> parity). The set is
+    /// rebuilt when either bound changes; the bounds are inclusive.
+    /// </summary>
+    let inline range (min: aval< ^T >) (max: aval< ^T >) : aset< ^T > =
+        ofAVal (AVal.map2 (fun lo hi -> seq { lo..hi }) min max)
+
+    /// <summary>
+    /// Adaptively maps over the two values and returns the resulting set (FDA
+    /// <c>ASet.bind2</c> parity). When either value changes, the whole inner
+    /// set is swapped (the bind semantics). Composed as one bind over the
+    /// mapped pair (the FDA approach: nested binds would miss the inner
+    /// bind's swap, which signals by version only, not by delta).
+    /// </summary>
+    let inline bind2 ([<InlineIfLambda>] mapping: 'A -> 'B -> aset<'C>) (a: aval<'A>) (b: aval<'B>) : aset<'C> =
+        bind (fun (av, bv) -> mapping av bv) (AVal.map2 (fun av bv -> (av, bv)) a b)
+
+    /// <summary>
+    /// Adaptively maps over the three values and returns the resulting set
+    /// (FDA <c>ASet.bind3</c> parity). When any value changes, the whole
+    /// inner set is swapped (the bind semantics).
+    /// </summary>
+    let inline bind3
+        ([<InlineIfLambda>] mapping: 'A -> 'B -> 'C -> aset<'D>)
+        (a: aval<'A>)
+        (b: aval<'B>)
+        (c: aval<'C>)
+        : aset<'D> =
+        bind (fun (av, bv, cv) -> mapping av bv cv) (AVal.map3 (fun av bv cv -> (av, bv, cv)) a b c)
+
+    /// <summary>
     /// An adaptive set over an external reader function. The reader is called
     /// on every read (poll); the node diffs the result against its state and
     /// emits the diff as the delta. Pull-based: nothing marks this node, so
@@ -168,6 +248,28 @@ module ASet =
     /// </summary>
     let inline custom ([<InlineIfLambda>] compute: IReadOnlySet<'T> -> SetDeltaBuilder<'T> -> unit) : aset<'T> =
         new CustomSetNode<'T>(compute)
+
+    /// <summary>
+    /// Creates an adaptive set from an external snapshot function and an
+    /// invalidate handle (FDA <c>ASet.ofExternal</c> parity, MAPA-DESIGN §1.1).
+    /// The snapshot runs at most once per invalidate, on the next read, and is
+    /// diffed against the previous snapshot; not invalidated → reads are
+    /// O(1) and allocate nothing. The handle is O(1) to call and thread-safe
+    /// (a foreign-thread call is posted to the owner context and applied at
+    /// the next graph operation).
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// let mutable current = HashSet [ 1; 2; 3 ]
+    /// let set, invalidate = ASet.ofExternal (fun () -&gt; current :&gt; IReadOnlySet&lt;_&gt;)
+    /// current &lt;- HashSet [ 1; 3 ]
+    /// invalidate ()
+    /// let forced = ASet.force set   // { 1; 3 }
+    /// </code>
+    /// </example>
+    let inline ofExternal ([<InlineIfLambda>] snapshot: unit -> IReadOnlySet<'T>) : aset<'T> * (unit -> unit) =
+        let node = new ExternalSetNode<'T>(snapshot)
+        (node :> aset<'T>, fun () -> node.Invalidate())
 
     /// <summary>
     /// Registers a callback that receives the current view and the net delta
@@ -282,12 +384,82 @@ module ASet =
     let inline countBy ([<InlineIfLambda>] predicate: 'T -> bool) (set: aset<'T>) : aval<int> =
         new SetReduceNode<'T, bool, int, int>(set, predicate, AdaptiveReduction.countPositive)
 
+    // =========================================================================
+    // The *A reductions (docs/2026-08-05-MAPA-DESIGN.md §10, v2): composition
+    // over mapA + the existing reduction nodes. No new node types. FDA
+    // argument order: reduction, mapping, set.
+    // =========================================================================
+
+    /// <summary>
+    /// Adaptively reduces the set after mapping every element to an adaptive
+    /// value (FDA <c>ASet.reduceByA</c> parity). The mapped values must be
+    /// equality-comparable (the mapA node's constraint). Composition: the
+    /// mapping produces distinct pairs <c>struct (x, v)</c>, so duplicate
+    /// mapped values keep their multiplicity (a plain mapA would deduplicate
+    /// them); the reduction projects the value side.
+    /// </summary>
+    let inline reduceByA
+        (reduction: AdaptiveReduction<'U, 's, 'v>)
+        ([<InlineIfLambda>] mapping: 'T -> aval<'U>)
+        (set: aset<'T>)
+        : aval<'v> =
+        set
+        |> mapA (fun x -> AVal.map (fun v -> struct (x, v)) (mapping x))
+        |> reduceBy reduction (fun struct (_, v) -> v)
+
+    /// <summary>
+    /// Adaptively counts the elements whose predicate aval holds <c>true</c>
+    /// (FDA <c>ASet.countByA</c> parity). Composition: filterA + count
+    /// (element-preserving, unlike a bool-mapped reduce).
+    /// </summary>
+    let inline countByA ([<InlineIfLambda>] predicate: 'T -> aval<bool>) (set: aset<'T>) : aval<int> =
+        set |> filterA predicate |> count
+
+    /// <summary>Adaptively tests if any element's predicate aval holds <c>true</c> (FDA <c>ASet.existsA</c> parity).</summary>
+    let inline existsA ([<InlineIfLambda>] predicate: 'T -> aval<bool>) (set: aset<'T>) : aval<bool> =
+        set |> countByA predicate |> AVal.map (fun c -> c <> 0)
+
+    /// <summary>Adaptively tests if every element's predicate aval holds <c>true</c> (FDA <c>ASet.forallA</c> parity).</summary>
+    let inline forallA ([<InlineIfLambda>] predicate: 'T -> aval<bool>) (set: aset<'T>) : aval<bool> =
+        set
+        |> filterA (fun x -> AVal.map not (predicate x))
+        |> count
+        |> AVal.map (fun c -> c = 0)
+
+    /// <summary>Adaptively sums the avals mapped from the elements (FDA <c>ASet.sumByA</c> parity).</summary>
+    let inline sumByA ([<InlineIfLambda>] mapping: 'T -> aval<'U>) (set: aset<'T>) : aval<'U> =
+        reduceByA (AdaptiveReduction.sum ()) mapping set
+
+    /// <summary>
+    /// Adaptively averages the avals mapped from the elements (FDA
+    /// <c>ASet.averageByA</c> parity; needs a numeric type with
+    /// <c>DivideByInt</c>, e.g. <c>float</c>).
+    /// </summary>
+    let inline averageByA ([<InlineIfLambda>] mapping: 'T -> aval<'U>) (set: aset<'T>) : aval<'U> =
+        AVal.map2
+            (fun total count -> LanguagePrimitives.DivideByInt total count)
+            (reduceByA (AdaptiveReduction.sum ()) mapping set)
+            (count set)
+
     /// <summary>Adaptively sums the elements.</summary>
     let inline sum (set: aset<'T>) : aval<'T> = reduce (AdaptiveReduction.sum ()) set
 
     /// <summary>Adaptively sums the mapped elements.</summary>
     let inline sumBy ([<InlineIfLambda>] mapping: 'T -> 'U) (set: aset<'T>) : aval<'U> =
         reduceBy (AdaptiveReduction.sum ()) mapping set
+
+    /// <summary>
+    /// Adaptively averages the elements (needs a numeric type with
+    /// <c>DivideByInt</c>, e.g. <c>float</c>). The average is sum/count.
+    /// </summary>
+    let inline average (set: aset< ^T >) : aval< ^T > =
+        AVal.map2 (fun total count -> LanguagePrimitives.DivideByInt total count) (sum set) (count set)
+
+    /// <summary>
+    /// Adaptively averages the mapped elements (needs a numeric type with
+    /// <c>DivideByInt</c>, e.g. <c>float</c>).
+    /// </summary>
+    let inline averageBy ([<InlineIfLambda>] mapping: 'T -> ^U) (set: aset<'T>) : aval< ^U > = average (map mapping set)
 
     /// <summary>Adaptively gets the minimum element, or <c>ValueNone</c> when empty.</summary>
     let inline tryMin (set: aset<'T>) : aval<'T voption> =
@@ -324,6 +496,30 @@ module ASet =
     /// </summary>
     let inline force (set: aset<'T>) : FrozenSet<'T> = set.GetValue().ToFrozenSet()
 
+    /// <summary>
+    /// The sorted set as a list, using the given comparison (gap sheet §10.2,
+    /// stable, poll node; a sorted set is a list by construction).
+    /// </summary>
+    let inline sortWith ([<InlineIfLambda>] comparer: 'T -> 'T -> int) (set: aset<'T>) : alist<'T> =
+        new SortListNode<'T, 'T>(new SetToListNode<'T>(set), (fun _ v -> v), comparer)
+
+    /// <summary>The sorted set as a list, ascending (gap sheet §10.2, stable).</summary>
+    let inline sort (set: aset<'T>) : alist<'T> = sortWith compare set
+
+    /// <summary>The sorted set as a list, descending (gap sheet §10.2, stable).</summary>
+    let inline sortDescending (set: aset<'T>) : alist<'T> = sortWith (fun a b -> compare b a) set
+
+    /// <summary>
+    /// The set sorted by the keys given by the projection, as a list (gap
+    /// sheet §10.2, stable).
+    /// </summary>
+    let inline sortBy ([<InlineIfLambda>] f: 'T -> 'K) (set: aset<'T>) : alist<'T> =
+        new SortListNode<'T, 'K>(new SetToListNode<'T>(set), (fun _ v -> f v), compare)
+
+    /// <summary>The set sorted by the keys given by the projection, descending (gap sheet §10.2, stable).</summary>
+    let inline sortByDescending ([<InlineIfLambda>] f: 'T -> 'K) (set: aset<'T>) : alist<'T> =
+        new SortListNode<'T, 'K>(new SetToListNode<'T>(set), (fun _ v -> f v), fun a b -> compare b a)
+
     /// <summary>Materializes the F# <c>Set</c> counterpart (sorted, structural equality).</summary>
     let inline toSet (set: aset<'T>) : Set<'T> = Set.ofSeq (set.GetValue())
 
@@ -343,6 +539,67 @@ module CSet =
 
     /// <summary>Replaces the whole set.</summary>
     let inline set (value: Set<'T>) (set: cset<'T>) = set.Set value
+
+    /// <summary>
+    /// Replaces the whole set and returns whether the content changed (FDA
+    /// <c>cset.UpdateTo</c> parity). An equal target marks nothing.
+    /// </summary>
+    let inline updateTo (target: seq<'T>) (set: cset<'T>) : bool =
+        let targetSet = HashSet<'T>(target)
+        let view = ASet.getValue set
+        let mutable changed = view.Count <> targetSet.Count
+
+        if not changed then
+            for x in view do
+                if not (targetSet.Contains x) then
+                    changed <- true
+
+        if changed then
+            set.Set target
+
+        changed
+
+    /// <summary>
+    /// Applies a batch of set operations (FDA <c>cset.Perform</c> parity). The
+    /// batch is applied atomically: observers receive one net delta. Adding and
+    /// removing the same element within the batch cancels.
+    /// </summary>
+    let perform (delta: SetDeltaBuilder<'T>) (set: cset<'T>) : unit =
+        let d = delta.Snapshot()
+
+        if not d.IsEmpty then
+            Transaction.run (fun () ->
+                let adds = d.Added
+
+                for i in 0 .. adds.Length - 1 do
+                    set.Add adds.Span[i] |> ignore
+
+                let rems = d.Removed
+
+                for i in 0 .. rems.Length - 1 do
+                    set.Remove rems.Span[i] |> ignore)
+
+    /// <summary>Adds all the given elements (FDA <c>cset.UnionWith</c> parity; one atomic batch).</summary>
+    let inline unionWith (other: seq<'T>) (set: cset<'T>) : unit =
+        Transaction.run (fun () ->
+            for x in other do
+                set.Add x |> ignore)
+
+    /// <summary>Removes all the given elements (FDA <c>cset.ExceptWith</c> parity; one atomic batch).</summary>
+    let inline exceptWith (other: seq<'T>) (set: cset<'T>) : unit =
+        Transaction.run (fun () ->
+            for x in other do
+                set.Remove x |> ignore)
+
+    /// <summary>Keeps only the elements also present in <c>other</c> (FDA <c>cset.IntersectWith</c> parity; one atomic batch).</summary>
+    let inline intersectWith (other: seq<'T>) (set: cset<'T>) : unit =
+        Transaction.run (fun () ->
+            let otherSet = HashSet<'T>(other)
+            let view = ASet.getValue set
+
+            for x in view do
+                if not (otherSet.Contains x) then
+                    set.Remove x |> ignore)
 
     /// <summary>Views the changeable set as an adaptive set.</summary>
     let inline value (set: cset<'T>) : aset<'T> = set
@@ -411,6 +668,10 @@ module AMap =
     let inline chooseV ([<InlineIfLambda>] f: 'K -> 'V -> 'U voption) (mapValue: amap<'K, 'V>) : amap<'K, 'U> =
         new MapMapNode<'K, 'V, 'U>(mapValue, f)
 
+    /// <summary>Maps the values only (FDA <c>AMap.map'</c> parity; the V suffix is the value-only convention).</summary>
+    let inline mapV ([<InlineIfLambda>] f: 'V -> 'U) (mapValue: amap<'K, 'V>) : amap<'K, 'U> =
+        map (fun _ v -> f v) mapValue
+
     /// <summary>Unions both maps, resolving colliding keys with the given function.</summary>
     let inline unionWith
         ([<InlineIfLambda>] resolve: 'K -> 'V -> 'V -> 'V)
@@ -448,6 +709,13 @@ module AMap =
                 | ValueSome l, ValueSome r -> ValueSome(struct (l, r))
                 | _ -> ValueNone
         )
+
+    /// <summary>
+    /// Alias of <see cref="intersect"/> (FDA parity name; our intersect is
+    /// already the struct-pair form, gap sheet §4.6).
+    /// </summary>
+    let inline intersectV (left: amap<'K, 'V1>) (right: amap<'K, 'V2>) : amap<'K, struct ('V1 * 'V2)> =
+        intersect left right
 
     /// <summary>Intersects both maps, combining the paired values.</summary>
     let inline intersectWith
@@ -532,9 +800,31 @@ module AMap =
     let inline mapSet ([<InlineIfLambda>] mapping: 'K -> 'V) (set: aset<'K>) : amap<'K, 'V> =
         new SetToMapNode<'K, 'V, 'K>(set, (fun k -> (k, mapping k)), false)
 
-    /// <summary>An adaptive set of the map's keys (FDA <c>toASet</c> parity).</summary>
-    let inline toASet (mapValue: amap<'K, 'V>) : aset<'K> =
+    /// <summary>
+    /// An adaptive set of the map's key/value pairs (FDA <c>AMap.toASet</c>
+    /// parity, gap sheet §4.14). Struct pairs: the library convention (cf.
+    /// <see cref="intersect"/>). The former keys behavior moved to
+    /// <see cref="keys"/>.
+    /// </summary>
+    let inline toASet (mapValue: amap<'K, 'V>) : aset<struct ('K * 'V)> =
+        new MapToSetNode<'K, 'V, struct ('K * 'V)>(mapValue, fun k v -> struct (k, v))
+
+    /// <summary>An adaptive set of the map's keys (gap sheet §4.14).</summary>
+    let inline keys (mapValue: amap<'K, 'V>) : aset<'K> =
         new MapToSetNode<'K, 'V, 'K>(mapValue, fun k _ -> k)
+
+    /// <summary>
+    /// An adaptive list of the map's entries (FDA <c>AMap.toAList</c> parity,
+    /// poll node). The order is the map's iteration order, stable while the
+    /// map does not change.
+    /// </summary>
+    let inline toAList (mapValue: amap<'K, 'V>) : alist<'K * 'V> = new MapToAListNode<'K, 'V>(mapValue)
+
+    /// <summary>
+    /// An adaptive map of a list of entries (FDA <c>AMap.ofAList</c> parity).
+    /// Duplicate keys: the last entry wins.
+    /// </summary>
+    let inline ofAList (list: alist<'K * 'V>) : amap<'K, 'V> = new AListToMapNode<'K, 'V>(list)
 
     /// <summary>An adaptive set of the map's distinct values (FDA <c>toASetValues</c> parity).</summary>
     let inline toASetValues (mapValue: amap<'K, 'V>) : aset<'V> =
@@ -570,6 +860,29 @@ module AMap =
         new BindMapNode<'K, 'V, 'T>(value, mapping)
 
     /// <summary>
+    /// Adaptively maps over the two values and returns the resulting map (FDA
+    /// <c>AMap.bind2</c> parity). When either value changes, the whole inner
+    /// map is swapped (the bind semantics). Composed as one bind over the
+    /// mapped pair (the FDA approach: nested binds would miss the inner
+    /// bind's swap, which signals by version only, not by delta).
+    /// </summary>
+    let inline bind2 ([<InlineIfLambda>] mapping: 'A -> 'B -> amap<'K, 'V>) (a: aval<'A>) (b: aval<'B>) : amap<'K, 'V> =
+        bind (fun (av, bv) -> mapping av bv) (AVal.map2 (fun av bv -> (av, bv)) a b)
+
+    /// <summary>
+    /// Adaptively maps over the three values and returns the resulting map
+    /// (FDA <c>AMap.bind3</c> parity). When any value changes, the whole
+    /// inner map is swapped (the bind semantics).
+    /// </summary>
+    let inline bind3
+        ([<InlineIfLambda>] mapping: 'A -> 'B -> 'C -> amap<'K, 'V>)
+        (a: aval<'A>)
+        (b: aval<'B>)
+        (c: aval<'C>)
+        : amap<'K, 'V> =
+        bind (fun (av, bv, cv) -> mapping av bv cv) (AVal.map3 (fun av bv cv -> (av, bv, cv)) a b c)
+
+    /// <summary>
     /// An adaptive map driven by a compute function (FDA <c>AMap.custom</c>
     /// parity, pull model). The compute receives the current view and a delta
     /// builder; it appends the operations that describe the change since the
@@ -580,9 +893,87 @@ module AMap =
         : amap<'K, 'V> =
         new CustomMapNode<'K, 'V>(compute)
 
+    /// <summary>
+    /// Creates an adaptive map from an external snapshot function and an
+    /// invalidate handle (FDA <c>AMap.ofExternal</c> parity, MAPA-DESIGN §1.1).
+    /// The snapshot runs at most once per invalidate, on the next read, and is
+    /// diffed against the previous snapshot (equal values elided); not
+    /// invalidated → reads are O(1) and allocate nothing. The handle is O(1)
+    /// to call and thread-safe (a foreign-thread call is posted to the owner
+    /// context and applied at the next graph operation).
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// let mutable current = dict [ 1, "a" ]
+    /// let map, invalidate = AMap.ofExternal (fun () -&gt; current :&gt; IReadOnlyDictionary&lt;_, _&gt;)
+    /// current &lt;- dict [ 1, "a"; 2, "b" ]
+    /// invalidate ()
+    /// let forced = AMap.force map   // [ 1, "a"; 2, "b" ]
+    /// </code>
+    /// </example>
+    let inline ofExternal
+        ([<InlineIfLambda>] snapshot: unit -> IReadOnlyDictionary<'K, 'V>)
+        : amap<'K, 'V> * (unit -> unit) =
+        let node = new ExternalMapNode<'K, 'V>(snapshot)
+        (node :> amap<'K, 'V>, fun () -> node.Invalidate())
+
+    /// <summary>
+    /// Maps every entry, disposing the mapped value when its key leaves (FDA
+    /// <c>AMap.mapUse</c> parity). The mapped values are stable (the mapping
+    /// runs once per key). Disposing the returned disposable disposes all
+    /// live mapped values and clears the output map.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// let src = CMap.ofSeq [ 1, "a"; 2, "b" ]
+    /// let cleanup, mapped = src |> AMap.mapUse (fun id _ -&gt; Resource(id))
+    /// CMap.remove 1 src              // the resource for key 1 is disposed
+    /// cleanup.Dispose()              // all remaining resources are disposed
+    /// </code>
+    /// </example>
+    let inline mapUse
+        ([<InlineIfLambda>] mapping: 'K -> 'V -> 'W)
+        (mapValue: amap<'K, 'V>)
+        : IDisposable * amap<'K, 'W> =
+        let node = new MapUseMapNode<'K, 'V, 'W>(mapValue, mapping)
+        (node :> IDisposable, node :> amap<'K, 'W>)
+
     /// <summary>Keeps the entries that satisfy the predicate.</summary>
     let inline filter ([<InlineIfLambda>] predicate: 'K -> 'V -> bool) (mapValue: amap<'K, 'V>) : amap<'K, 'V> =
         new FilterMapNode<'K, 'V>(mapValue, predicate)
+
+    /// <summary>Keeps the entries whose value satisfies the predicate (FDA <c>AMap.filter'</c> parity; the V suffix is the value-only convention).</summary>
+    let inline filterV ([<InlineIfLambda>] predicate: 'V -> bool) (mapValue: amap<'K, 'V>) : amap<'K, 'V> =
+        filter (fun _ v -> predicate v) mapValue
+
+    /// <summary>
+    /// Adaptively maps every entry of the map to an adaptive value (FDA
+    /// <c>AMap.mapA</c> parity). The output follows the aval returned for
+    /// each entry; writes to the avals deliver targeted deltas.
+    /// </summary>
+    let inline mapA ([<InlineIfLambda>] mapping: 'K -> 'V -> aval<'U>) (mapValue: amap<'K, 'V>) : amap<'K, 'U> =
+        new ElementMapNode<'K, 'V, 'U>(mapValue, fun k v -> AVal.map ValueSome (mapping k v))
+
+    /// <summary>
+    /// Adaptively maps every entry of the map to an adaptive value, keeping
+    /// only the entries whose aval holds <c>Some</c> (FDA
+    /// <c>AMap.chooseA</c> parity).
+    /// </summary>
+    let inline chooseA
+        ([<InlineIfLambda>] mapping: 'K -> 'V -> aval<'U option>)
+        (mapValue: amap<'K, 'V>)
+        : amap<'K, 'U> =
+        new ElementMapNode<'K, 'V, 'U>(mapValue, fun k v -> AVal.map Option.toValueOption (mapping k v))
+
+    /// <summary>
+    /// Adaptively keeps the entries whose predicate aval holds <c>true</c>
+    /// (FDA <c>AMap.filterA</c> parity).
+    /// </summary>
+    let inline filterA ([<InlineIfLambda>] predicate: 'K -> 'V -> aval<bool>) (mapValue: amap<'K, 'V>) : amap<'K, 'V> =
+        new ElementMapNode<'K, 'V, 'V>(
+            mapValue,
+            fun k v -> AVal.map (fun b -> if b then ValueSome v else ValueNone) (predicate k v)
+        )
 
     /// <summary>
     /// Registers a callback that receives the current view and the net delta
@@ -661,10 +1052,47 @@ module AMap =
 
         new MapReduceNode<'k, 'v, struct ('k * 'v), 's, 's>(mapValue, mapping, AdaptiveReduction.group zero add2 sub2)
 
+    /// <summary>
+    /// Adaptively folds the map with a partially invertible <c>trySubtract</c>:
+    /// removals that cannot be inverted recompute the whole fold (FDA
+    /// <c>AMap.foldHalfGroup</c> parity).
+    /// </summary>
+    let inline foldHalfGroup
+        ([<InlineIfLambda>] add: 's -> 'k -> 'v -> 's)
+        ([<InlineIfLambda>] trySubtract: 's -> 'k -> 'v -> 's voption)
+        (zero: 's)
+        (mapValue: amap<'k, 'v>)
+        : aval<'s> =
+        let inline mapping k v = struct (k, v)
+        let inline add2 s struct (k, v) = add s k v
+        let inline sub2 s struct (k, v) = trySubtract s k v
+
+        new MapReduceNode<'k, 'v, struct ('k * 'v), 's, 's>(
+            mapValue,
+            mapping,
+            AdaptiveReduction.halfGroup zero add2 sub2
+        )
+
+    /// <summary>
+    /// Adaptively sums the mapped entries (FDA <c>AMap.sumBy</c> parity).
+    /// </summary>
+    let inline sumBy ([<InlineIfLambda>] mapping: 'k -> 'v -> 'u) (mapValue: amap<'k, 'v>) : aval<'u> =
+        reduceBy (AdaptiveReduction.sum ()) mapping mapValue
+
 
     /// <summary>Adaptively gets the number of entries.</summary>
     let inline count (mapValue: amap<'K, 'V>) : aval<int> =
         AdaptiveNode<int>(fun () -> mapValue.GetValue().Count)
+
+    /// <summary>
+    /// Adaptively averages the mapped entries (needs a numeric type with
+    /// <c>DivideByInt</c>, e.g. <c>float</c>). The average is sum/count.
+    /// </summary>
+    let inline averageBy ([<InlineIfLambda>] mapping: 'k -> 'v -> ^u) (mapValue: amap<'k, 'v>) : aval< ^u > =
+        AVal.map2
+            (fun total c -> LanguagePrimitives.DivideByInt total c)
+            (reduceBy (AdaptiveReduction.sum ()) mapping mapValue)
+            (count mapValue)
 
     /// <summary>Adaptively tests if the map is empty.</summary>
     let inline isEmpty (mapValue: amap<'K, 'V>) : aval<bool> =
@@ -746,7 +1174,7 @@ module AMap =
 
     /// <summary>Materializes the F# <c>Map</c> counterpart (sorted, structural equality).</summary>
     let inline toMap (mapValue: amap<'K, 'V>) : Map<'K, 'V> =
-        mapValue.GetValue() |> Seq.map (fun (KeyValue(k, v)) -> (k, v)) |> Map.ofSeq
+        [ for KeyValue(k, v) in mapValue.GetValue() -> k, v ] |> Map.ofList
 
 /// <summary>Operations on changeable maps.</summary>
 module CMap =
@@ -764,6 +1192,77 @@ module CMap =
 
     /// <summary>Replaces the whole map.</summary>
     let inline set (value: Map<'K, 'V>) (mapValue: cmap<'K, 'V>) = mapValue.Set(Map.toSeq value)
+
+    /// <summary>Tests whether the key is present (FDA <c>cmap.ContainsKey</c> parity).</summary>
+    let inline containsKey (key: 'K) (mapValue: cmap<'K, 'V>) : bool =
+        (AMap.getValue mapValue).ContainsKey key
+
+    /// <summary>Gets the value for the key, or <c>ValueNone</c> when absent (FDA <c>cmap.TryGetValue</c> parity).</summary>
+    let inline tryGetValue (key: 'K) (mapValue: cmap<'K, 'V>) : 'V voption =
+        let view = AMap.getValue mapValue
+        let mutable v = Unchecked.defaultof<'V>
+
+        if view.TryGetValue(key, &v) then ValueSome v else ValueNone
+
+    /// <summary>Gets the value for the key (FDA <c>cmap.Item</c> parity; <see cref="KeyNotFoundException"/> when absent).</summary>
+    let inline item (key: 'K) (mapValue: cmap<'K, 'V>) : 'V = (AMap.getValue mapValue).[key]
+
+    /// <summary>
+    /// Replaces the whole map and returns whether the content changed (FDA
+    /// <c>cmap.UpdateTo</c> parity; deviation: FDA merges with init/update, we
+    /// replace, matching <see cref="set"/>). An equal target marks nothing.
+    /// </summary>
+    let inline updateTo (target: seq<'K * 'V>) (mapValue: cmap<'K, 'V>) : bool =
+        let targetMap = Dictionary<'K, 'V>()
+
+        for k, v in target do
+            targetMap[k] <- v
+
+        let view = AMap.getValue mapValue
+        let mutable changed = view.Count <> targetMap.Count
+
+        if not changed then
+            for KeyValue(k, v) in view do
+                let mutable t = Unchecked.defaultof<'V>
+
+                if
+                    not (targetMap.TryGetValue(k, &t))
+                    || not (EqualityComparer<'V>.Default.Equals(t, v))
+                then
+                    changed <- true
+
+        if changed then
+            mapValue.Set target
+
+        changed
+
+    /// <summary>
+    /// Applies a batch of map operations (FDA <c>cmap.Perform</c> parity). The
+    /// batch is applied atomically: observers receive one net delta.
+    /// </summary>
+    let perform (delta: MapDeltaBuilder<'K, 'V>) (mapValue: cmap<'K, 'V>) : unit =
+        let d = delta.Snapshot()
+
+        if not d.IsEmpty then
+            Transaction.run (fun () ->
+                let sets = d.SetEntries
+
+                for i in 0 .. sets.Length - 1 do
+                    let struct (k, v) = sets.Span[i]
+                    mapValue.AddOrUpdate k v |> ignore
+
+                let rems = d.RemovedKeys
+
+                for i in 0 .. rems.Length - 1 do
+                    mapValue.Remove rems.Span[i] |> ignore)
+
+    /// <summary>Removes all entries (FDA <c>cmap.Clear</c> parity; one atomic batch).</summary>
+    let inline clear (mapValue: cmap<'K, 'V>) : unit =
+        Transaction.run (fun () ->
+            let view = AMap.getValue mapValue
+
+            for KeyValue(k, _) in view do
+                mapValue.Remove k |> ignore)
 
     /// <summary>Views the changeable map as an adaptive map.</summary>
     let inline value (mapValue: cmap<'K, 'V>) : amap<'K, 'V> = mapValue
@@ -810,13 +1309,13 @@ module AList =
 
     /// <summary>Maps every element of the list.</summary>
     let inline map ([<InlineIfLambda>] f: 'T -> 'U) (list: alist<'T>) : alist<'U> =
-        new FilterMapListNode<'T, 'U>(list, fun x -> ValueSome(f x))
+        new FilterMapListNode<'T, 'U>(list, fun _ x -> ValueSome(f x))
 
     /// <summary>Maps every element, keeping only the ones the mapping returns a value for.</summary>
     let inline choose ([<InlineIfLambda>] f: 'T -> 'U option) (list: alist<'T>) : alist<'U> =
         new FilterMapListNode<'T, 'U>(
             list,
-            fun x ->
+            fun _ x ->
                 match f x with
                 | Some u -> ValueSome u
                 | None -> ValueNone
@@ -824,11 +1323,93 @@ module AList =
 
     /// <summary>Maps every element, keeping only the ones the mapping returns a value for (voption form).</summary>
     let inline chooseV ([<InlineIfLambda>] f: 'T -> 'U voption) (list: alist<'T>) : alist<'U> =
-        new FilterMapListNode<'T, 'U>(list, f)
+        new FilterMapListNode<'T, 'U>(list, fun _ x -> f x)
 
     /// <summary>Keeps the elements that satisfy the predicate.</summary>
     let inline filter ([<InlineIfLambda>] predicate: 'T -> bool) (list: alist<'T>) : alist<'T> =
-        new FilterMapListNode<'T, 'T>(list, fun x -> if predicate x then ValueSome x else ValueNone)
+        new FilterMapListNode<'T, 'T>(list, fun _ x -> if predicate x then ValueSome x else ValueNone)
+
+    /// <summary>
+    /// Maps every element, passing the input position to the mapping (FDA
+    /// <c>AList.mapi</c> parity; the index is the <c>int</c> input position,
+    /// the positional deviation per ALIST-DESIGN §5).
+    /// </summary>
+    let inline mapi ([<InlineIfLambda>] f: int -> 'T -> 'U) (list: alist<'T>) : alist<'U> =
+        new FilterMapListNode<'T, 'U>(list, fun i x -> ValueSome(f i x))
+
+    /// <summary>Keeps the entries whose index-aware mapping returns a value (FDA <c>AList.choosei</c> parity).</summary>
+    let inline choosei ([<InlineIfLambda>] f: int -> 'T -> 'U option) (list: alist<'T>) : alist<'U> =
+        new FilterMapListNode<'T, 'U>(
+            list,
+            fun i x ->
+                match f i x with
+                | Some u -> ValueSome u
+                | None -> ValueNone
+        )
+
+    /// <summary>Keeps the elements whose index-aware predicate holds (FDA <c>AList.filteri</c> parity).</summary>
+    let inline filteri ([<InlineIfLambda>] predicate: int -> 'T -> bool) (list: alist<'T>) : alist<'T> =
+        new FilterMapListNode<'T, 'T>(list, fun i x -> if predicate i x then ValueSome x else ValueNone)
+
+    /// <summary>
+    /// An adaptive list of the elements paired with their input positions
+    /// (FDA <c>AList.indexed</c> parity; struct pair, the library convention;
+    /// the position is the <c>int</c> input position).
+    /// </summary>
+    let inline indexed (list: alist<'T>) : alist<struct (int * 'T)> = mapi (fun i v -> struct (i, v)) list
+
+    /// <summary>
+    /// Adaptively maps every element of the list to an adaptive value (FDA
+    /// <c>AList.mapA</c> parity). The output follows the aval returned for
+    /// each element; writes to the avals deliver targeted deltas.
+    /// </summary>
+    let inline mapA ([<InlineIfLambda>] mapping: 'T -> aval<'U>) (list: alist<'T>) : alist<'U> =
+        new ElementListNode<'T, 'U>(list, fun _ x -> AVal.map ValueSome (mapping x))
+
+    /// <summary>
+    /// Adaptively maps every element of the list to an adaptive value, keeping
+    /// only the elements whose aval holds <c>Some</c> (FDA
+    /// <c>AList.chooseA</c> parity).
+    /// </summary>
+    let inline chooseA ([<InlineIfLambda>] mapping: 'T -> aval<'U option>) (list: alist<'T>) : alist<'U> =
+        new ElementListNode<'T, 'U>(list, fun _ x -> AVal.map Option.toValueOption (mapping x))
+
+    /// <summary>
+    /// Adaptively keeps the elements whose predicate aval holds <c>true</c>
+    /// (FDA <c>AList.filterA</c> parity).
+    /// </summary>
+    let inline filterA ([<InlineIfLambda>] predicate: 'T -> aval<bool>) (list: alist<'T>) : alist<'T> =
+        new ElementListNode<'T, 'T>(
+            list,
+            fun _ x -> AVal.map (fun b -> if b then ValueSome x else ValueNone) (predicate x)
+        )
+
+    /// <summary>
+    /// Adaptively maps every element of the list to an adaptive value, passing
+    /// the input position to the mapping (FDA <c>AList.mapiA</c> parity;
+    /// FDA passes an <c>Index</c>, we pass the <c>int</c> position).
+    /// </summary>
+    let inline mapiA ([<InlineIfLambda>] mapping: int -> 'T -> aval<'U>) (list: alist<'T>) : alist<'U> =
+        new ElementListNode<'T, 'U>(list, fun i x -> AVal.map ValueSome (mapping i x))
+
+    /// <summary>
+    /// Adaptively maps every element of the list to an adaptive value, keeping
+    /// only the elements whose aval holds <c>Some</c>, passing the input
+    /// position to the mapping (FDA <c>AList.chooseiA</c> parity).
+    /// </summary>
+    let inline chooseiA ([<InlineIfLambda>] mapping: int -> 'T -> aval<'U option>) (list: alist<'T>) : alist<'U> =
+        new ElementListNode<'T, 'U>(list, fun i x -> AVal.map Option.toValueOption (mapping i x))
+
+    /// <summary>
+    /// Adaptively keeps the elements whose predicate aval holds <c>true</c>,
+    /// passing the input position to the predicate (FDA <c>AList.filteriA</c>
+    /// parity).
+    /// </summary>
+    let inline filteriA ([<InlineIfLambda>] predicate: int -> 'T -> aval<bool>) (list: alist<'T>) : alist<'T> =
+        new ElementListNode<'T, 'T>(
+            list,
+            fun i x -> AVal.map (fun b -> if b then ValueSome x else ValueNone) (predicate i x)
+        )
 
     /// <summary>The concatenation of two lists (FDA <c>AList.append</c> parity).</summary>
     let inline append (left: alist<'T>) (right: alist<'T>) : alist<'T> = new AppendListNode<'T>(left, right)
@@ -863,6 +1444,421 @@ module AList =
     /// <summary>Adaptively tests if the list is empty.</summary>
     let inline isEmpty (list: alist<'T>) : aval<bool> =
         AdaptiveNode<bool>(fun () -> list.GetValue().Count = 0)
+
+    /// <summary>
+    /// Adaptively reduces the list with the given <see cref="AdaptiveReduction"/>
+    /// (FDA <c>AList.reduce</c> parity). The reduction state is maintained per
+    /// delta; a reduction that cannot invert a removal recomputes (e.g.
+    /// <see cref="AdaptiveReduction.fold"/>). Order-sensitive reductions are
+    /// the caller's contract (the add/sub must be delta-consistent).
+    /// </summary>
+    let inline reduce (reduction: AdaptiveReduction<'a, 's, 'v>) (list: alist<'a>) : aval<'v> =
+        new ListReduceNode<'a, 'a, 's, 'v>(list, (fun v -> v), reduction)
+
+    /// <summary>
+    /// Maps every element, then reduces the mapped values with the given
+    /// <see cref="AdaptiveReduction"/> (FDA <c>AList.reduceBy</c> parity). The
+    /// mapping runs per delta entry.
+    /// </summary>
+    let inline reduceBy
+        (reduction: AdaptiveReduction<'b, 's, 'v>)
+        ([<InlineIfLambda>] mapping: 'a -> 'b)
+        (list: alist<'a>)
+        : aval<'v> =
+        new ListReduceNode<'a, 'b, 's, 'v>(list, mapping, reduction)
+
+    /// <summary>
+    /// Adaptively folds the list with <c>add</c>; every removal recomputes the
+    /// whole fold (FDA <c>AList.fold</c> parity).
+    /// </summary>
+    let inline fold ([<InlineIfLambda>] add: 's -> 'a -> 's) (zero: 's) (list: alist<'a>) : aval<'s> =
+        reduceBy (AdaptiveReduction.fold zero add) (fun v -> v) list
+
+    /// <summary>
+    /// Adaptively folds the list with an invertible <c>subtract</c>: removals
+    /// update the state without a recompute (FDA <c>AList.foldGroup</c>
+    /// parity; the add/sub must be delta-consistent, see
+    /// <see cref="reduce"/>).
+    /// </summary>
+    let inline foldGroup
+        ([<InlineIfLambda>] add: 's -> 'a -> 's)
+        ([<InlineIfLambda>] subtract: 's -> 'a -> 's)
+        (zero: 's)
+        (list: alist<'a>)
+        : aval<'s> =
+        reduceBy (AdaptiveReduction.group zero add subtract) (fun v -> v) list
+
+    /// <summary>
+    /// Adaptively folds the list with a partially invertible
+    /// <c>trySubtract</c>: removals that cannot be inverted recompute the
+    /// whole fold (FDA <c>AList.foldHalfGroup</c> parity).
+    /// </summary>
+    let inline foldHalfGroup
+        ([<InlineIfLambda>] add: 's -> 'a -> 's)
+        ([<InlineIfLambda>] trySubtract: 's -> 'a -> 's voption)
+        (zero: 's)
+        (list: alist<'a>)
+        : aval<'s> =
+        reduceBy (AdaptiveReduction.halfGroup zero add trySubtract) (fun v -> v) list
+
+    /// <summary>Adaptively tests if any element satisfies the predicate (FDA <c>AList.exists</c> parity).</summary>
+    let inline exists ([<InlineIfLambda>] predicate: 'T -> bool) (list: alist<'T>) : aval<bool> =
+        let reduction =
+            AdaptiveReduction.countPositive |> AdaptiveReduction.mapOut (fun c -> c <> 0)
+
+        new ListReduceNode<'T, bool, int, bool>(list, predicate, reduction)
+
+    /// <summary>Adaptively tests if every element satisfies the predicate (FDA <c>AList.forall</c> parity).</summary>
+    let inline forall ([<InlineIfLambda>] predicate: 'T -> bool) (list: alist<'T>) : aval<bool> =
+        new ListReduceNode<'T, bool, int, bool>(
+            list,
+            predicate,
+            AdaptiveReduction.countNegative |> AdaptiveReduction.mapOut (fun c -> c = 0)
+        )
+
+    /// <summary>Adaptively counts the elements that satisfy the predicate (FDA <c>AList.countBy</c> parity).</summary>
+    let inline countBy ([<InlineIfLambda>] predicate: 'T -> bool) (list: alist<'T>) : aval<int> =
+        new ListReduceNode<'T, bool, int, int>(list, predicate, AdaptiveReduction.countPositive)
+
+    /// <summary>Adaptively gets the minimum element, or <c>ValueNone</c> when empty (FDA <c>AList.tryMin</c> parity).</summary>
+    let inline tryMin (list: alist<'T>) : aval<'T voption> =
+        reduce (AdaptiveReduction.tryMin ()) list
+
+    /// <summary>Adaptively gets the maximum element, or <c>ValueNone</c> when empty (FDA <c>AList.tryMax</c> parity).</summary>
+    let inline tryMax (list: alist<'T>) : aval<'T voption> =
+        reduce (AdaptiveReduction.tryMax ()) list
+
+    /// <summary>Adaptively sums the elements (FDA <c>AList.sum</c> parity; needs an additive numeric type).</summary>
+    let inline sum (list: alist<'T>) : aval<'T> = reduce (AdaptiveReduction.sum ()) list
+
+    /// <summary>Adaptively sums the mapped elements (FDA <c>AList.sumBy</c> parity).</summary>
+    let inline sumBy ([<InlineIfLambda>] mapping: 'T -> 'U) (list: alist<'T>) : aval<'U> =
+        reduceBy (AdaptiveReduction.sum ()) mapping list
+
+    /// <summary>
+    /// Adaptively averages the elements (needs a numeric type with
+    /// <c>DivideByInt</c>, e.g. <c>float</c>; FDA <c>AList.average</c> parity).
+    /// </summary>
+    let inline average (list: alist< ^T >) : aval< ^T > =
+        AVal.map2 (fun total c -> LanguagePrimitives.DivideByInt total c) (sum list) (count list)
+
+    /// <summary>
+    /// Adaptively averages the mapped elements (needs a numeric type with
+    /// <c>DivideByInt</c>, e.g. <c>float</c>; FDA <c>AList.averageBy</c> parity).
+    /// </summary>
+    let inline averageBy ([<InlineIfLambda>] mapping: 'T -> ^U) (list: alist<'T>) : aval< ^U > =
+        AVal.map2 (fun total c -> LanguagePrimitives.DivideByInt total c) (sumBy mapping list) (count list)
+
+    /// <summary>
+    /// An adaptive list over an adaptive value of a sequence (FDA
+    /// <c>AList.ofAVal</c> parity). Every change of the value replaces the
+    /// whole state and emits the positional diff as the delta.
+    /// </summary>
+    let inline ofAVal<'T, 'S when 'S :> seq<'T>> (value: aval<'S>) : alist<'T> = new OfAvalListNode<'T, 'S>(value)
+
+    /// <summary>
+    /// An adaptive list generated from a count and a generator (FDA
+    /// <c>AList.init</c> parity). The list is rebuilt when the count changes.
+    /// </summary>
+    let inline init ([<InlineIfLambda>] f: int -> 'T) (count: aval<int>) : alist<'T> =
+        ofAVal (AVal.map (fun c -> Array.init c f) count)
+
+    /// <summary>
+    /// An adaptive numeric range as a list (FDA <c>AList.range</c> parity).
+    /// The list is rebuilt when either bound changes; the bounds are inclusive.
+    /// </summary>
+    let inline range (min: aval< ^T >) (max: aval< ^T >) : alist< ^T > =
+        ofAVal (AVal.map2 (fun lo hi -> seq { lo..hi }) min max)
+
+    /// <summary>
+    /// Adaptively looks up the element at the given position (FDA
+    /// <c>AList.tryAt</c> parity; the position is the <c>int</c> input
+    /// position, the positional deviation).
+    /// </summary>
+    let inline tryAt (index: int) (list: alist<'T>) : aval<'T voption> =
+        AdaptiveNode(fun () ->
+            let view = list.GetValue()
+
+            if index >= 0 && index < view.Count then
+                ValueSome view[index]
+            else
+                ValueNone)
+
+    /// <summary>Alias of <see cref="tryAt"/> (FDA parity name; both take the <c>int</c> position).</summary>
+    let inline tryGet (index: int) (list: alist<'T>) : aval<'T voption> = tryAt index list
+
+    /// <summary>Adaptively gets the first element, or <c>ValueNone</c> when empty (FDA <c>AList.tryFirst</c> parity).</summary>
+    let inline tryFirst (list: alist<'T>) : aval<'T voption> =
+        AdaptiveNode(fun () ->
+            let view = list.GetValue()
+
+            if view.Count > 0 then ValueSome view[0] else ValueNone)
+
+    /// <summary>Adaptively gets the last element, or <c>ValueNone</c> when empty (FDA <c>AList.tryLast</c> parity).</summary>
+    let inline tryLast (list: alist<'T>) : aval<'T voption> =
+        AdaptiveNode(fun () ->
+            let view = list.GetValue()
+
+            if view.Count > 0 then
+                ValueSome view[view.Count - 1]
+            else
+                ValueNone)
+
+    /// <summary>
+    /// Materializes the list as an adaptive value. Every change materializes a
+    /// new array (the retain boundary, like <see cref="force"/>); the value
+    /// is safe to retain (FDA <c>AList.toAVal</c> parity, as <c>aval&lt;'T[]&gt;</c>,
+    /// the positional deviation).
+    /// </summary>
+    let inline toAVal (list: alist<'T>) : aval<'T[]> =
+        AdaptiveNode<'T[]>(fun () -> Seq.toArray (list.GetValue()))
+
+    /// <summary>
+    /// An adaptive set of the list's elements, deduplicated (FDA
+    /// <c>AList.toASet</c> parity). An element leaves the output only when its
+    /// last occurrence leaves.
+    /// </summary>
+    let inline toASet (list: alist<'T>) : aset<'T> = new ToSetListNode<'T>(list)
+
+    /// <summary>
+    /// An adaptive set of the elements paired with their input positions
+    /// (FDA <c>AList.toIndexedASet</c> parity; struct pairs, the library
+    /// convention).
+    /// </summary>
+    let inline toIndexedASet (list: alist<'T>) : aset<struct (int * 'T)> = list |> indexed |> toASet
+
+    /// <summary>
+    /// An adaptive list of a set's elements (FDA <c>AList.ofASet</c> parity,
+    /// poll node). The order is the set's iteration order, stable while the
+    /// set does not change.
+    /// </summary>
+    let inline ofASet (set: aset<'T>) : alist<'T> = new SetToListNode<'T>(set)
+
+    /// <summary>
+    /// Reverses the list (FDA <c>AList.rev</c> parity, poll node).
+    /// </summary>
+    let inline rev (list: alist<'T>) : alist<'T> =
+        new PollListSourceNode<'T, 'T>(
+            list,
+            fun view ->
+                let next = ResizeArray<'T>(view.Count)
+
+                for i in view.Count - 1 .. -1 .. 0 do
+                    next.Add view[i]
+
+                next
+        )
+
+    /// <summary>
+    /// Adaptively maps over the given value and returns the resulting list
+    /// (FDA <c>AList.bind</c> parity). When the value changes, <c>mapping</c>
+    /// selects the new inner list; the output is rebuilt on any change (the
+    /// value's or the inner list's), emitting the positional diff.
+    /// </summary>
+    let inline bind ([<InlineIfLambda>] mapping: 'T -> alist<'U>) (value: aval<'T>) : alist<'U> =
+        new BindListNode<'T, 'U>(value, mapping)
+
+    /// <summary>
+    /// Adaptively maps over the two values and returns the resulting list
+    /// (FDA <c>AList.bind2</c> parity). Composed as one bind over the mapped
+    /// pair (the ASet lesson: nested binds miss the inner bind's swap, which
+    /// signals by version only, not by delta).
+    /// </summary>
+    let inline bind2 ([<InlineIfLambda>] mapping: 'A -> 'B -> alist<'C>) (a: aval<'A>) (b: aval<'B>) : alist<'C> =
+        bind (fun (av, bv) -> mapping av bv) (AVal.map2 (fun av bv -> (av, bv)) a b)
+
+    /// <summary>
+    /// Adaptively maps over the three values and returns the resulting list
+    /// (FDA <c>AList.bind3</c> parity).
+    /// </summary>
+    let inline bind3
+        ([<InlineIfLambda>] mapping: 'A -> 'B -> 'C -> alist<'D>)
+        (a: aval<'A>)
+        (b: aval<'B>)
+        (c: aval<'C>)
+        : alist<'D> =
+        bind (fun (av, bv, cv) -> mapping av bv cv) (AVal.map3 (fun av bv cv -> (av, bv, cv)) a b c)
+
+    /// <summary>
+    /// Concatenates a fixed sequence of lists (FDA <c>AList.concat</c> parity,
+    /// poll node; generalizes <see cref="append"/>).
+    /// </summary>
+    let inline concat (lists: #seq<alist<'T>>) : alist<'T> =
+        new ConcatListNode<'T>(Seq.toArray lists)
+
+    /// <summary>
+    /// The window <c>[offset, offset + count)</c> of the list (FDA
+    /// <c>AList.subA</c> parity, poll node; the bounds are adaptive).
+    /// </summary>
+    let inline subA (offset: aval<int>) (count: aval<int>) (list: alist<'T>) : alist<'T> =
+        new PollListSourceNode<'T, 'T>(
+            list,
+            fun view ->
+                let o = max 0 (offset.GetValue())
+                let c = max 0 (count.GetValue())
+                let start = min o view.Count
+                let n = min c (view.Count - start)
+                let next = ResizeArray<'T>(n)
+
+                for i in start .. start + n - 1 do
+                    next.Add view[i]
+
+                next
+        )
+
+    /// <summary>The window <c>[offset, offset + count)</c> of the list (FDA <c>AList.sub</c> parity).</summary>
+    let inline sub (offset: int) (count: int) (list: alist<'T>) : alist<'T> =
+        subA (AVal.constant offset) (AVal.constant count) list
+
+    /// <summary>The first <c>count</c> elements (FDA <c>AList.takeA</c> parity).</summary>
+    let inline takeA (count: aval<int>) (list: alist<'T>) : alist<'T> = subA (AVal.constant 0) count list
+
+    /// <summary>The first <c>count</c> elements (FDA <c>AList.take</c> parity).</summary>
+    let inline take (count: int) (list: alist<'T>) : alist<'T> = takeA (AVal.constant count) list
+
+    /// <summary>All elements after the first <c>count</c> (FDA <c>AList.skipA</c> parity).</summary>
+    let inline skipA (count: aval<int>) (list: alist<'T>) : alist<'T> =
+        subA count (AVal.constant System.Int32.MaxValue) list
+
+    /// <summary>All elements after the first <c>count</c> (FDA <c>AList.skip</c> parity).</summary>
+    let inline skip (count: int) (list: alist<'T>) : alist<'T> = skipA (AVal.constant count) list
+
+    /// <summary>
+    /// Sorts the list with the given comparison (FDA <c>AList.sortWith</c>
+    /// parity, stable, poll node).
+    /// </summary>
+    let inline sortWith ([<InlineIfLambda>] comparer: 'T -> 'T -> int) (list: alist<'T>) : alist<'T> =
+        new SortListNode<'T, 'T>(list, (fun _ v -> v), comparer)
+
+    /// <summary>Sorts the list ascending (FDA <c>AList.sort</c> parity, stable, poll node).</summary>
+    let inline sort (list: alist<'T>) : alist<'T> = sortWith compare list
+
+    /// <summary>Sorts the list descending (FDA <c>AList.sortDescending</c> parity, stable, poll node).</summary>
+    let inline sortDescending (list: alist<'T>) : alist<'T> = sortWith (fun a b -> compare b a) list
+
+    /// <summary>
+    /// Sorts the list by the keys given by the projection (FDA
+    /// <c>AList.sortBy</c> parity, stable, poll node).
+    /// </summary>
+    let inline sortBy ([<InlineIfLambda>] f: 'T -> 'K) (list: alist<'T>) : alist<'T> =
+        new SortListNode<'T, 'K>(list, (fun _ v -> f v), compare)
+
+    /// <summary>
+    /// Sorts the list by the keys given by the projection, passing the input
+    /// position to the projection (FDA <c>AList.sortByi</c> parity, stable,
+    /// poll node; the index is the <c>int</c> input position).
+    /// </summary>
+    let inline sortByi ([<InlineIfLambda>] f: int -> 'T -> 'K) (list: alist<'T>) : alist<'T> =
+        new SortListNode<'T, 'K>(list, f, compare)
+
+    /// <summary>Sorts the list by the keys given by the projection, descending (FDA <c>AList.sortByDescending</c> parity).</summary>
+    let inline sortByDescending ([<InlineIfLambda>] f: 'T -> 'K) (list: alist<'T>) : alist<'T> =
+        new SortListNode<'T, 'K>(list, (fun _ v -> f v), fun a b -> compare b a)
+
+    /// <summary>Sorts the list by the keys given by the projection, descending, index-aware (FDA <c>AList.sortByDescendingi</c> parity).</summary>
+    let inline sortByDescendingi ([<InlineIfLambda>] f: int -> 'T -> 'K) (list: alist<'T>) : alist<'T> =
+        new SortListNode<'T, 'K>(list, f, fun a b -> compare b a)
+
+    /// <summary>
+    /// An adaptive list of adjacent pairs (FDA <c>AList.pairwise</c> parity,
+    /// poll node; struct pairs, the library convention).
+    /// </summary>
+    let inline pairwise (list: alist<'T>) : alist<struct ('T * 'T)> =
+        new PollListSourceNode<'T, struct ('T * 'T)>(
+            list,
+            fun view ->
+                let next = ResizeArray<struct ('T * 'T)>(max 0 (view.Count - 1))
+
+                for i in 0 .. view.Count - 2 do
+                    next.Add(struct (view[i], view[i + 1]))
+
+                next
+        )
+
+    /// <summary>
+    /// An adaptive list of adjacent pairs, with the last element paired with
+    /// the first (FDA <c>AList.pairwiseCyclic</c> parity, poll node).
+    /// </summary>
+    let inline pairwiseCyclic (list: alist<'T>) : alist<struct ('T * 'T)> =
+        new PollListSourceNode<'T, struct ('T * 'T)>(
+            list,
+            fun view ->
+                let next = ResizeArray<struct ('T * 'T)>(view.Count)
+
+                for i in 0 .. view.Count - 1 do
+                    next.Add(struct (view[i], view[(i + 1) % view.Count]))
+
+                next
+        )
+
+    /// <summary>
+    /// Maps every element, disposing the mapped value when the element leaves
+    /// its position (FDA <c>AList.mapUse</c> parity). The output is 1:1 with
+    /// the input. Disposing the returned disposable disposes all live mapped
+    /// values and clears the output.
+    /// </summary>
+    let inline mapUse ([<InlineIfLambda>] mapping: 'T -> 'W) (list: alist<'T>) : IDisposable * alist<'W> =
+        let node = new MapUseListNode<'T, 'W>(list, fun _ v -> mapping v)
+        (node :> IDisposable, node :> alist<'W>)
+
+    /// <summary>
+    /// Maps every element, passing the input position to the mapping and
+    /// disposing the mapped value when the element leaves its position (FDA
+    /// <c>AList.mapUsei</c> parity; the index is the <c>int</c> input
+    /// position, the positional deviation).
+    /// </summary>
+    let inline mapUsei ([<InlineIfLambda>] mapping: int -> 'T -> 'W) (list: alist<'T>) : IDisposable * alist<'W> =
+        let node = new MapUseListNode<'T, 'W>(list, mapping)
+        (node :> IDisposable, node :> alist<'W>)
+
+    /// <summary>
+    /// Creates an adaptive list from an external snapshot function and an
+    /// invalidate handle (FDA <c>AList.ofExternal</c> parity, MAPA-DESIGN
+    /// §1.1). The snapshot runs at most once per invalidate, on the next read,
+    /// and is diffed against the previous snapshot positionally (prefix/suffix,
+    /// the <c>ChangeableList.ApplyDiff</c> algorithm); not invalidated → reads
+    /// are O(1) and allocate nothing. The handle is O(1) to call and
+    /// thread-safe (a foreign-thread call is posted to the owner context and
+    /// applied at the next graph operation).
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// let mutable current = ResizeArray [ 1; 2; 3 ]
+    /// let list, invalidate = AList.ofExternal (fun () -&gt; current :&gt; IReadOnlyList&lt;_&gt;)
+    /// current.RemoveAt 0
+    /// invalidate ()
+    /// let forced = AList.force list   // [ 2; 3 ]
+    /// </code>
+    /// </example>
+    let inline ofExternal ([<InlineIfLambda>] snapshot: unit -> IReadOnlyList<'T>) : alist<'T> * (unit -> unit) =
+        let node = new ExternalListNode<'T>(snapshot)
+        (node :> alist<'T>, fun () -> node.Invalidate())
+
+    /// <summary>
+    /// An adaptive list driven by a compute function (FDA <c>AList.custom</c>
+    /// parity, MAPA-DESIGN §1.3, pull model). The compute receives the current
+    /// view and a delta builder; it appends the operations that describe the
+    /// change since the previous call (for example, consuming its own event
+    /// queue). The operations are positional and applied in order.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// let mutable offset = 0
+    /// let list =
+    ///     AList.custom (fun view delta -&gt;
+    ///         // rebuild the whole view on each poll (the simplest compute)
+    ///         if offset &lt;&gt; 0 then
+    ///             for i in view.Count - 1 .. -1 .. 0 do
+    ///                 delta.Remove i
+    ///
+    ///             for i in 0 .. view.Count - 1 do
+    ///                 delta.Insert(i, i + offset)
+    ///
+    ///             offset &lt;- 0)
+    /// </code>
+    /// </example>
+    let inline custom ([<InlineIfLambda>] compute: IReadOnlyList<'T> -> ListDeltaBuilder<'T> -> unit) : alist<'T> =
+        new CustomListNode<'T>(compute)
 
     /// <summary>
     /// Registers a callback that receives the current view and the ordered
@@ -929,6 +1925,54 @@ module CList =
     /// <summary>Replaces the whole list. Last-wins over the whole batch inside a transaction.</summary>
     let inline set (values: seq<'T>) (list: clist<'T>) = list.Set values
 
+    /// <summary>
+    /// Replaces the whole list and returns whether the content changed (FDA
+    /// <c>clist.UpdateTo</c> parity). An equal target marks nothing.
+    /// </summary>
+    let inline updateTo (target: 'T[]) (list: clist<'T>) : bool =
+        let view = AList.getValue list
+        let mutable changed = view.Count <> target.Length
+
+        if not changed then
+            let mutable i = 0
+
+            while not changed && i < target.Length do
+                if not (EqualityComparer<'T>.Default.Equals(view[i], target[i])) then
+                    changed <- true
+
+                i <- i + 1
+
+        if changed then
+            list.Set target
+
+        changed
+
+    /// <summary>
+    /// Applies a batch of list operations (FDA <c>clist.Perform</c> parity). The
+    /// operations are positional and applied in order; the batch is atomic
+    /// (observers receive one delta).
+    /// </summary>
+    let perform (delta: ListDeltaBuilder<'T>) (list: clist<'T>) : unit =
+        let d = delta.Snapshot()
+
+        if not d.IsEmpty then
+            Transaction.run (fun () ->
+                let ops = d.Operations
+
+                for i in 0 .. ops.Length - 1 do
+                    let op = ops.Span[i]
+
+                    match op.Kind with
+                    | ListOpKind.Insert -> list.InsertAt(op.Position, op.Value)
+                    | ListOpKind.Remove -> list.RemoveAt op.Position
+                    | _ -> list.UpdateAt(op.Position, op.Value))
+
+    /// <summary>Appends all the given elements (FDA <c>clist.AddRange</c> parity; one atomic batch).</summary>
+    let inline addRange (items: seq<'T>) (list: clist<'T>) : unit =
+        Transaction.run (fun () ->
+            for x in items do
+                list.Append x |> ignore)
+
     /// <summary>Views the changeable list as an adaptive list.</summary>
     let inline value (list: clist<'T>) : alist<'T> = list
 
@@ -937,3 +1981,25 @@ module CList =
 
     /// <summary>Materializes the F# <c>list</c> counterpart.</summary>
     let inline toList (list: clist<'T>) : 'T list = AList.toList list
+
+/// <summary>
+/// Slicing for adaptive lists (gap sheet §10.1): <c>list.[a..b]</c>. The
+/// bounds are clamped; the slice is the window <c>[a, b]</c> inclusive.
+/// </summary>
+[<AutoOpen>]
+module AListSliceExtensions =
+    type IAdaptiveList<'T> with
+        /// <summary>
+        /// Slicing: <c>list.[a..b]</c> (gap sheet §10.1). The bounds are
+        /// clamped; the slice is the window <c>[a, b]</c> inclusive.
+        /// </summary>
+        /// <example>
+        /// <code>
+        /// let items = CList.ofSeq [ 0; 1; 2; 3; 4 ]
+        /// let middle = (CList.value items).[1..3]   // [ 1; 2; 3 ]
+        /// </code>
+        /// </example>
+        member this.GetSlice(start: int option, finish: int option) : alist<'T> =
+            let s = defaultArg start 0
+            let f = defaultArg finish System.Int32.MaxValue
+            AList.sub s (max 0 (f - s + 1)) this

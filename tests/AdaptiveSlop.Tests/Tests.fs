@@ -1,3 +1,7 @@
+// Shares a collection with the property tests (Properties.fs): the adaptive
+// graph is confined to one owner thread, so xUnit must not run this module's
+// tests in parallel with the FsCheck properties.
+[<global.Xunit.Collection("AdaptiveSlop")>]
 module AdaptiveSlop.Tests
 
 #nowarn "893"
@@ -185,6 +189,302 @@ let ``ASet map and filter`` () =
     Assert.Equal<Set<int>>(expectedAfterRemove, ASet.toSet filtered)
 
 [<Fact>]
+let ``ASet mapA follows element avals and structural edits`` () =
+    let s = CSet.ofSeq [ 1; 2; 3 ]
+    let even = CVal.create 1
+    let odd = CVal.create 0
+
+    let result =
+        s
+        |> ASet.mapA (fun v ->
+            if v % 2 = 0 then
+                AVal.map (fun e -> v * 10 + e) (even :> aval<int>)
+            else
+                AVal.map (fun e -> v * 10 + e) (odd :> aval<int>))
+
+    // (1,10) (2,21) (3,30)
+    Assert.Equal<Set<int>>(Set.ofList [ 10; 21; 30 ], ASet.toSet result)
+
+    CVal.set 2 odd
+    // (1,12) (3,32)
+    Assert.Equal<Set<int>>(Set.ofList [ 12; 21; 32 ], ASet.toSet result)
+
+    s.Add 4
+    // (4,41)
+    Assert.Equal<Set<int>>(Set.ofList [ 12; 21; 32; 41 ], ASet.toSet result)
+
+    CVal.set 5 even
+    // (2,25) (4,45)
+    Assert.Equal<Set<int>>(Set.ofList [ 12; 25; 32; 45 ], ASet.toSet result)
+
+    s.Remove 2
+    Assert.Equal<Set<int>>(Set.ofList [ 12; 32; 45 ], ASet.toSet result)
+
+    CVal.set 1 even
+    CVal.set 0 odd
+    // element 2 was removed earlier: no 21
+    Assert.Equal<Set<int>>(Set.ofList [ 10; 30; 41 ], ASet.toSet result)
+
+[<Fact>]
+let ``ASet chooseA survival flips`` () =
+    let s = CSet.ofSeq [ 1; 2; 3 ]
+    let even = CVal.create (Some 1)
+    let odd = CVal.create (Some 0)
+
+    let result =
+        s
+        |> ASet.chooseA (fun v ->
+            if v % 2 = 0 then
+                even :> aval<int option>
+            else
+                odd :> aval<int option>)
+
+    // (1,0) (2,1) (3,0)
+    Assert.Equal<Set<int>>(Set.ofList [ 0; 1 ], ASet.toSet result)
+
+    CVal.set (Some 2) odd
+    // (1,2) (2,1) (3,2)
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2 ], ASet.toSet result)
+
+    CVal.set None even
+    // (2,None) (4 absent)
+    Assert.Equal<Set<int>>(Set.ofList [ 2 ], ASet.toSet result)
+
+    s.Add 4
+    // (4,None)
+    Assert.Equal<Set<int>>(Set.ofList [ 2 ], ASet.toSet result)
+
+    CVal.set (Some 5) even
+    // (2,5) (4,5)
+    Assert.Equal<Set<int>>(Set.ofList [ 2; 5 ], ASet.toSet result)
+
+[<Fact>]
+let ``ASet filterA flips with predicate avals`` () =
+    let takeEven = CVal.create true
+    let takeOdd = CVal.create true
+    let set = ASet.ofArray (Array.init 5 id)
+
+    let filtered =
+        set
+        |> ASet.filterA (fun i ->
+            if i % 2 = 0 then
+                takeEven :> aval<bool>
+            else
+                takeOdd :> aval<bool>)
+
+    Assert.Equal<Set<int>>(Set.ofList [ 0; 1; 2; 3; 4 ], ASet.toSet filtered)
+
+    CVal.set false takeEven
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 3 ], ASet.toSet filtered)
+
+    CVal.set false takeOdd
+    Assert.Equal<Set<int>>(Set.empty, ASet.toSet filtered)
+
+    CVal.set true takeOdd
+    CVal.set true takeEven
+    Assert.Equal<Set<int>>(Set.ofList [ 0; 1; 2; 3; 4 ], ASet.toSet filtered)
+
+[<Fact>]
+let ``ASet mapA counts duplicate mapped values`` () =
+    let s = CSet.ofSeq [ 1; 2; 3 ]
+    let v = CVal.create 0
+
+    let result = s |> ASet.mapA (fun _ -> v :> aval<int>)
+
+    Assert.Equal<Set<int>>(Set.ofList [ 0 ], ASet.toSet result)
+
+    CVal.set 1 v
+    Assert.Equal<Set<int>>(Set.ofList [ 1 ], ASet.toSet result)
+
+    s.Remove 1 // two occurrences of v remain
+    Assert.Equal<Set<int>>(Set.ofList [ 1 ], ASet.toSet result)
+
+    s.Remove 2
+    Assert.Equal<Set<int>>(Set.ofList [ 1 ], ASet.toSet result)
+
+    s.Remove 3 // last occurrence leaves: the output empties
+    Assert.Equal<Set<int>>(Set.empty, ASet.toSet result)
+
+[<Fact>]
+let ``ASet mapA delivers targeted deltas to observers`` () =
+    let s = CSet.ofSeq [ 1; 2; 3 ]
+    let even = CVal.create 1
+    let odd = CVal.create 0
+
+    let result =
+        s
+        |> ASet.mapA (fun v -> if v % 2 = 0 then even :> aval<int> else odd :> aval<int>)
+
+    let mutable lastAdds = Set.empty<int>
+    let mutable lastRems = Set.empty<int>
+
+    use _obs =
+        ASet.observe
+            (fun _ (d: SetDelta<int>) ->
+                lastAdds <- d.Added.ToArray() |> Set.ofArray
+                lastRems <- d.Removed.ToArray() |> Set.ofArray)
+            result
+
+    ASet.force result |> ignore
+
+    CVal.set 2 even // element 2: 1 -> 2
+    Assert.Equal<Set<int>>(Set.ofList [ 2 ], lastAdds)
+    Assert.Equal<Set<int>>(Set.ofList [ 1 ], lastRems)
+
+    CVal.set 5 even // element 2: 2 -> 5
+    Assert.Equal<Set<int>>(Set.ofList [ 5 ], lastAdds)
+    Assert.Equal<Set<int>>(Set.ofList [ 2 ], lastRems)
+
+    s.Remove 2 // the only 5 leaves
+    Assert.Equal<Set<int>>(Set.empty, lastAdds)
+    Assert.Equal<Set<int>>(Set.ofList [ 5 ], lastRems)
+
+    s.Add 4 // (4,5)
+    Assert.Equal<Set<int>>(Set.ofList [ 5 ], lastAdds)
+    Assert.Equal<Set<int>>(Set.empty, lastRems)
+
+[<Fact>]
+let ``ASet mapA: a mapping that writes to the source during load is applied`` () =
+    let s = CSet.ofSeq [ 1 ]
+    let mutable reenter = true
+
+    let result =
+        s
+        |> ASet.mapA (fun x ->
+            if reenter && x = 1 then
+                reenter <- false
+                s.Add 2 |> ignore
+                AVal.constant x
+            else
+                AVal.constant x)
+
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2 ], ASet.toSet result)
+    // The journal must be clean: the next write applies normally.
+    s.Add 3
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2; 3 ], ASet.toSet result)
+
+[<Fact>]
+let ``ASet mapA steady-state element writes allocate zero bytes`` () =
+    let s = CSet.ofSeq (List.init 1000 id)
+    let v = CVal.create 0
+    let result = s |> ASet.mapA (fun _ -> v :> aval<int>)
+    use _obs = ASet.observe (fun _ _ -> ()) result
+    ASet.getValue result |> ignore
+    // Warm up: the first write grows the shared mark stack and notification queue.
+    CVal.set 1 v
+    ASet.getValue result |> ignore
+
+    let before = GC.GetAllocatedBytesForCurrentThread()
+
+    for i in 1..1000 do
+        CVal.set (i % 2) v
+        ASet.getValue result |> ignore
+
+    let allocated = GC.GetAllocatedBytesForCurrentThread() - before
+    Assert.Equal(0L, allocated)
+
+[<Fact>]
+let ``ASet mapA disposal unregisters every element aval edge`` () =
+    let s = CSet.ofSeq [ 1; 2; 3 ]
+    let v1 = CVal.create 1
+    let v2 = CVal.create 2
+
+    let result =
+        s |> ASet.mapA (fun x -> if x % 2 = 0 then v1 :> aval<int> else v2 :> aval<int>)
+
+    use _obs = ASet.observe (fun _ _ -> ()) result
+    ASet.force result |> ignore
+    let aval1 = v1 :> IEdgeTarget
+    let aval2 = v2 :> IEdgeTarget
+    Assert.Equal(1, aval1.EdgeCount)
+    Assert.Equal(2, aval2.EdgeCount)
+    (result :> IDisposable).Dispose()
+    Assert.Equal(0, aval1.EdgeCount)
+    Assert.Equal(0, aval2.EdgeCount)
+
+[<Fact>]
+let ``ASet countByA counts predicate-aval matches`` () =
+    let s = CSet.ofSeq [ 1; 2; 3; 4 ]
+    let flag = CVal.create true
+
+    let count = s |> ASet.countByA (fun v -> flag |> AVal.map (fun f -> f && v % 2 = 0))
+
+    Assert.Equal(2, AVal.getValue count) // 2,4
+    CVal.set false flag
+    Assert.Equal(0, AVal.getValue count)
+    s.Add 6
+    Assert.Equal(0, AVal.getValue count)
+    CVal.set true flag
+    Assert.Equal(3, AVal.getValue count) // 2,4,6
+    s.Remove 2
+    Assert.Equal(2, AVal.getValue count)
+
+[<Fact>]
+let ``ASet existsA and forallA follow predicate avals`` () =
+    let s = CSet.ofSeq [ 1; 2; 3 ]
+    let flag = CVal.create true
+
+    let exists = s |> ASet.existsA (fun v -> flag |> AVal.map (fun f -> f && v > 2))
+
+    let forall = s |> ASet.forallA (fun v -> flag |> AVal.map (fun f -> f && v > 2))
+
+    Assert.True(AVal.getValue exists) // 3 qualifies
+    Assert.False(AVal.getValue forall) // 1,2 do not
+    CVal.set false flag
+    Assert.False(AVal.getValue exists)
+    Assert.False(AVal.getValue forall)
+    CVal.set true flag
+    Assert.True(AVal.getValue exists)
+    Assert.False(AVal.getValue forall)
+
+[<Fact>]
+let ``ASet sumByA sums mapped avals`` () =
+    let s = CSet.ofSeq [ 1; 2; 3 ]
+    let k = CVal.create 10
+
+    let sum = s |> ASet.sumByA (fun v -> k |> AVal.map (fun k -> v * k))
+
+    Assert.Equal(60, AVal.getValue sum)
+    CVal.set 2 k
+    Assert.Equal(12, AVal.getValue sum)
+    s.Add 4
+    Assert.Equal(20, AVal.getValue sum)
+    s.Remove 3
+    Assert.Equal(14, AVal.getValue sum)
+
+[<Fact>]
+let ``ASet averageByA averages mapped avals`` () =
+    let s = CSet.ofSeq [ 1.0; 2.0; 3.0 ]
+    let k = CVal.create 2.0
+
+    let avg = s |> ASet.averageByA (fun v -> k |> AVal.map (fun k -> v * k))
+
+    Assert.Equal(4.0, AVal.getValue avg) // (2+4+6)/3
+    CVal.set 3.0 k
+    Assert.Equal(6.0, AVal.getValue avg) // (3+6+9)/3
+    s.Add 5.0
+    Assert.Equal(8.25, AVal.getValue avg) // (3+6+9+15)/4
+    s.Remove 1.0
+    Assert.Equal(10.0, AVal.getValue avg) // (6+9+15)/3
+
+[<Fact>]
+let ``ASet reduceByA folds with a custom reduction`` () =
+    let s = CSet.ofSeq [ 1; 3; 5 ]
+    let k = CVal.create 10
+
+    let min =
+        s
+        |> ASet.reduceByA (AdaptiveReduction.tryMin ()) (fun v -> k |> AVal.map (fun k -> v + k))
+
+    Assert.Equal(ValueSome 11, AVal.getValue min)
+    CVal.set 100 k
+    Assert.Equal(ValueSome 101, AVal.getValue min)
+    s.Add 200
+    Assert.Equal(ValueSome 101, AVal.getValue min)
+    s.Remove 1
+    Assert.Equal(ValueSome 103, AVal.getValue min)
+
+[<Fact>]
 let ``AMap map and filter`` () =
     let source = CMap.ofSeq [ 1, 10; 2, 20; 3, 30 ]
     let mapped = AMap.map (fun _ v -> v + 1) (CMap.value source)
@@ -200,6 +500,159 @@ let ``AMap map and filter`` () =
     source.Remove(3)
     let expectedAfterRemove: Map<int, int> = Map.ofList [ 2, 21; 4, 41 ]
     Assert.Equal<Map<int, int>>(expectedAfterRemove, AMap.toMap filtered)
+
+[<Fact>]
+let ``AMap mapA follows entry avals and structural edits`` () =
+    let m = CMap.ofSeq [ "A", 1; "B", 2; "C", 3 ]
+    let flag = CVal.create true
+
+    let res =
+        m
+        |> AMap.mapA (fun _ v ->
+            flag
+            |> AVal.map (function
+                | true -> v
+                | false -> -1))
+
+    Assert.Equal<Map<string, int>>(Map.ofList [ "A", 1; "B", 2; "C", 3 ], AMap.toMap res)
+
+    CVal.set false flag
+    Assert.Equal<Map<string, int>>(Map.ofList [ "A", -1; "B", -1; "C", -1 ], AMap.toMap res)
+
+    CMap.set (Map.ofList [ "A", 2; "B", 4; "C", 6 ]) m
+    Assert.Equal<Map<string, int>>(Map.ofList [ "A", -1; "B", -1; "C", -1 ], AMap.toMap res)
+
+    CVal.set true flag
+    Assert.Equal<Map<string, int>>(Map.ofList [ "A", 2; "B", 4; "C", 6 ], AMap.toMap res)
+
+    CMap.remove "B" m
+    Assert.Equal<Map<string, int>>(Map.ofList [ "A", 2; "C", 6 ], AMap.toMap res)
+
+    CMap.addOrUpdate "D" 8 m
+    Assert.Equal<Map<string, int>>(Map.ofList [ "A", 2; "C", 6; "D", 8 ], AMap.toMap res)
+
+[<Fact>]
+let ``AMap chooseA survival flips`` () =
+    let m = CMap.ofSeq [ "A", 1; "B", 2; "C", 3 ]
+    let keep = CVal.create (Some true)
+
+    let res =
+        m
+        |> AMap.chooseA (fun _ v -> keep |> AVal.map (fun b -> if b = Some true then Some(v * 10) else None))
+
+    Assert.Equal<Map<string, int>>(Map.ofList [ "A", 10; "B", 20; "C", 30 ], AMap.toMap res)
+
+    CVal.set (Some false) keep
+    Assert.Equal<Map<string, int>>(Map.empty, AMap.toMap res)
+
+    CVal.set (Some true) keep
+    Assert.Equal<Map<string, int>>(Map.ofList [ "A", 10; "B", 20; "C", 30 ], AMap.toMap res)
+
+[<Fact>]
+let ``AMap filterA flips with predicate avals`` () =
+    let m = CMap.ofSeq [ "A", 1; "B", 2; "C", 3; "D", 4 ]
+    let takeEven = CVal.create true
+
+    let filtered =
+        m
+        |> AMap.filterA (fun _ v ->
+            if v % 2 = 0 then
+                takeEven :> aval<bool>
+            else
+                AVal.constant true)
+
+    Assert.Equal<Map<string, int>>(Map.ofList [ "A", 1; "B", 2; "C", 3; "D", 4 ], AMap.toMap filtered)
+
+    CVal.set false takeEven
+    Assert.Equal<Map<string, int>>(Map.ofList [ "A", 1; "C", 3 ], AMap.toMap filtered)
+
+    CVal.set true takeEven
+    Assert.Equal<Map<string, int>>(Map.ofList [ "A", 1; "B", 2; "C", 3; "D", 4 ], AMap.toMap filtered)
+
+[<Fact>]
+let ``AMap mapA delivers targeted deltas to observers`` () =
+    let m = CMap.ofSeq [ "A", 1; "B", 2 ]
+    let flag = CVal.create true
+
+    let res =
+        m
+        |> AMap.mapA (fun _ v ->
+            flag
+            |> AVal.map (function
+                | true -> v
+                | false -> -1))
+
+    let mutable lastSets = Map.empty<string, int>
+    let mutable lastRems = Set.empty<string>
+
+    use _obs =
+        AMap.observe
+            (fun _ (d: MapDelta<string, int>) ->
+                lastSets <- d.SetEntries.ToArray() |> Array.map (fun struct (k, v) -> k, v) |> Map.ofArray
+                lastRems <- d.RemovedKeys.ToArray() |> Set.ofArray)
+            res
+
+    AMap.force res |> ignore
+
+    CVal.set false flag // every entry: v -> -1
+    Assert.Equal<Map<string, int>>(Map.ofList [ "A", -1; "B", -1 ], lastSets)
+    Assert.Equal<Set<string>>(Set.empty, lastRems)
+
+    CMap.remove "A" m
+    Assert.Equal<Map<string, int>>(Map.empty, lastSets)
+    Assert.Equal<Set<string>>(Set.ofList [ "A" ], lastRems)
+
+    CMap.addOrUpdate "C" 3 m // (C,-1)
+    Assert.Equal<Map<string, int>>(Map.ofList [ "C", -1 ], lastSets)
+    Assert.Equal<Set<string>>(Set.empty, lastRems)
+
+[<Fact>]
+let ``AMap mapA steady-state entry writes allocate zero bytes`` () =
+    let m = CMap.ofSeq (List.init 1000 (fun i -> i, i))
+    let flag = CVal.create true
+
+    let res =
+        m
+        |> AMap.mapA (fun _ v ->
+            flag
+            |> AVal.map (function
+                | true -> v
+                | false -> -1))
+
+    use _obs = AMap.observe (fun _ _ -> ()) res
+    AMap.getValue res |> ignore
+    // Warm up: the first write grows the shared mark stack and notification queue.
+    CVal.set false flag
+    AMap.getValue res |> ignore
+
+    let before = GC.GetAllocatedBytesForCurrentThread()
+
+    for i in 1..1000 do
+        CVal.set (i % 2 = 0) flag
+        AMap.getValue res |> ignore
+
+    let allocated = GC.GetAllocatedBytesForCurrentThread() - before
+    Assert.Equal(0L, allocated)
+
+[<Fact>]
+let ``AMap mapA disposal unregisters every entry aval edge`` () =
+    let m = CMap.ofSeq [ "A", 1; "B", 2 ]
+    let v1 = CVal.create 1
+    let v2 = CVal.create 2
+
+    let res =
+        m
+        |> AMap.mapA (fun _ v -> if v % 2 = 0 then v1 :> aval<int> else v2 :> aval<int>)
+
+    use _obs = AMap.observe (fun _ _ -> ()) res
+    AMap.force res |> ignore
+    let aval1 = v1 :> IEdgeTarget
+    let aval2 = v2 :> IEdgeTarget
+    Assert.Equal(1, aval1.EdgeCount)
+    Assert.Equal(1, aval2.EdgeCount)
+    (res :> IDisposable).Dispose()
+    Assert.Equal(0, aval1.EdgeCount)
+    Assert.Equal(0, aval2.EdgeCount)
 
 [<Fact>]
 let ``Transaction defers ChangeableValue updates`` () =
@@ -2574,7 +3027,7 @@ let ``AMap mapSet, toASet and toASetValues`` () =
     )
 
     let m = CMap.empty<string, int>
-    let keys = AMap.toASet (CMap.value m)
+    let keys = AMap.keys (CMap.value m)
     let values = AMap.toASetValues (CMap.value m)
 
     CMap.addOrUpdate "a" 1 m
@@ -3263,6 +3716,254 @@ let ``AList map reflects changes`` () =
     Assert.Equal<int list>([], AList.toList mapped)
 
 [<Fact>]
+let ``AList mapA follows element avals and structural edits`` () =
+    let l = CList.ofList [ 1; 2; 3 ]
+    let even = CVal.create 1
+    let odd = CVal.create 0
+
+    let result =
+        l
+        |> AList.mapA (fun v -> if v % 2 = 0 then even :> aval<int> else odd :> aval<int>)
+
+    // (1,0) (2,1) (3,0)
+    Assert.Equal<int list>([ 0; 1; 0 ], AList.toList result)
+
+    CVal.set 2 odd
+    // (1,2) (2,1) (3,2)
+    Assert.Equal<int list>([ 2; 1; 2 ], AList.toList result)
+
+    CList.append 4 l
+    // (4,1)
+    Assert.Equal<int list>([ 2; 1; 2; 1 ], AList.toList result)
+
+    CVal.set 5 even
+    // (2,5) (4,5)
+    Assert.Equal<int list>([ 2; 5; 2; 5 ], AList.toList result)
+
+    CList.removeAt 0 l
+    // the first element leaves with its aval
+    Assert.Equal<int list>([ 5; 2; 5 ], AList.toList result)
+
+    CVal.set 1 even
+    CVal.set 0 odd
+    Assert.Equal<int list>([ 1; 0; 1 ], AList.toList result)
+
+[<Fact>]
+let ``AList chooseA survival flips`` () =
+    let l = CList.ofList [ 1; 2; 3 ]
+    let even = CVal.create (Some 1)
+    let odd = CVal.create (Some 0)
+
+    let result =
+        l
+        |> AList.chooseA (fun v ->
+            if v % 2 = 0 then
+                even :> aval<int option>
+            else
+                odd :> aval<int option>)
+
+    // (1,0) (2,1) (3,0)
+    Assert.Equal<int list>([ 0; 1; 0 ], AList.toList result)
+
+    CVal.set (Some 2) odd
+    Assert.Equal<int list>([ 2; 1; 2 ], AList.toList result)
+
+    CVal.set None even
+    // (2,None) (4 absent): the middle element leaves the output
+    Assert.Equal<int list>([ 2; 2 ], AList.toList result)
+
+    CList.append 4 l
+    // (4,None)
+    Assert.Equal<int list>([ 2; 2 ], AList.toList result)
+
+    CVal.set (Some 5) even
+    // (2,5) (4,5): both enter the output
+    Assert.Equal<int list>([ 2; 5; 2; 5 ], AList.toList result)
+
+[<Fact>]
+let ``AList filterA flips with predicate avals`` () =
+    let takeEven = CVal.create true
+    let takeOdd = CVal.create true
+    let l = CList.ofList [ 0; 1; 2; 3; 4 ]
+
+    let filtered =
+        l
+        |> AList.filterA (fun i ->
+            if i % 2 = 0 then
+                takeEven :> aval<bool>
+            else
+                takeOdd :> aval<bool>)
+
+    Assert.Equal<int list>([ 0; 1; 2; 3; 4 ], AList.toList filtered)
+
+    CVal.set false takeEven
+    Assert.Equal<int list>([ 1; 3 ], AList.toList filtered)
+
+    CVal.set false takeOdd
+    Assert.Equal<int list>([], AList.toList filtered)
+
+    CVal.set true takeOdd
+    CVal.set true takeEven
+    Assert.Equal<int list>([ 0; 1; 2; 3; 4 ], AList.toList filtered)
+
+[<Fact>]
+let ``AList mapA delivers targeted deltas to observers`` () =
+    let l = CList.ofList [ 1; 2; 3 ]
+    let even = CVal.create 1
+    let odd = CVal.create 0
+
+    let result =
+        l
+        |> AList.mapA (fun v -> if v % 2 = 0 then even :> aval<int> else odd :> aval<int>)
+
+    let mutable lastOps = []
+
+    use _obs =
+        AList.observe
+            (fun _ (d: ListDelta<int>) ->
+                lastOps <-
+                    d.Operations.ToArray()
+                    |> Array.map (fun op ->
+                        match op.Kind with
+                        | ListOpKind.Insert -> sprintf "I%d:%d" op.Position op.Value
+                        | ListOpKind.Remove -> sprintf "R%d" op.Position
+                        | ListOpKind.Update -> sprintf "U%d:%d" op.Position op.Value
+                        | _ -> "?")
+                    |> List.ofArray)
+            result
+
+    AList.force result |> ignore
+
+    CVal.set 2 odd // elements 0 and 2: 0 -> 2
+    Assert.Equal<string list>([ "U0:2"; "U2:2" ], lastOps)
+
+    CVal.set 5 even // element at position 1: 1 -> 5
+    Assert.Equal<string list>([ "U1:5" ], lastOps)
+
+    CList.append 4 l // (4,5)
+    Assert.Equal<string list>([ "I3:5" ], lastOps)
+
+[<Fact>]
+let ``AList mapA steady-state element writes allocate zero bytes`` () =
+    let l = CList.ofList (List.init 1000 id)
+    let v = CVal.create 0
+    let result = l |> AList.mapA (fun _ -> v :> aval<int>)
+    use _obs = AList.observe (fun _ _ -> ()) result
+    AList.getValue result |> ignore
+    // Warm up: the first write grows the shared mark stack and notification queue.
+    CVal.set 1 v
+    AList.getValue result |> ignore
+
+    let before = GC.GetAllocatedBytesForCurrentThread()
+
+    for i in 1..1000 do
+        CVal.set (i % 2) v
+        AList.getValue result |> ignore
+
+    let allocated = GC.GetAllocatedBytesForCurrentThread() - before
+    Assert.Equal(0L, allocated)
+
+[<Fact>]
+let ``AList mapA disposal unregisters every element aval edge`` () =
+    let l = CList.ofList [ 1; 2; 3 ]
+    let v1 = CVal.create 1
+    let v2 = CVal.create 2
+
+    let result =
+        l
+        |> AList.mapA (fun x -> if x % 2 = 0 then v1 :> aval<int> else v2 :> aval<int>)
+
+    use _obs = AList.observe (fun _ _ -> ()) result
+    AList.force result |> ignore
+    let aval1 = v1 :> IEdgeTarget
+    let aval2 = v2 :> IEdgeTarget
+    Assert.Equal(1, aval1.EdgeCount)
+    Assert.Equal(2, aval2.EdgeCount)
+    (result :> IDisposable).Dispose()
+    Assert.Equal(0, aval1.EdgeCount)
+    Assert.Equal(0, aval2.EdgeCount)
+
+[<Fact>]
+let ``AList mapiA passes the position at mapping time`` () =
+    let l = CList.ofList [ 10; 20; 30 ]
+
+    let result = l |> AList.mapiA (fun i _ -> AVal.constant i)
+
+    Assert.Equal<int list>([ 0; 1; 2 ], AList.toList result)
+
+    CList.insertAt 0 5 l
+    // The new element maps at position 0; shifted elements keep their aval
+    // (the mapping does not re-run for shifted elements, docs/2026-08-05-
+    // MAPA-DESIGN.md §4: FDA's stable-Index equivalent).
+    Assert.Equal<int list>([ 0; 0; 1; 2 ], AList.toList result)
+
+    CList.removeAt 2 l // removes 20 (mapped 1); 30 keeps its mapped 2
+    Assert.Equal<int list>([ 0; 0; 2 ], AList.toList result)
+
+    CList.append 6 l // the new element maps at position 3
+    Assert.Equal<int list>([ 0; 0; 2; 3 ], AList.toList result)
+
+    CList.updateAt 1 99 l // the updated element re-maps at position 1
+    Assert.Equal<int list>([ 0; 1; 2; 3 ], AList.toList result)
+
+[<Fact>]
+let ``AList mapiA inner change (mapping depends on another adaptive set)`` () =
+    let map = CList.ofList [ 1; 2; 3; 4; 5 ]
+    let keys = CSet.ofSeq [ 0; 2; 4 ]
+
+    let res =
+        map
+        |> AList.mapiA (fun k v ->
+            keys
+            |> ASet.contains k
+            |> AVal.map (function
+                | true -> v
+                | false -> -1))
+
+    Assert.Equal<int list>([ 1; -1; 3; -1; 5 ], AList.toList res)
+
+    CList.set [ 2; 4; 6; 8; 10 ] map
+    Assert.Equal<int list>([ 2; -1; 6; -1; 10 ], AList.toList res)
+
+    CSet.set (Set.ofList [ 0; 2; 3; 4 ]) keys
+    Assert.Equal<int list>([ 2; -1; 6; 8; 10 ], AList.toList res)
+
+[<Fact>]
+let ``AList filteriA flips by position`` () =
+    let map = CList.ofList [ 1; 2; 3; 4; 5 ]
+    let keys = CSet.ofSeq [ 0; 2; 4 ]
+
+    let res = map |> AList.filteriA (fun k _ -> keys |> ASet.contains k)
+
+    Assert.Equal<int list>([ 1; 3; 5 ], AList.toList res)
+
+    CList.set [ 2; 4; 6; 8; 10 ] map
+    Assert.Equal<int list>([ 2; 6; 10 ], AList.toList res)
+
+    CSet.set (Set.ofList [ 0; 2; 3; 4 ]) keys
+    Assert.Equal<int list>([ 2; 6; 8; 10 ], AList.toList res)
+
+[<Fact>]
+let ``AList chooseiA survival flips by position`` () =
+    let l = CList.ofList [ 1; 2; 3 ]
+    let keepEven = CVal.create true
+
+    let result =
+        l
+        |> AList.chooseiA (fun i v -> keepEven |> AVal.map (fun k -> if k && i % 2 = 1 then Some(v * 10) else None))
+
+    Assert.Equal<int list>([ 20 ], AList.toList result)
+
+    CVal.set false keepEven
+    Assert.Equal<int list>([], AList.toList result)
+
+    CList.append 4 l
+    Assert.Equal<int list>([], AList.toList result)
+
+    CVal.set true keepEven
+    Assert.Equal<int list>([ 20; 40 ], AList.toList result)
+
+[<Fact>]
 let ``AList filter and choose update semantics`` () =
     let src = CList.ofList [ 1; 2; 3; 4; 5 ]
     let evens = AList.filter (fun x -> x % 2 = 0) (CList.value src)
@@ -3640,10 +4341,10 @@ let ``AMap observe delivers the net of a set-then-rem batch`` () =
         CMap.addOrUpdate "k" 2 r)
 
     // Net: the key is present with 2 -> exactly one delivery, a Set.
-    Assert.Single(delivered)
+    Assert.Single(delivered) |> ignore
     let d = delivered[0]
     let entries = d.SetEntries.ToArray()
-    Assert.Single(entries)
+    Assert.Single(entries) |> ignore
     Assert.Empty(d.RemovedKeys.ToArray())
     let struct (k, v) = entries[0]
     Assert.Equal("k", k)
@@ -3849,3 +4550,1166 @@ let ``sinks registered during delivery do not receive the current batch`` () =
     Assert.Equal<Set<_>>(Set.ofList [ 10 ], Set.ofSeq (ASet.force b))
     CSet.remove 1 src
     Assert.Equal<Set<int>>(Set.empty, Set.ofSeq (ASet.force b))
+
+// =============================================================================
+// Extension points (MAPA-DESIGN §1): ofExternal ×4, AList.custom.
+// Public API level only. Semantics per §1.1: the snapshot runs at most once
+// per invalidate, on the next read; not invalidated → zero cost.
+// =============================================================================
+
+[<Fact>]
+let ``AVal ofExternal: first read takes the snapshot; invalidate re-reads`` () =
+    let mutable current = 0
+    let value, invalidate = AVal.ofExternal (fun () -> current)
+
+    Assert.Equal(0, AVal.getValue value)
+
+    current <- 42
+    Assert.Equal(0, AVal.getValue value) // not invalidated: cached
+    invalidate ()
+    Assert.Equal(42, AVal.getValue value)
+
+[<Fact>]
+let ``AVal ofExternal: reads without invalidate do not re-run the function`` () =
+    let mutable calls = 0
+
+    let value, _ =
+        AVal.ofExternal (fun () ->
+            calls <- calls + 1
+            calls)
+
+    AVal.getValue value |> ignore
+    AVal.getValue value |> ignore
+    Assert.Equal(1, calls)
+
+[<Fact>]
+let ``AVal ofExternal: derived values recompute after invalidate`` () =
+    let mutable current = 1
+    let value, invalidate = AVal.ofExternal (fun () -> current)
+    let doubled = AVal.map (fun v -> v * 2) value
+
+    Assert.Equal(2, AVal.getValue doubled)
+
+    current <- 5
+    invalidate ()
+    Assert.Equal(10, AVal.getValue doubled)
+
+[<Fact>]
+let ``AVal ofExternal: observe fires only when the re-read changed the value`` () =
+    let mutable current = 1
+    let value, invalidate = AVal.ofExternal (fun () -> current)
+    let mutable callbacks = 0
+
+    use _obs = AVal.observe (fun _ -> callbacks <- callbacks + 1) value
+
+    invalidate () // same value: no callback
+    Assert.Equal(0, callbacks)
+
+    current <- 2
+    invalidate ()
+    Assert.Equal(1, callbacks)
+
+[<Fact>]
+let ``AVal ofExternal: foreign-thread invalidate applies at the next read`` () =
+    let mutable current = 1
+    let value, invalidate = AVal.ofExternal (fun () -> current)
+
+    Assert.Equal(1, AVal.getValue value)
+
+    current <- 7
+    Task.Run(fun () -> invalidate ()).Wait()
+    Assert.Equal(7, AVal.getValue value) // the post drains at the next graph op
+
+[<Fact>]
+let ``ASet mapA consumes an AVal ofExternal element source`` () =
+    // The invalidate moves the write generation, so the *A scan gate fires.
+    let s = CSet.ofSeq [ 1; 2; 3 ]
+    let mutable current = 0
+    let ext, invalidate = AVal.ofExternal (fun () -> current)
+    let mapped = s |> ASet.mapA (fun _ -> ext)
+
+    Assert.Equal<Set<int>>(Set.ofList [ 0 ], ASet.toSet mapped)
+
+    current <- 9
+    invalidate ()
+    Assert.Equal<Set<int>>(Set.ofList [ 9 ], ASet.toSet mapped)
+
+[<Fact>]
+let ``ASet ofExternal: materializes on first read and diffs on invalidate`` () =
+    let mutable current = HashSet<int>([ 1; 2; 3 ])
+    let s, invalidate = ASet.ofExternal (fun () -> current :> IReadOnlySet<int>)
+
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2; 3 ], ASet.toSet s)
+
+    current <- HashSet<int>([ 2; 3; 4 ])
+    invalidate ()
+    Assert.Equal<Set<int>>(Set.ofList [ 2; 3; 4 ], ASet.toSet s)
+
+    invalidate () // unchanged snapshot: no visible change
+    Assert.Equal<Set<int>>(Set.ofList [ 2; 3; 4 ], ASet.toSet s)
+
+[<Fact>]
+let ``ASet ofExternal: reads without invalidate do not re-run the snapshot`` () =
+    let mutable calls = 0
+
+    let s, _ =
+        ASet.ofExternal (fun () ->
+            calls <- calls + 1
+            HashSet<int>([ 1 ]) :> IReadOnlySet<int>)
+
+    ASet.force s |> ignore
+    ASet.force s |> ignore
+    Assert.Equal(1, calls)
+
+[<Fact>]
+let ``ASet ofExternal: observes receive the net delta after invalidate`` () =
+    let mutable current = HashSet<int>([ 1; 2; 3 ])
+    let s, invalidate = ASet.ofExternal (fun () -> current :> IReadOnlySet<int>)
+    let mutable lastAdds = Set.empty<int>
+    let mutable lastRems = Set.empty<int>
+
+    use _obs =
+        ASet.observe
+            (fun _ (d: SetDelta<int>) ->
+                lastAdds <- d.Added.ToArray() |> Set.ofArray
+                lastRems <- d.Removed.ToArray() |> Set.ofArray)
+            s
+
+    current <- HashSet<int>([ 3; 4 ])
+    invalidate ()
+    Assert.Equal<Set<int>>(Set.ofList [ 4 ], lastAdds)
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2 ], lastRems)
+
+[<Fact>]
+let ``AMap ofExternal: materializes on first read and diffs on invalidate`` () =
+    let mutable current = Dictionary<int, string>()
+    current[1] <- "a"
+    current[2] <- "b"
+
+    let m, invalidate =
+        AMap.ofExternal (fun () -> current :> IReadOnlyDictionary<int, string>)
+
+    Assert.Equal<Map<int, string>>(Map.ofList [ 1, "a"; 2, "b" ], AMap.toMap m)
+
+    current[1] <- "a" // unchanged value: elided
+    current[3] <- "c"
+    invalidate ()
+    Assert.Equal<Map<int, string>>(Map.ofList [ 1, "a"; 2, "b"; 3, "c" ], AMap.toMap m)
+
+    current.Remove 2 |> ignore
+    invalidate ()
+    Assert.Equal<Map<int, string>>(Map.ofList [ 1, "a"; 3, "c" ], AMap.toMap m)
+
+[<Fact>]
+let ``AList ofExternal: materializes on first read and diffs positionally`` () =
+    let mutable current = ResizeArray [ 1; 2; 3 ]
+    let l, invalidate = AList.ofExternal (fun () -> current :> IReadOnlyList<int>)
+
+    Assert.Equal<int[]>([| 1; 2; 3 |], AList.toArray l)
+
+    current.RemoveAt 0 // [ 2; 3 ]
+    invalidate ()
+    Assert.Equal<int[]>([| 2; 3 |], AList.toArray l)
+
+    current.Insert(1, 9) // [ 2; 9; 3 ]
+    invalidate ()
+    Assert.Equal<int[]>([| 2; 9; 3 |], AList.toArray l)
+
+    current[0] <- 7 // [ 7; 9; 3 ]
+    invalidate ()
+    Assert.Equal<int[]>([| 7; 9; 3 |], AList.toArray l)
+
+[<Fact>]
+let ``AList ofExternal: reads without invalidate do not re-run the snapshot`` () =
+    let mutable calls = 0
+
+    let l, _ =
+        AList.ofExternal (fun () ->
+            calls <- calls + 1
+            ResizeArray [ 1 ] :> IReadOnlyList<int>)
+
+    AList.force l |> ignore
+    AList.force l |> ignore
+    Assert.Equal(1, calls)
+
+[<Fact>]
+let ``AList ofExternal: observes receive the ordered delta after invalidate`` () =
+    let mutable current = ResizeArray [ 1; 2; 3 ]
+    let l, invalidate = AList.ofExternal (fun () -> current :> IReadOnlyList<int>)
+    let mutable opCount = 0
+
+    use _obs =
+        AList.observe (fun _ (d: ListDelta<int>) -> opCount <- opCount + d.Operations.Length) l
+
+    current.Insert(0, 0) // [ 0; 1; 2; 3 ]
+    invalidate ()
+    Assert.Equal(1, opCount)
+    Assert.Equal<int[]>([| 0; 1; 2; 3 |], AList.toArray l)
+
+[<Fact>]
+let ``AList custom: the compute drains an event queue into the list`` () =
+    let events = ResizeArray<int>()
+
+    let list =
+        AList.custom (fun view (delta: ListDeltaBuilder<int>) ->
+            for i in 0 .. events.Count - 1 do
+                delta.Insert(view.Count + i, events[i])
+
+            events.Clear())
+
+    Assert.Equal<int[]>([||], AList.toArray list)
+
+    events.Add 1
+    events.Add 2
+    Assert.Equal<int[]>([| 1; 2 |], AList.toArray list) // one poll drains the queue
+
+    events.Add 3
+    Assert.Equal<int[]>([| 1; 2; 3 |], AList.toArray list)
+
+[<Fact>]
+let ``AList custom: observes receive the computed ops`` () =
+    let events = ResizeArray<int>()
+
+    let list =
+        AList.custom (fun view (delta: ListDeltaBuilder<int>) ->
+            for i in 0 .. events.Count - 1 do
+                delta.Insert(view.Count + i, events[i])
+
+            events.Clear())
+
+    let mutable opCount = 0
+
+    use _obs =
+        AList.observe (fun _ (d: ListDelta<int>) -> opCount <- opCount + d.Operations.Length) list
+
+    events.Add 5
+    events.Add 6
+    AList.force list |> ignore // the read polls; the delta wakes the observer
+    Assert.Equal(2, opCount)
+    Assert.Equal<int[]>([| 5; 6 |], AList.toArray list)
+
+[<Fact>]
+let ``ofExternal: reads without invalidate allocate nothing`` () =
+    let mutable current = 1
+    let v, invalidateV = AVal.ofExternal (fun () -> current)
+
+    let s, invalidateS =
+        ASet.ofExternal (fun () -> HashSet<int>([ 1 ]) :> IReadOnlySet<int>)
+
+    let map = Dictionary<int, string>()
+    map[1] <- "a"
+
+    let m, invalidateM =
+        AMap.ofExternal (fun () -> map :> IReadOnlyDictionary<int, string>)
+
+    let l, invalidateL =
+        AList.ofExternal (fun () -> ResizeArray [ 1 ] :> IReadOnlyList<int>)
+
+    // Settle: first reads, an invalidate round, settled reads.
+    AVal.getValue v |> ignore
+    ASet.getValue s |> ignore
+    AMap.getValue m |> ignore
+    AList.getValue l |> ignore
+    invalidateV ()
+    invalidateS ()
+    invalidateM ()
+    invalidateL ()
+    AVal.getValue v |> ignore
+    ASet.getValue s |> ignore
+    AMap.getValue m |> ignore
+    AList.getValue l |> ignore
+
+    let before = GC.GetAllocatedBytesForCurrentThread()
+
+    for _ in 1..1000 do
+        AVal.getValue v |> ignore
+        ASet.getValue s |> ignore
+        AMap.getValue m |> ignore
+        AList.getValue l |> ignore
+
+    let allocated = GC.GetAllocatedBytesForCurrentThread() - before
+    Assert.Equal(0L, allocated)
+
+// =============================================================================
+// Bring list — ASet group (docs/2026-08-05-FDA-API-GAPS.md §3): range,
+// bind2/bind3, collect', mapUse, average/averageBy.
+// =============================================================================
+
+[<Fact>]
+let ``ASet range follows its bounds`` () =
+    let lo = CVal.create 1
+    let hi = CVal.create 3
+    let r = ASet.range (CVal.value lo) (CVal.value hi)
+
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2; 3 ], ASet.toSet r)
+
+    CVal.set 0 lo
+    Assert.Equal<Set<int>>(Set.ofList [ 0; 1; 2; 3 ], ASet.toSet r)
+
+    CVal.set 2 hi
+    Assert.Equal<Set<int>>(Set.ofList [ 0; 1; 2 ], ASet.toSet r)
+
+[<Fact>]
+let ``ASet bind2 and bind3 remap when any input changes`` () =
+    let a = CVal.create 0
+    let b = CVal.create 0
+    let buckets = [| CSet.empty<int>; CSet.empty<int>; CSet.empty<int> |]
+
+    let combined =
+        ASet.bind2 (fun av bv -> buckets[av + bv]) (CVal.value a) (CVal.value b)
+
+    CSet.add 1 (buckets[0])
+    Assert.Equal<Set<int>>(Set.ofList [ 1 ], ASet.toSet combined)
+
+    CVal.set 1 b // a+b = 1: bucket 1, still empty
+    Assert.Equal<Set<int>>(Set.empty, ASet.toSet combined)
+
+    CSet.add 2 (buckets[1])
+    Assert.Equal<Set<int>>(Set.ofList [ 2 ], ASet.toSet combined)
+
+    CVal.set 1 a // a+b = 2: bucket 2, empty
+    Assert.Equal<Set<int>>(Set.empty, ASet.toSet combined)
+
+    let c = CVal.create 0
+
+    let combined3 =
+        ASet.bind3 (fun av bv cv -> buckets[av + bv + cv]) (CVal.value a) (CVal.value b) (CVal.value c)
+
+    Assert.Equal<Set<int>>(Set.empty, ASet.toSet combined3)
+
+    CVal.set 0 a
+    CVal.set 0 b
+    CVal.set 1 c // a+b+c = 1: bucket 1 holds { 2 }
+    Assert.Equal<Set<int>>(Set.ofList [ 2 ], ASet.toSet combined3)
+
+[<Fact>]
+let ``ASet collect' expands statically`` () =
+    let s = CSet.ofSeq [ 1; 2; 3 ]
+    let expanded = s |> ASet.collect' (fun v -> [ v; v * 10 ])
+
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 10; 2; 20; 3; 30 ], ASet.toSet expanded)
+
+    CSet.remove 1 s
+    Assert.Equal<Set<int>>(Set.ofList [ 2; 20; 3; 30 ], ASet.toSet expanded)
+
+[<Fact>]
+let ``ASet mapUse disposes on removal and on dispose`` () =
+    let input = CSet.ofSeq [ 1; 2; 3; 4 ]
+    let refCount = ref 0
+
+    let newDisposable () =
+        incr refCount
+
+        { new IDisposable with
+            member _.Dispose() = decr refCount }
+
+    let disp, set = input |> ASet.mapUse (fun v -> newDisposable ())
+
+    Assert.Equal(0, !refCount) // mapped lazily: nothing before the first read
+
+    ASet.force set |> ignore
+    Assert.Equal(4, !refCount)
+
+    CSet.remove 1 input
+    ASet.force set |> ignore
+    Assert.Equal(3, !refCount)
+
+    CSet.add 7 input
+    ASet.force set |> ignore
+    Assert.Equal(4, !refCount)
+
+    disp.Dispose()
+    Assert.Equal(0, !refCount)
+
+[<Fact>]
+let ``ASet mapUse refcounts duplicate mapped values`` () =
+    let input = CSet.ofSeq [ 1; 2 ]
+    let mutable disposes = 0
+
+    let shared =
+        { new IDisposable with
+            member _.Dispose() = disposes <- disposes + 1 }
+
+    let disp, set = input |> ASet.mapUse (fun _ -> shared)
+
+    ASet.force set |> ignore
+    Assert.Equal(1, (ASet.force set).Count) // both elements map to one output value
+    Assert.Equal(0, disposes)
+
+    CSet.remove 1 input
+    ASet.force set |> ignore
+    Assert.Equal(1, (ASet.force set).Count) // one occurrence remains
+    Assert.Equal(0, disposes)
+
+    CSet.remove 2 input
+    ASet.force set |> ignore
+    Assert.Equal(0, (ASet.force set).Count)
+    Assert.Equal(1, disposes) // last occurrence left: disposed exactly once
+
+[<Fact>]
+let ``ASet average and averageBy`` () =
+    let s = CSet.ofSeq [ 1.0; 2.0; 3.0 ]
+
+    Assert.Equal(2.0, AVal.getValue (ASet.average (CSet.value s)))
+    Assert.Equal(4.0, AVal.getValue (ASet.averageBy (fun v -> v * 2.0) (CSet.value s)))
+
+    CSet.add 5.0 s
+    Assert.Equal(2.75, AVal.getValue (ASet.average (CSet.value s)))
+
+// =============================================================================
+// Bring list — AMap group (docs/2026-08-05-FDA-API-GAPS.md §4): map',
+// choose', filter', intersectV, bind2/bind3, mapUse, foldHalfGroup,
+// sumBy/averageBy, toASet pairs + keys.
+// =============================================================================
+
+[<Fact>]
+let ``AMap mapV and filterV are value-only`` () =
+    let m = CMap.ofSeq [ 1, 2; 2, 4; 3, 5 ]
+
+    let doubled = AMap.mapV (fun v -> v * 2) (CMap.value m)
+    Assert.Equal<Map<int, int>>(Map.ofList [ 1, 4; 2, 8; 3, 10 ], AMap.toMap doubled)
+
+    let big = AMap.filterV (fun v -> v > 3) (CMap.value m)
+    Assert.Equal<Map<int, int>>(Map.ofList [ 2, 4; 3, 5 ], AMap.toMap big)
+
+[<Fact>]
+let ``AMap intersectV pairs the values as struct pairs`` () =
+    let a = CMap.ofSeq [ 1, "a"; 2, "b"; 3, "c" ]
+    let b = CMap.ofSeq [ 2, 20; 3, 30; 4, 40 ]
+
+    let paired = AMap.intersectV (CMap.value a) (CMap.value b)
+
+    let expected = Map.ofList [ 2, struct ("b", 20); 3, struct ("c", 30) ]
+
+    Assert.Equal<Map<int, struct (string * int)>>(expected, AMap.toMap paired)
+
+[<Fact>]
+let ``AMap bind2 and bind3 remap when any input changes`` () =
+    let a = CVal.create 0
+    let b = CVal.create 0
+
+    let tables =
+        [| CMap.empty<int, string>; CMap.empty<int, string>; CMap.empty<int, string> |]
+
+    let combined =
+        AMap.bind2 (fun av bv -> tables[av + bv]) (CVal.value a) (CVal.value b)
+
+    CMap.addOrUpdate 1 "x" (tables[0])
+    Assert.Equal<Map<int, string>>(Map.ofList [ 1, "x" ], AMap.toMap combined)
+
+    CVal.set 1 b // a+b = 1: table 1, still empty
+    Assert.Equal<Map<int, string>>(Map.empty, AMap.toMap combined)
+
+    CMap.addOrUpdate 2 "y" (tables[1])
+    Assert.Equal<Map<int, string>>(Map.ofList [ 2, "y" ], AMap.toMap combined)
+
+    CVal.set 1 a // a+b = 2: table 2, empty
+    Assert.Equal<Map<int, string>>(Map.empty, AMap.toMap combined)
+
+    let c = CVal.create 0
+
+    let combined3 =
+        AMap.bind3 (fun av bv cv -> tables[av + bv + cv]) (CVal.value a) (CVal.value b) (CVal.value c)
+
+    Assert.Equal<Map<int, string>>(Map.empty, AMap.toMap combined3)
+
+    CVal.set 0 a
+    CVal.set 0 b
+    CVal.set 1 c // a+b+c = 1: table 1 holds { 2 -> y }
+    Assert.Equal<Map<int, string>>(Map.ofList [ 2, "y" ], AMap.toMap combined3)
+
+[<Fact>]
+let ``AMap mapUse disposes on removal and on dispose`` () =
+    let input = CMap.ofSeq [ 1, "a"; 2, "b"; 3, "c"; 4, "d" ]
+    let refCount = ref 0
+
+    let newDisposable _ =
+        incr refCount
+
+        { new IDisposable with
+            member _.Dispose() = decr refCount }
+
+    let disp, mapValue = input |> AMap.mapUse (fun _ _ -> newDisposable ())
+
+    Assert.Equal(0, !refCount) // mapped lazily: nothing before the first read
+
+    AMap.force mapValue |> ignore
+    Assert.Equal(4, !refCount)
+
+    CMap.remove 1 input
+    AMap.force mapValue |> ignore
+    Assert.Equal(3, !refCount)
+
+    CMap.addOrUpdate 7 "g" input
+    AMap.force mapValue |> ignore
+    Assert.Equal(4, !refCount)
+
+    disp.Dispose()
+    Assert.Equal(0, !refCount)
+
+[<Fact>]
+let ``AMap foldHalfGroup, sumBy and averageBy`` () =
+    let m = CMap.ofSeq [ 1, 10; 2, 20; 3, 30 ]
+
+    // Fully invertible: removals subtract without a full recompute.
+    let sum =
+        AMap.foldHalfGroup (fun s k v -> s + v) (fun s k v -> ValueSome(s - v)) 0 (CMap.value m)
+
+    Assert.Equal(60, AVal.getValue sum)
+
+    CMap.remove 2 m
+    Assert.Equal(40, AVal.getValue sum)
+
+    CMap.addOrUpdate 4 40 m
+    Assert.Equal(80, AVal.getValue sum)
+
+    // Non-invertible trySubtract: removals recompute the whole fold; the
+    // result stays correct.
+    let always =
+        AMap.foldHalfGroup (fun s k v -> s + v) (fun _ _ _ -> ValueNone) 0 (CMap.value m)
+
+    Assert.Equal(80, AVal.getValue always)
+
+    CMap.remove 4 m
+    Assert.Equal(40, AVal.getValue always)
+
+    let sums = AMap.sumBy (fun k v -> v) (CMap.value m)
+    Assert.Equal(40, AVal.getValue sums)
+
+    let mf = CMap.ofSeq [ 1, 1.0; 2, 2.0 ]
+    let avg = AMap.averageBy (fun k v -> v) (CMap.value mf)
+    Assert.Equal(1.5, AVal.getValue avg)
+
+[<Fact>]
+let ``AMap toASet returns pairs and keys returns keys`` () =
+    let m = CMap.ofSeq [ 1, "a"; 2, "b" ]
+
+    let pairs = AMap.toASet (CMap.value m)
+    let keys = AMap.keys (CMap.value m)
+
+    Assert.Equal<Set<struct (int * string)>>(Set.ofList [ struct (1, "a"); struct (2, "b") ], ASet.toSet pairs)
+
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2 ], ASet.toSet keys)
+
+    CMap.remove 1 m
+    Assert.Equal<Set<struct (int * string)>>(Set.ofList [ struct (2, "b") ], ASet.toSet pairs)
+    Assert.Equal<Set<int>>(Set.ofList [ 2 ], ASet.toSet keys)
+
+// =============================================================================
+// Bring list — AList simple group (gap sheet §5.1, §5.5, §5.6, §5.7):
+// mapi/choosei/filteri, indexed, ofAVal, toAVal, range, init, tryAt/tryGet/
+// tryFirst/tryLast, rev, sort family, pairwise, mapUse/mapUsei.
+// =============================================================================
+
+[<Fact>]
+let ``AList mapi choosei and filteri pass the input position`` () =
+    let l = CList.ofSeq [ 10; 20; 30 ]
+
+    let withPos = l |> AList.mapi (fun i v -> (i, v))
+    Assert.Equal<(int * int)[]>([| 0, 10; 1, 20; 2, 30 |], AList.toArray withPos)
+
+    let chosen =
+        l |> AList.choosei (fun i v -> if i % 2 = 0 then Some(v * 10) else None)
+
+    Assert.Equal<int[]>([| 100; 300 |], AList.toArray chosen)
+
+    let filtered = l |> AList.filteri (fun i v -> i = 1 || v = 30)
+    Assert.Equal<int[]>([| 20; 30 |], AList.toArray filtered)
+
+    CList.insertAt 0 5 l // [ 5; 10; 20; 30 ]
+    // Mapping-time positions stick (the mapiA convention): shifted elements
+    // keep the position the mapping saw (FDA stable-Index equivalent).
+    Assert.Equal<(int * int)[]>([| 0, 5; 0, 10; 1, 20; 2, 30 |], AList.toArray withPos)
+
+    let chosen2 =
+        l |> AList.choosei (fun i v -> if i % 2 = 0 then Some(v * 10) else None)
+
+    Assert.Equal<int[]>([| 50; 200 |], AList.toArray chosen2) // 5@0, 20@2
+
+[<Fact>]
+let ``AList indexed pairs elements with their positions`` () =
+    let l = CList.ofSeq [ "a"; "b" ]
+    let indexed = AList.indexed (CList.value l)
+
+    Assert.Equal<struct (int * string)[]>([| struct (0, "a"); struct (1, "b") |], AList.toArray indexed)
+
+    CList.insertAt 1 "x" l
+    // Mapping-time positions stick (the mapiA convention).
+    Assert.Equal<struct (int * string)[]>(
+        [| struct (0, "a"); struct (1, "x"); struct (1, "b") |],
+        AList.toArray indexed
+    )
+
+[<Fact>]
+let ``AList ofAVal rebuilds on value change`` () =
+    let v = CVal.create [| 1; 2; 3 |]
+    let l = AList.ofAVal (CVal.value v)
+
+    Assert.Equal<int[]>([| 1; 2; 3 |], AList.toArray l)
+
+    CVal.set [| 3; 4 |] v
+    Assert.Equal<int[]>([| 3; 4 |], AList.toArray l)
+
+[<Fact>]
+let ``AList toAVal materializes snapshots`` () =
+    let l = CList.ofSeq [ 1; 2 ]
+    let snap = AList.toAVal (CList.value l)
+
+    Assert.Equal<int[]>([| 1; 2 |], AVal.getValue snap)
+
+    CList.append 3 l
+    Assert.Equal<int[]>([| 1; 2; 3 |], AVal.getValue snap)
+
+[<Fact>]
+let ``AList range and init follow their inputs`` () =
+    let lo = CVal.create 1
+    let hi = CVal.create 3
+    let r = AList.range (CVal.value lo) (CVal.value hi)
+    Assert.Equal<int[]>([| 1; 2; 3 |], AList.toArray r)
+
+    CVal.set 5 hi
+    Assert.Equal<int[]>([| 1; 2; 3; 4; 5 |], AList.toArray r)
+
+    let count = CVal.create 2
+    let gen = AList.init (fun i -> i * 10) (CVal.value count)
+    Assert.Equal<int[]>([| 0; 10 |], AList.toArray gen)
+
+    CVal.set 4 count
+    Assert.Equal<int[]>([| 0; 10; 20; 30 |], AList.toArray gen)
+
+[<Fact>]
+let ``AList tryAt tryGet tryFirst tryLast`` () =
+    let l = CList.ofSeq [ 10; 20; 30 ]
+    let a = AList.tryAt 1 (CList.value l)
+    let g = AList.tryGet 5 (CList.value l)
+    let f = AList.tryFirst (CList.value l)
+    let t = AList.tryLast (CList.value l)
+
+    Assert.Equal(ValueSome 20, AVal.getValue a)
+    Assert.Equal(ValueNone, AVal.getValue g)
+    Assert.Equal(ValueSome 10, AVal.getValue f)
+    Assert.Equal(ValueSome 30, AVal.getValue t)
+
+    CList.removeAt 0 l
+    Assert.Equal(ValueSome 20, AVal.getValue f)
+    Assert.Equal(ValueSome 30, AVal.getValue t)
+
+[<Fact>]
+let ``AList rev follows the source`` () =
+    let l = CList.ofSeq [ 1; 2; 3 ]
+    let r = AList.rev (CList.value l)
+
+    Assert.Equal<int[]>([| 3; 2; 1 |], AList.toArray r)
+
+    CList.append 4 l
+    Assert.Equal<int[]>([| 4; 3; 2; 1 |], AList.toArray r)
+
+[<Fact>]
+let ``AList sort family is stable`` () =
+    let l = CList.ofSeq [ 3; 1; 2; 1 ]
+
+    Assert.Equal<int[]>([| 1; 1; 2; 3 |], AList.toArray (AList.sort (CList.value l)))
+    Assert.Equal<int[]>([| 3; 2; 1; 1 |], AList.toArray (AList.sortDescending (CList.value l)))
+    Assert.Equal<int[]>([| 1; 1; 2; 3 |], AList.toArray (AList.sortBy (fun v -> v) (CList.value l)))
+    Assert.Equal<int[]>([| 1; 1; 2; 3 |], AList.toArray (AList.sortWith (fun a b -> compare a b) (CList.value l)))
+
+    // sortByi: the projection sees the input position at poll time; stable.
+    let bySum = AList.sortByi (fun i v -> i + v) (CList.value l)
+    Assert.Equal<int[]>([| 1; 3; 2; 1 |], AList.toArray bySum) // keys: 3, 2, 4, 4
+
+    let l2 = CList.ofSeq [ 1; 2; 3 ]
+    let byDesc = AList.sortByDescending (fun v -> v) (CList.value l2)
+    Assert.Equal<int[]>([| 3; 2; 1 |], AList.toArray byDesc)
+
+    let byDesci = AList.sortByDescendingi (fun i v -> i + v) (CList.value l2)
+    Assert.Equal<int[]>([| 3; 2; 1 |], AList.toArray byDesci) // keys: 1, 3, 5
+
+[<Fact>]
+let ``AList pairwise and pairwiseCyclic`` () =
+    let l = CList.ofSeq [ 1; 2; 3 ]
+
+    let p = AList.pairwise (CList.value l)
+    Assert.Equal<struct (int * int)[]>([| struct (1, 2); struct (2, 3) |], AList.toArray p)
+
+    let pc = AList.pairwiseCyclic (CList.value l)
+    Assert.Equal<struct (int * int)[]>([| struct (1, 2); struct (2, 3); struct (3, 1) |], AList.toArray pc)
+
+    CList.insertAt 1 9 l // [ 1; 9; 2; 3 ]
+    Assert.Equal<struct (int * int)[]>([| struct (1, 9); struct (9, 2); struct (2, 3) |], AList.toArray p)
+
+[<Fact>]
+let ``AList mapUse disposes on removal and on dispose`` () =
+    let input = CList.ofSeq [ 1; 2; 3 ]
+    let refCount = ref 0
+
+    let newDisposable _ =
+        incr refCount
+
+        { new IDisposable with
+            member _.Dispose() = decr refCount }
+
+    let disp, list = input |> AList.mapUse newDisposable
+
+    Assert.Equal(0, !refCount) // mapped lazily: nothing before the first read
+
+    AList.force list |> ignore
+    Assert.Equal(3, !refCount)
+
+    CList.removeAt 0 input
+    AList.force list |> ignore
+    Assert.Equal(2, !refCount)
+
+    CList.append 7 input
+    AList.force list |> ignore
+    Assert.Equal(3, !refCount)
+
+    disp.Dispose()
+    Assert.Equal(0, !refCount)
+
+[<Fact>]
+let ``AList mapUsei disposes the replaced value on update`` () =
+    let input = CList.ofSeq [ 10 ]
+    let mutable disposes = 0
+
+    let disp, list =
+        input
+        |> AList.mapUsei (fun i v ->
+            { new IDisposable with
+                member _.Dispose() = disposes <- disposes + 1 })
+
+    AList.force list |> ignore
+
+    CList.updateAt 0 20 input // the mapped value at position 0 is replaced
+    AList.force list |> ignore
+    Assert.Equal(1, disposes)
+
+    disp.Dispose()
+    Assert.Equal(2, disposes)
+
+// =============================================================================
+// Bring list — AList bind/slices/concat group (gap sheet §5.2, §5.4, §5.1.5).
+// =============================================================================
+
+[<Fact>]
+let ``AList bind follows the value and the inner list`` () =
+    let selected = CVal.create 0
+    let lists = [| CList.ofSeq [ 1; 2 ]; CList.ofSeq [ 3 ] |]
+
+    let bound = AList.bind (fun i -> CList.value lists[i]) (CVal.value selected)
+
+    Assert.Equal<int[]>([| 1; 2 |], AList.toArray bound)
+
+    CList.append 9 (lists[0]) // the bound inner's changes propagate
+    Assert.Equal<int[]>([| 1; 2; 9 |], AList.toArray bound)
+
+    CVal.set 1 selected // swap to the second inner
+    Assert.Equal<int[]>([| 3 |], AList.toArray bound)
+
+    CList.append 8 (lists[0]) // the unbound inner no longer leaks
+    Assert.Equal<int[]>([| 3 |], AList.toArray bound)
+
+[<Fact>]
+let ``AList bind2 and bind3 remap when any input changes`` () =
+    let a = CVal.create 0
+    let b = CVal.create 0
+    let lists = [| CList.ofSeq [ 1 ]; CList.ofSeq [ 2 ]; CList.ofSeq [ 3 ] |]
+
+    let combined =
+        AList.bind2 (fun av bv -> CList.value lists[av + bv]) (CVal.value a) (CVal.value b)
+
+    Assert.Equal<int[]>([| 1 |], AList.toArray combined)
+
+    CVal.set 1 b
+    Assert.Equal<int[]>([| 2 |], AList.toArray combined)
+
+    CVal.set 1 a
+    Assert.Equal<int[]>([| 3 |], AList.toArray combined)
+
+    let c = CVal.create 0
+
+    let combined3 =
+        AList.bind3 (fun av bv cv -> CList.value lists[av + bv + cv]) (CVal.value a) (CVal.value b) (CVal.value c)
+
+    Assert.Equal<int[]>([| 3 |], AList.toArray combined3)
+
+    CVal.set 0 c // a+b+c = 2: the third list
+    CVal.set 0 a
+    Assert.Equal<int[]>([| 2 |], AList.toArray combined3)
+
+[<Fact>]
+let ``AList concat concatenates the inner lists`` () =
+    let a = CList.ofSeq [ 1; 2 ]
+    let b = CList.ofSeq [ 3 ]
+    let c = CList.ofSeq [ 4; 5 ]
+
+    let all = AList.concat [ CList.value a; CList.value b; CList.value c ]
+
+    Assert.Equal<int[]>([| 1; 2; 3; 4; 5 |], AList.toArray all)
+
+    CList.append 9 b
+    Assert.Equal<int[]>([| 1; 2; 3; 9; 4; 5 |], AList.toArray all)
+
+    CList.append 6 c
+    Assert.Equal<int[]>([| 1; 2; 3; 9; 4; 5; 6 |], AList.toArray all)
+
+[<Fact>]
+let ``AList take skip and sub follow adaptive bounds`` () =
+    let l = CList.ofSeq [ 0; 1; 2; 3; 4 ]
+
+    let t = AList.take 2 (CList.value l)
+    Assert.Equal<int[]>([| 0; 1 |], AList.toArray t)
+
+    let s = AList.skip 2 (CList.value l)
+    Assert.Equal<int[]>([| 2; 3; 4 |], AList.toArray s)
+
+    let sub = AList.sub 1 2 (CList.value l)
+    Assert.Equal<int[]>([| 1; 2 |], AList.toArray sub)
+
+    let count = CVal.create 2
+    let ta = AList.takeA (CVal.value count) (CList.value l)
+    Assert.Equal<int[]>([| 0; 1 |], AList.toArray ta)
+
+    CVal.set 4 count
+    Assert.Equal<int[]>([| 0; 1; 2; 3 |], AList.toArray ta)
+
+    let offset = CVal.create 1
+    let c = CVal.create 2
+    let sa = AList.subA (CVal.value offset) (CVal.value c) (CList.value l)
+    Assert.Equal<int[]>([| 1; 2 |], AList.toArray sa)
+
+    CVal.set 3 offset
+    Assert.Equal<int[]>([| 3; 4 |], AList.toArray sa)
+
+    CVal.set 1 c
+    Assert.Equal<int[]>([| 3 |], AList.toArray sa)
+
+// =============================================================================
+// Bring list — AList reductions group (gap sheet §5.8): reduce/reduceBy,
+// fold/foldGroup/foldHalfGroup, forall/exists, tryMin/tryMax, sum/sumBy,
+// average/averageBy, countBy.
+// =============================================================================
+
+[<Fact>]
+let ``AList reduce and reduceBy follow the deltas`` () =
+    let l = CList.ofSeq [ 1; 2; 3 ]
+
+    let sum = AList.sum (CList.value l)
+    Assert.Equal(6, AVal.getValue sum)
+
+    let sums = AList.sumBy (fun v -> v * 10) (CList.value l)
+    Assert.Equal(60, AVal.getValue sums)
+
+    CList.append 4 l
+    Assert.Equal(10, AVal.getValue sum)
+    Assert.Equal(100, AVal.getValue sums)
+
+    CList.removeAt 0 l // [ 2; 3; 4 ]
+    Assert.Equal(9, AVal.getValue sum)
+    Assert.Equal(90, AVal.getValue sums)
+
+    CList.updateAt 1 30 l // [ 2; 30; 4 ]
+    Assert.Equal(36, AVal.getValue sum)
+
+    CList.updateAt 1 30 l // no-op update: no rebuild, same value
+    Assert.Equal(36, AVal.getValue sum)
+
+[<Fact>]
+let ``AList fold family`` () =
+    let l = CList.ofSeq [ 1; 2; 3 ]
+
+    let f = AList.fold (fun s v -> s + v) 0 (CList.value l)
+    Assert.Equal(6, AVal.getValue f)
+
+    CList.append 4 l // fold recomputes on removals; appends add
+    Assert.Equal(10, AVal.getValue f)
+
+    CList.removeAt 0 l // fold cannot invert: full recompute
+    Assert.Equal(9, AVal.getValue f)
+
+    let l2 = CList.ofSeq [ 1; 2; 3 ]
+    let g = AList.foldGroup (fun s v -> s + v) (fun s v -> s - v) 0 (CList.value l2)
+    Assert.Equal(6, AVal.getValue g)
+
+    CList.removeAt 1 l2 // invertible: subtract without recompute
+    Assert.Equal(4, AVal.getValue g)
+
+    let l3 = CList.ofSeq [ 1; 2; 3 ]
+
+    let h =
+        AList.foldHalfGroup (fun s v -> s + v) (fun s v -> ValueSome(s - v)) 0 (CList.value l3)
+
+    Assert.Equal(6, AVal.getValue h)
+
+    CList.removeAt 0 l3
+    Assert.Equal(5, AVal.getValue h)
+
+    let l4 = CList.ofSeq [ 1; 2; 3 ]
+
+    let nonInv =
+        AList.foldHalfGroup (fun s v -> s + v) (fun _ _ -> ValueNone) 0 (CList.value l4)
+
+    Assert.Equal(6, AVal.getValue nonInv)
+
+    CList.removeAt 0 l4 // cannot invert: recompute
+    Assert.Equal(5, AVal.getValue nonInv)
+
+[<Fact>]
+let ``AList exists forall and countBy`` () =
+    let l = CList.ofSeq [ 1; 2; 3 ]
+
+    let hasEven = AList.exists (fun v -> v % 2 = 0) (CList.value l)
+    let allPos = AList.forall (fun v -> v > 0) (CList.value l)
+    let evens = AList.countBy (fun v -> v % 2 = 0) (CList.value l)
+
+    Assert.Equal(true, AVal.getValue hasEven)
+    Assert.Equal(true, AVal.getValue allPos)
+    Assert.Equal(1, AVal.getValue evens)
+
+    CList.append 4 l
+    Assert.Equal(2, AVal.getValue evens)
+
+    CList.removeAt 0 l // [ 2; 3; 4 ]: still has evens
+    Assert.Equal(true, AVal.getValue hasEven)
+
+    CList.updateAt 0 7 l // [ 7; 3; 4 ]
+    Assert.Equal(true, AVal.getValue hasEven)
+
+    CList.updateAt 2 5 l // [ 7; 3; 5 ]: no evens left
+    Assert.Equal(false, AVal.getValue hasEven)
+    Assert.Equal(0, AVal.getValue evens)
+
+[<Fact>]
+let ``AList tryMin tryMax sum average`` () =
+    let l = CList.ofSeq [ 3; 1; 2 ]
+
+    Assert.Equal(ValueSome 1, AVal.getValue (AList.tryMin (CList.value l)))
+    Assert.Equal(ValueSome 3, AVal.getValue (AList.tryMax (CList.value l)))
+    Assert.Equal(6, AVal.getValue (AList.sum (CList.value l)))
+
+    let lf = CList.ofSeq [ 1.0; 2.0; 3.0 ]
+    Assert.Equal(2.0, AVal.getValue (AList.average (CList.value lf)))
+    Assert.Equal(4.0, AVal.getValue (AList.averageBy (fun v -> v * 2.0) (CList.value lf)))
+
+    CList.removeAt 1 l // [ 3; 2 ]
+    Assert.Equal(ValueSome 2, AVal.getValue (AList.tryMin (CList.value l)))
+    Assert.Equal(ValueSome 3, AVal.getValue (AList.tryMax (CList.value l)))
+    Assert.Equal(5, AVal.getValue (AList.sum (CList.value l)))
+
+    CList.removeAt 0 lf // [ 2.0; 3.0 ]
+    Assert.Equal(2.5, AVal.getValue (AList.average (CList.value lf)))
+
+    CList.removeAt 0 l
+    CList.removeAt 0 l // empty
+    Assert.Equal(ValueNone, AVal.getValue (AList.tryMin (CList.value l)))
+    Assert.Equal(ValueNone, AVal.getValue (AList.tryMax (CList.value l)))
+    Assert.Equal(0, AVal.getValue (AList.sum (CList.value l)))
+
+// =============================================================================
+// Bring list — Changeables group (gap sheet §6): cset UpdateTo/Perform/
+// UnionWith/ExceptWith/IntersectWith; cmap ContainsKey/TryGetValue/Item/
+// UpdateTo/Perform/Clear; clist UpdateTo/Perform/AddRange.
+// =============================================================================
+
+[<Fact>]
+let ``CSet updateTo and perform`` () =
+    let s = CSet.ofSeq [ 1; 2; 3 ]
+
+    Assert.Equal(true, CSet.updateTo (seq [ 2; 3; 4 ]) s)
+    Assert.Equal<Set<int>>(Set.ofList [ 2; 3; 4 ], CSet.toSet s)
+
+    Assert.Equal(false, CSet.updateTo (seq [ 2; 3; 4 ]) s) // equal: no-op
+    Assert.Equal<Set<int>>(Set.ofList [ 2; 3; 4 ], CSet.toSet s)
+
+    let delta = SetDeltaBuilder<int>()
+    delta.Add 5
+    delta.Remove 2
+    CSet.perform delta s
+    Assert.Equal<Set<int>>(Set.ofList [ 3; 4; 5 ], CSet.toSet s)
+
+[<Fact>]
+let ``CSet unionWith exceptWith intersectWith are atomic batches`` () =
+    let s = CSet.ofSeq [ 1; 2; 3 ]
+    let mutable deliveries = 0
+
+    use _obs = ASet.observe (fun _ _ -> deliveries <- deliveries + 1) (CSet.value s)
+
+    CSet.unionWith (seq [ 3; 4 ]) s
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2; 3; 4 ], CSet.toSet s)
+    Assert.Equal(1, deliveries) // one batch, one delivery
+
+    CSet.exceptWith (seq [ 1; 5 ]) s
+    Assert.Equal<Set<int>>(Set.ofList [ 2; 3; 4 ], CSet.toSet s)
+
+    CSet.intersectWith (seq [ 2; 9; 4 ]) s
+    Assert.Equal<Set<int>>(Set.ofList [ 2; 4 ], CSet.toSet s)
+
+[<Fact>]
+let ``CMap containsKey tryGetValue item`` () =
+    let m = CMap.ofSeq [ 1, "a"; 2, "b" ]
+
+    Assert.Equal(true, CMap.containsKey 1 m)
+    Assert.Equal(false, CMap.containsKey 3 m)
+    Assert.Equal(ValueSome "a", CMap.tryGetValue 1 m)
+    Assert.Equal(ValueNone, CMap.tryGetValue 3 m)
+    Assert.Equal("b", CMap.item 2 m)
+
+    CMap.remove 1 m
+    Assert.Equal(false, CMap.containsKey 1 m)
+    Assert.Equal(ValueNone, CMap.tryGetValue 1 m)
+
+[<Fact>]
+let ``CMap updateTo perform and clear`` () =
+    let m = CMap.ofSeq [ 1, "a"; 2, "b" ]
+
+    Assert.Equal(true, CMap.updateTo (seq [ 2, "B"; 3, "c" ]) m)
+    Assert.Equal<Map<int, string>>(Map.ofList [ 2, "B"; 3, "c" ], CMap.toMap m)
+
+    Assert.Equal(false, CMap.updateTo (seq [ 2, "B"; 3, "c" ]) m) // equal: no-op
+
+    let delta = MapDeltaBuilder<int, string>()
+    delta.Set(4, "d")
+    delta.Set(2, "b2")
+    delta.Remove 3
+    CMap.perform delta m
+    Assert.Equal<Map<int, string>>(Map.ofList [ 2, "b2"; 4, "d" ], CMap.toMap m)
+
+    CMap.clear m
+    Assert.Equal<Map<int, string>>(Map.empty, CMap.toMap m)
+
+[<Fact>]
+let ``CList updateTo perform and addRange`` () =
+    let l = CList.ofSeq [ 1; 2; 3 ]
+
+    Assert.Equal(true, CList.updateTo [| 2; 3; 4 |] l)
+    Assert.Equal<int[]>([| 2; 3; 4 |], CList.force l)
+
+    Assert.Equal(false, CList.updateTo [| 2; 3; 4 |] l) // equal: no-op
+
+    let delta = ListDeltaBuilder<int>()
+    delta.Remove 0
+    delta.Insert(1, 9)
+    delta.Update(2, 8)
+    CList.perform delta l // [ 3; 9; 8 ]
+    Assert.Equal<int[]>([| 3; 9; 8 |], CList.force l)
+
+    CList.addRange (seq [ 5; 6 ]) l
+    Assert.Equal<int[]>([| 3; 9; 8; 5; 6 |], CList.force l)
+
+// =============================================================================
+// Bring list — §10 conversions + slicing + ASet.sort; §11 AdaptiveReduction
+// par/structpar/mapIn/count.
+// =============================================================================
+
+[<Fact>]
+let ``AList toASet dedups and toIndexedASet pairs positions`` () =
+    let l = CList.ofSeq [ 1; 2; 2; 3 ]
+
+    let s = AList.toASet (CList.value l)
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2; 3 ], ASet.toSet s)
+
+    CList.append 2 l
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2; 3 ], ASet.toSet s) // still one 2
+
+    CList.removeAt 0 l // [ 2; 2; 3 ]: one 2 remains
+    Assert.Equal<Set<int>>(Set.ofList [ 2; 3 ], ASet.toSet s)
+
+    CList.removeAt 0 l // [ 2; 3 ]
+    Assert.Equal<Set<int>>(Set.ofList [ 2; 3 ], ASet.toSet s)
+
+    CList.removeAt 0 l // [ 3; 2 ]
+    Assert.Equal<Set<int>>(Set.ofList [ 2; 3 ], ASet.toSet s)
+
+    CList.removeAt 0 l // [ 2 ]
+    Assert.Equal<Set<int>>(Set.ofList [ 2 ], ASet.toSet s)
+
+    CList.removeAt 0 l // []
+    Assert.Equal<Set<int>>(Set.empty, ASet.toSet s)
+
+    let l2 = CList.ofSeq [ 10; 20 ]
+    let indexed = AList.toIndexedASet (CList.value l2)
+    Assert.Equal<Set<struct (int * int)>>(Set.ofList [ struct (0, 10); struct (1, 20) ], ASet.toSet indexed)
+
+[<Fact>]
+let ``AList ofASet follows the set`` () =
+    let s = CSet.ofSeq [ 3; 1; 2 ]
+    let l = AList.ofASet (CSet.value s)
+
+    Assert.Equal<Set<int>>(Set.ofList [ 1; 2; 3 ], ASet.toSet (AList.toASet l))
+    Assert.Equal(3, (AList.force l).Length)
+
+    CSet.add 9 s
+    CSet.remove 1 s
+    Assert.Equal<Set<int>>(Set.ofList [ 2; 3; 9 ], ASet.toSet (AList.toASet l))
+
+[<Fact>]
+let ``AMap toAList and ofAList`` () =
+    let m = CMap.ofSeq [ 1, "a"; 2, "b" ]
+    let l = AMap.toAList (CMap.value m)
+
+    Assert.Equal<Set<int * string>>(Set.ofList [ 1, "a"; 2, "b" ], AList.toArray l |> Set.ofArray)
+
+    CMap.addOrUpdate 3 "c" m
+    Assert.Equal<Set<int * string>>(Set.ofList [ 1, "a"; 2, "b"; 3, "c" ], AList.toArray l |> Set.ofArray)
+
+    let src = CList.ofSeq [ 1, "x"; 2, "y"; 1, "z" ] // duplicate key: last wins
+    let m2 = AMap.ofAList (CList.value src)
+    Assert.Equal<Map<int, string>>(Map.ofList [ 1, "z"; 2, "y" ], AMap.toMap m2)
+
+    CList.append (3, "w") src
+    Assert.Equal<Map<int, string>>(Map.ofList [ 1, "z"; 2, "y"; 3, "w" ], AMap.toMap m2)
+
+[<Fact>]
+let ``ASet sort family returns sorted lists`` () =
+    let s = CSet.ofSeq [ 3; 1; 2; 1 ] // the set dedups to { 1; 2; 3 }
+
+    Assert.Equal<int[]>([| 1; 2; 3 |], AList.toArray (ASet.sort (CSet.value s)))
+    Assert.Equal<int[]>([| 3; 2; 1 |], AList.toArray (ASet.sortDescending (CSet.value s)))
+    Assert.Equal<int[]>([| 1; 2; 3 |], AList.toArray (ASet.sortBy (fun v -> v) (CSet.value s)))
+    Assert.Equal<int[]>([| 3; 2; 1 |], AList.toArray (ASet.sortByDescending (fun v -> v) (CSet.value s)))
+
+    CSet.add 0 s
+    Assert.Equal<int[]>([| 0; 1; 2; 3 |], AList.toArray (ASet.sort (CSet.value s)))
+
+[<Fact>]
+let ``AList slicing syntax`` () =
+    let items = CList.ofSeq [ 0; 1; 2; 3; 4 ]
+    let l = CList.value items
+
+    Assert.Equal<int[]>([| 1; 2; 3 |], AList.toArray l.[1..3])
+    Assert.Equal<int[]>([| 2; 3; 4 |], AList.toArray l.[2..])
+    Assert.Equal<int[]>([| 0; 1 |], AList.toArray l.[..1])
+
+[<Fact>]
+let ``AdaptiveReduction par structpar mapIn count`` () =
+    let l = CList.ofSeq [ 1; 2; 3 ]
+
+    // count and sum in parallel over the same elements
+    let par = AdaptiveReduction.par AdaptiveReduction.count (AdaptiveReduction.sum ())
+
+    let both = AList.reduceBy par (fun v -> v) (CList.value l)
+    let (c, s) = AVal.getValue both
+    Assert.Equal(3, c)
+    Assert.Equal(6, s)
+
+    CList.append 4 l
+    let (c2, s2) = AVal.getValue both
+    Assert.Equal(4, c2)
+    Assert.Equal(10, s2)
+
+    let spar =
+        AdaptiveReduction.structpar AdaptiveReduction.count (AdaptiveReduction.sum ())
+
+    let sboth = AList.reduceBy spar (fun v -> v) (CList.value l)
+    let struct (c3, s3) = AVal.getValue sboth
+    Assert.Equal(4, c3)
+    Assert.Equal(10, s3)
+
+    // mapIn: map the element side before reducing
+    let sumOfSquares =
+        AdaptiveReduction.sum () |> AdaptiveReduction.mapIn (fun v -> v * v)
+
+    let sq = AList.reduceBy sumOfSquares (fun v -> v) (CList.value l)
+    Assert.Equal(30, AVal.getValue sq) // 1 + 4 + 9 + 16
+
+    let c = AList.reduceBy AdaptiveReduction.count (fun v -> v) (CList.value l)
+    Assert.Equal(4, AVal.getValue c)

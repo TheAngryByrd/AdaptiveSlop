@@ -19,6 +19,10 @@
     <Compile Include="Collections/ObserveNodes.fs" />
     <Compile Include="Collections/ListNodes.fs" />
     <Compile Include="Collections/Reductions.fs" />
+    <Compile Include="Collections/ElementSetNode.fs" />
+    <Compile Include="Collections/ElementMapNode.fs" />
+    <Compile Include="Collections/ElementListNode.fs" />
+<Compile Include="Collections/ExternalNodes.fs" />
     <Compile Include="Collections/Api.fs" />
   </ItemGroup>
 
