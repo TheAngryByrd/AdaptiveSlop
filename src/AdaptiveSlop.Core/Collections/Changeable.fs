@@ -339,8 +339,10 @@ type ChangeableSet<'T>(initial: seq<'T>) =
             // Replay the pending ops in arrival order through the net-delta
             // scratch state (the same replay the transaction commit runs). A
             // full replace supersedes the earlier ops of the batch, matching
-            // the transaction semantics of Set. Ops arriving during the
-            // replay stay in the ring and apply at the next drain.
+            // the transaction semantics of Set. Ops arriving while the drain
+            // loop runs join the same batch; an op that lands after the loop
+            // emptied the ring re-enqueues the node and applies at the next
+            // drain.
             scratchAdds.Clear()
             scratchRems.Clear()
             let mutable hasReplace = false
@@ -701,8 +703,10 @@ type ChangeableMap<'K, 'V when 'K: equality>(initial: seq<'K * 'V>) =
             // Replay the pending ops in arrival order through the net-delta
             // scratch state (the same replay the transaction commit runs). A
             // full replace supersedes the earlier ops of the batch, matching
-            // the transaction semantics of Set. Ops arriving during the
-            // replay stay in the ring and apply at the next drain.
+            // the transaction semantics of Set. Ops arriving while the drain
+            // loop runs join the same batch; an op that lands after the loop
+            // emptied the ring re-enqueues the node and applies at the next
+            // drain.
             scratchSets.Clear()
             scratchRems.Clear()
             let mutable hasReplace = false

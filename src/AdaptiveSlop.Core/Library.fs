@@ -458,7 +458,7 @@ type internal GraphContext() =
         if operationDepth = 1 && not this.TxActive then
             try
                 this.DrainIfPending()
-            with ex ->
+            with _ ->
                 // The drain failed (a posted op threw, for example an invalid
                 // posted list position). Unwind this claim before propagating
                 // so the caller's ReleaseOwner in its finally cannot underflow

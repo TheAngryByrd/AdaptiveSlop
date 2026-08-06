@@ -5972,6 +5972,23 @@ let ``posted list positions are validated at apply time`` () =
 
     Assert.Equal<int[]>([| 1 |], AList.force items)
 
+    // Strictness matches the transaction path: an invalid positional op
+    // aborts the batch even when a later replace would supersede it (the
+    // transaction validates positional ops at write time and throws there).
+    let items3 = CList.empty<int>
+    let doneSignal3 = new ManualResetEventSlim(false)
+
+    let worker3 =
+        Task.Run(fun () ->
+            CList.postRemoveAt 0 items3
+            CList.postSet [ 1; 2; 3 ] items3
+            doneSignal3.Set())
+
+    doneSignal3.Wait()
+    worker3.Wait()
+    Assert.Throws<ArgumentOutOfRangeException>(fun () -> Posting.pump ()) |> ignore
+    Assert.Equal<int[]>(Array.empty, AList.force items3)
+
 [<Fact>]
 let ``posts inside a transaction apply after commit`` () =
     let items = CSet.empty<int>
