@@ -4,6 +4,17 @@
 [<global.Xunit.Collection("AdaptiveSlop")>]
 module AdaptiveSlop.Properties
 
+// Test taxonomy:
+// - "law:*" — one-shot algebraic law. FsCheck generates the input, the chain
+//   is built once, forced, compared to a pure List/Set/Map function. Tests
+//   the load path.
+// - "matches the reference model" — the test owns a Dictionary/HashSet/
+//   ResizeArray model, derives expected from it, compares after every op.
+//   Tests the incremental path against an independent oracle.
+// - "incremental law:*" — same shape as "matches the model" but for the
+//   simple combinators (map, sort, rev, ...). The oracle is the test's own
+//   model, not the library's read.
+
 #nowarn "893"
 
 open System
@@ -43,39 +54,9 @@ let ``part 1: cross-map lookup follows the entity-first sequence`` () =
 
 // =============================================================================
 // FsCheck property tests (FsCheck 3.x API, the built-in runner per the docs:
-// Check.QuickThrowOnFailure inside plain xUnit facts).
-//
-// The reference-impl model tests (MAPA-DESIGN §12) live here; the smoke
-// tests below prove the FsCheck machinery runs before the models build on
-// it.
+// Check.QuickThrowOnFailure inside plain xUnit facts). The reference-impl
+// model tests (MAPA-DESIGN §12) live here.
 // =============================================================================
-
-[<Fact>]
-let ``FsCheck smoke: reverse is involutive`` () =
-    let revRevIsOrig (xs: int list) = List.rev (List.rev xs) = xs
-    Check.QuickThrowOnFailure revRevIsOrig
-
-[<Fact>]
-let ``FsCheck smoke: ASet roundtrip`` () =
-    let roundtrip (xs: int list) =
-        let s = CSet.ofSeq xs
-        let actual = s |> CSet.value |> ASet.toSet
-        actual = Set.ofList xs
-
-    Check.QuickThrowOnFailure roundtrip
-
-[<Fact>]
-let ``FsCheck smoke: AList append builds the sequence`` () =
-    let builds (xs: int list) =
-        let l = CList.empty<int>
-
-        for x in xs do
-            CList.append x l
-
-        let actual = l |> CList.value |> AList.toList
-        actual = xs
-
-    Check.QuickThrowOnFailure builds
 
 // =============================================================================
 // Algebraic laws over generated data. These are the real property tests: the
@@ -484,18 +465,15 @@ let ``incremental law: AList.sort stays sorted`` () =
         let l = CList.empty<int>
         let model = ResizeArray<int>()
         let sorted = AList.sort (CList.value l)
-        let mutable ok = true
 
         for op in ops do
             applyListMutation op l model
 
             let actual = AList.toList sorted
-            let expected = l |> CList.value |> AList.toList |> List.sort
+            let expected = model |> Seq.sort |> List.ofSeq
 
             if actual <> expected then
-                ok <- false
-
-        ok
+                failwithf "mismatch after op %A: actual=%A expected=%A" op actual expected
 
     Check.QuickThrowOnFailure prop
 
@@ -505,18 +483,15 @@ let ``incremental law: AList.rev stays reversed`` () =
         let l = CList.empty<int>
         let model = ResizeArray<int>()
         let reversed = AList.rev (CList.value l)
-        let mutable ok = true
 
         for op in ops do
             applyListMutation op l model
 
             let actual = AList.toList reversed
-            let expected = l |> CList.value |> AList.toList |> List.rev
+            let expected = model |> Seq.rev |> List.ofSeq
 
             if actual <> expected then
-                ok <- false
-
-        ok
+                failwithf "mismatch after op %A: actual=%A expected=%A" op actual expected
 
     Check.QuickThrowOnFailure prop
 
@@ -526,18 +501,15 @@ let ``incremental law: AList.map stays mapped`` () =
         let l = CList.empty<int>
         let model = ResizeArray<int>()
         let mapped = AList.map ((+) 1) (CList.value l)
-        let mutable ok = true
 
         for op in ops do
             applyListMutation op l model
 
             let actual = AList.toList mapped
-            let expected = l |> CList.value |> AList.toList |> List.map ((+) 1)
+            let expected = model |> Seq.map ((+) 1) |> List.ofSeq
 
             if actual <> expected then
-                ok <- false
-
-        ok
+                failwithf "mismatch after op %A: actual=%A expected=%A" op actual expected
 
     Check.QuickThrowOnFailure prop
 
@@ -548,18 +520,15 @@ let ``incremental law: AList.take stays truncated`` () =
         let model = ResizeArray<int>()
         let count = List.length ops % 5
         let taken = AList.take count (CList.value l)
-        let mutable ok = true
 
         for op in ops do
             applyListMutation op l model
 
             let actual = AList.toList taken
-            let expected = l |> CList.value |> AList.toList |> List.truncate count
+            let expected = model |> Seq.truncate count |> List.ofSeq
 
             if actual <> expected then
-                ok <- false
-
-        ok
+                failwithf "mismatch after op %A: actual=%A expected=%A" op actual expected
 
     Check.QuickThrowOnFailure prop
 
@@ -570,23 +539,20 @@ let ``incremental law: AList.skip stays skipped`` () =
         let model = ResizeArray<int>()
         let count = List.length ops % 5
         let skipped = AList.skip count (CList.value l)
-        let mutable ok = true
 
         for op in ops do
             applyListMutation op l model
 
-            let source = l |> CList.value |> AList.toList
+            let actual = AList.toList skipped
 
             let expected =
-                if count >= List.length source then
+                if count >= model.Count then
                     []
                 else
-                    source |> List.skip count
+                    model |> Seq.skip count |> List.ofSeq
 
-            if AList.toList skipped <> expected then
-                ok <- false
-
-        ok
+            if actual <> expected then
+                failwithf "mismatch after op %A: actual=%A expected=%A" op actual expected
 
     Check.QuickThrowOnFailure prop
 
@@ -598,22 +564,19 @@ let ``incremental law: AList.sub stays sliced`` () =
         let offset = List.length ops % 3
         let count = List.length ops % 5
         let sliced = AList.sub offset count (CList.value l)
-        let mutable ok = true
 
         for op in ops do
             applyListMutation op l model
 
-            let source = l |> CList.value |> AList.toList
+            let actual = AList.toList sliced
 
             let expected =
-                let from = min offset (List.length source)
-                let take = max 0 (min count (List.length source - from))
-                source |> List.skip from |> List.truncate take
+                let from = min offset model.Count
+                let take = max 0 (min count (model.Count - from))
+                model |> Seq.skip from |> Seq.truncate take |> List.ofSeq
 
-            if AList.toList sliced <> expected then
-                ok <- false
-
-        ok
+            if actual <> expected then
+                failwithf "mismatch after op %A: actual=%A expected=%A" op actual expected
 
     Check.QuickThrowOnFailure prop
 
@@ -623,19 +586,17 @@ let ``incremental law: AList.pairwise stays paired`` () =
         let l = CList.empty<int>
         let model = ResizeArray<int>()
         let pairs = AList.pairwise (CList.value l)
-        let mutable ok = true
 
         for op in ops do
             applyListMutation op l model
 
-            let source = l |> CList.value |> AList.toList
+            let actual = AList.toList pairs
 
-            let expected = source |> List.pairwise |> List.map (fun (a, b) -> struct (a, b))
+            let expected =
+                model |> Seq.pairwise |> Seq.map (fun (a, b) -> struct (a, b)) |> List.ofSeq
 
-            if AList.toList pairs <> expected then
-                ok <- false
-
-        ok
+            if actual <> expected then
+                failwithf "mismatch after op %A: actual=%A expected=%A" op actual expected
 
     Check.QuickThrowOnFailure prop
 
@@ -646,7 +607,6 @@ let ``incremental law: AList.indexed stays indexed`` () =
         // Mirror: element -> the index its mapping ran at (positions stick).
         let model = ResizeArray<struct (int * int)>()
         let indexed = AList.indexed (CList.value l)
-        let mutable ok = true
 
         for op in ops do
             let kind = op % 3
@@ -673,12 +633,11 @@ let ``incremental law: AList.indexed stays indexed`` () =
                         CList.updateAt position element l
                         model[position] <- struct (element, position)
 
+            let actual = AList.toList indexed
             let expected = model |> Seq.map (fun struct (e, i) -> struct (i, e)) |> List.ofSeq
 
-            if AList.toList indexed <> expected then
-                ok <- false
-
-        ok
+            if actual <> expected then
+                failwithf "mismatch after op %A: actual=%A expected=%A" op actual expected
 
     Check.QuickThrowOnFailure prop
 
@@ -688,18 +647,15 @@ let ``incremental law: AList.mapA stays mapped`` () =
         let l = CList.empty<int>
         let model = ResizeArray<int>()
         let mapped = AList.mapA (fun x -> AVal.constant (x * 2)) (CList.value l)
-        let mutable ok = true
 
         for op in ops do
             applyListMutation op l model
 
             let actual = AList.toList mapped
-            let expected = l |> CList.value |> AList.toList |> List.map ((*) 2)
+            let expected = model |> Seq.map ((*) 2) |> List.ofSeq
 
             if actual <> expected then
-                ok <- false
-
-        ok
+                failwithf "mismatch after op %A: actual=%A expected=%A" op actual expected
 
     Check.QuickThrowOnFailure prop
 
@@ -713,18 +669,15 @@ let ``incremental law: AList.choose stays chosen`` () =
             if x % 2 = 0 then Some(x * 10) else None
 
         let chosen = AList.choose f (CList.value l)
-        let mutable ok = true
 
         for op in ops do
             applyListMutation op l model
 
             let actual = AList.toList chosen
-            let expected = l |> CList.value |> AList.toList |> List.choose f
+            let expected = model |> Seq.choose f |> List.ofSeq
 
             if actual <> expected then
-                ok <- false
-
-        ok
+                failwithf "mismatch after op %A: actual=%A expected=%A" op actual expected
 
     Check.QuickThrowOnFailure prop
 
@@ -736,31 +689,25 @@ let ``incremental law: AList reductions stay correct`` () =
         let total = AList.sum (CList.value l)
         let evenCount = AList.countBy (fun x -> x % 2 = 0) (CList.value l)
         let acc = AList.fold (fun s x -> s * 10 + x) 0 (CList.value l)
-        let mutable ok = true
 
         for op in ops do
             applyListMutation op l model
 
-            let source = l |> CList.value |> AList.toList
-
             let actualTotal = AVal.getValue total
-            let expectedTotal = List.sum source
+            let expectedTotal = Seq.sum model
 
             let actualEvenCount = AVal.getValue evenCount
-
-            let expectedEvenCount = source |> List.filter (fun x -> x % 2 = 0) |> List.length
+            let expectedEvenCount = model |> Seq.filter (fun x -> x % 2 = 0) |> Seq.length
 
             let actualAcc = AVal.getValue acc
-            let expectedAcc = source |> List.fold (fun s x -> s * 10 + x) 0
+            let expectedAcc = model |> Seq.fold (fun s x -> s * 10 + x) 0
 
             if
                 actualTotal <> expectedTotal
                 || actualEvenCount <> expectedEvenCount
                 || actualAcc <> expectedAcc
             then
-                ok <- false
-
-        ok
+                failwithf "mismatch after op %A: total=%A evenCount=%A acc=%A" op actualTotal actualEvenCount actualAcc
 
     Check.QuickThrowOnFailure prop
 
@@ -770,7 +717,6 @@ let ``incremental law: ASet.map and filter stay correct`` () =
         let s = CSet.empty<int>
         let mapped = ASet.map ((+) 1) (CSet.value s)
         let filtered = ASet.filter (fun x -> x % 2 = 0) (CSet.value s)
-        let mutable ok = true
 
         for op in ops do
             applySetMutation op s
@@ -784,9 +730,7 @@ let ``incremental law: ASet.map and filter stay correct`` () =
             let expectedFiltered = Set.filter (fun x -> x % 2 = 0) source
 
             if actualMapped <> expectedMapped || actualFiltered <> expectedFiltered then
-                ok <- false
-
-        ok
+                failwithf "mismatch after op %A: mapped=%A filtered=%A" op actualMapped actualFiltered
 
     Check.QuickThrowOnFailure prop
 
@@ -797,7 +741,6 @@ let ``incremental law: ASet union and intersect stay correct`` () =
         let b = CSet.empty<int>
         let union = ASet.union (CSet.value a) (CSet.value b)
         let intersect = ASet.intersect (CSet.value a) (CSet.value b)
-        let mutable ok = true
 
         for op in ops do
             let kind = op % 3
@@ -821,9 +764,7 @@ let ``incremental law: ASet union and intersect stay correct`` () =
             let expectedIntersect = Set.intersect sourceA sourceB
 
             if actualUnion <> expectedUnion || actualIntersect <> expectedIntersect then
-                ok <- false
-
-        ok
+                failwithf "mismatch after op %A: union=%A intersect=%A" op actualUnion actualIntersect
 
     Check.QuickThrowOnFailure prop
 
@@ -833,7 +774,6 @@ let ``incremental law: ASet mapA and count stay correct`` () =
         let s = CSet.empty<int>
         let mapped = ASet.mapA (fun x -> AVal.constant (x * 2)) (CSet.value s)
         let count = ASet.count (CSet.value s)
-        let mutable ok = true
 
         for op in ops do
             applySetMutation op s
@@ -847,9 +787,7 @@ let ``incremental law: ASet mapA and count stay correct`` () =
             let expectedCount = Set.count source
 
             if actualMapped <> expectedMapped || actualCount <> expectedCount then
-                ok <- false
-
-        ok
+                failwithf "mismatch after op %A: mapped=%A count=%A" op actualMapped actualCount
 
     Check.QuickThrowOnFailure prop
 
@@ -858,7 +796,6 @@ let ``incremental law: ASet sum stays correct`` () =
     let prop (ops: int list) =
         let s = CSet.empty<int>
         let total = ASet.sum (CSet.value s)
-        let mutable ok = true
 
         for op in ops do
             applySetMutation op s
@@ -866,9 +803,7 @@ let ``incremental law: ASet sum stays correct`` () =
             let source = Set.ofSeq (ASet.toSet (CSet.value s))
 
             if AVal.getValue total <> Seq.sum source then
-                ok <- false
-
-        ok
+                failwithf "mismatch after op %A: total=%A" op (AVal.getValue total)
 
     Check.QuickThrowOnFailure prop
 
@@ -878,7 +813,6 @@ let ``incremental law: AMap mapV and filter stay correct`` () =
         let m = CMap.empty<int, int>
         let mapped = AMap.mapV ((+) 1) (CMap.value m)
         let filtered = AMap.filter (fun _ v -> v % 2 = 0) (CMap.value m)
-        let mutable ok = true
 
         for op in ops do
             applyMapMutation op m
@@ -892,9 +826,7 @@ let ``incremental law: AMap mapV and filter stay correct`` () =
             let expectedFiltered = Map.filter (fun _ v -> v % 2 = 0) source
 
             if actualMapped <> expectedMapped || actualFiltered <> expectedFiltered then
-                ok <- false
-
-        ok
+                failwithf "mismatch after op %A: mapped=%A filtered=%A" op actualMapped actualFiltered
 
     Check.QuickThrowOnFailure prop
 
@@ -903,17 +835,17 @@ let ``incremental law: AMap keys stay correct`` () =
     let prop (ops: int list) =
         let m = CMap.empty<int, int>
         let keys = AMap.keys (CMap.value m)
-        let mutable ok = true
 
         for op in ops do
             applyMapMutation op m
 
             let source = AMap.toMap (CMap.value m)
 
-            if ASet.toSet keys <> Set.ofSeq (Map.keys source) then
-                ok <- false
+            let actual = ASet.toSet keys
+            let expected = Set.ofSeq (Map.keys source)
 
-        ok
+            if actual <> expected then
+                failwithf "mismatch after op %A: keys=%A" op actual
 
     Check.QuickThrowOnFailure prop
 
@@ -922,17 +854,17 @@ let ``incremental law: AMap fold stays correct`` () =
     let prop (ops: int list) =
         let m = CMap.empty<int, int>
         let total = AMap.fold (fun acc _ v -> acc + v) 0 (CMap.value m)
-        let mutable ok = true
 
         for op in ops do
             applyMapMutation op m
 
             let source = AMap.toMap (CMap.value m)
 
-            if AVal.getValue total <> (source |> Map.toSeq |> Seq.sumBy snd) then
-                ok <- false
+            let actual = AVal.getValue total
+            let expected = source |> Map.toSeq |> Seq.sumBy snd
 
-        ok
+            if actual <> expected then
+                failwithf "mismatch after op %A: total=%A" op actual
 
     Check.QuickThrowOnFailure prop
 
@@ -968,7 +900,6 @@ let ``scalar map tracks its input`` () =
         let inputs = [| CVal.create 0; CVal.create 0; CVal.create 0; CVal.create 0 |]
         let derived = AVal.map (fun x -> x * 2 + 1) (CVal.value inputs[0])
         let model = [| 0; 0; 0; 0 |]
-        let mutable ok = true
 
         for op in ops do
             match op with
@@ -976,10 +907,11 @@ let ``scalar map tracks its input`` () =
                 CVal.set v inputs[i]
                 model[i] <- v
 
-            if AVal.getValue derived <> model[0] * 2 + 1 then
-                ok <- false
+            let actual = AVal.getValue derived
+            let expected = model[0] * 2 + 1
 
-        ok
+            if actual <> expected then
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
 
     Check.One(scalarConfig, prop)
 
@@ -992,7 +924,6 @@ let ``scalar map2 tracks its inputs`` () =
             AVal.map2 (fun x y -> x * 10 + y) (CVal.value inputs[0]) (CVal.value inputs[1])
 
         let model = [| 0; 0; 0; 0 |]
-        let mutable ok = true
 
         for op in ops do
             match op with
@@ -1000,10 +931,11 @@ let ``scalar map2 tracks its inputs`` () =
                 CVal.set v inputs[i]
                 model[i] <- v
 
-            if AVal.getValue derived <> model[0] * 10 + model[1] then
-                ok <- false
+            let actual = AVal.getValue derived
+            let expected = model[0] * 10 + model[1]
 
-        ok
+            if actual <> expected then
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
 
     Check.One(scalarConfig, prop)
 
@@ -1020,7 +952,6 @@ let ``scalar map3 tracks its inputs`` () =
                 (CVal.value inputs[2])
 
         let model = [| 0; 0; 0; 0 |]
-        let mutable ok = true
 
         for op in ops do
             match op with
@@ -1028,10 +959,11 @@ let ``scalar map3 tracks its inputs`` () =
                 CVal.set v inputs[i]
                 model[i] <- v
 
-            if AVal.getValue derived <> model[0] * 100 + model[1] * 10 + model[2] then
-                ok <- false
+            let actual = AVal.getValue derived
+            let expected = model[0] * 100 + model[1] * 10 + model[2]
 
-        ok
+            if actual <> expected then
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
 
     Check.One(scalarConfig, prop)
 
@@ -1049,7 +981,6 @@ let ``scalar map4 tracks its inputs`` () =
                 (CVal.value inputs[3])
 
         let model = [| 0; 0; 0; 0 |]
-        let mutable ok = true
 
         for op in ops do
             match op with
@@ -1057,13 +988,11 @@ let ``scalar map4 tracks its inputs`` () =
                 CVal.set v inputs[i]
                 model[i] <- v
 
-            if
-                AVal.getValue derived
-                <> model[0] * 1000 + model[1] * 100 + model[2] * 10 + model[3]
-            then
-                ok <- false
+            let actual = AVal.getValue derived
+            let expected = model[0] * 1000 + model[1] * 100 + model[2] * 10 + model[3]
 
-        ok
+            if actual <> expected then
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
 
     Check.One(scalarConfig, prop)
 
@@ -1081,7 +1010,6 @@ let ``scalar mapN tracks its inputs`` () =
                    CVal.value inputs[3] |]
 
         let model = [| 0; 0; 0; 0 |]
-        let mutable ok = true
 
         for op in ops do
             match op with
@@ -1089,13 +1017,11 @@ let ``scalar mapN tracks its inputs`` () =
                 CVal.set v inputs[i]
                 model[i] <- v
 
-            if
-                AVal.getValue derived
-                <> model[0] * 1000 + model[1] * 100 + model[2] * 10 + model[3]
-            then
-                ok <- false
+            let actual = AVal.getValue derived
+            let expected = model[0] * 1000 + model[1] * 100 + model[2] * 10 + model[3]
 
-        ok
+            if actual <> expected then
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
 
     Check.One(scalarConfig, prop)
 
@@ -1109,7 +1035,6 @@ let ``scalar bind tracks its input and its inner`` () =
             AVal.bind (fun x -> AVal.map (fun y -> x * 10 + y) (CVal.value inputs[1])) (CVal.value inputs[0])
 
         let model = [| 0; 0; 0; 0 |]
-        let mutable ok = true
 
         for op in ops do
             match op with
@@ -1117,10 +1042,11 @@ let ``scalar bind tracks its input and its inner`` () =
                 CVal.set v inputs[i]
                 model[i] <- v
 
-            if AVal.getValue derived <> model[0] * 10 + model[1] then
-                ok <- false
+            let actual = AVal.getValue derived
+            let expected = model[0] * 10 + model[1]
 
-        ok
+            if actual <> expected then
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
 
     Check.One(scalarConfig, prop)
 
@@ -1137,7 +1063,6 @@ let ``scalar bind2 tracks its inputs and its inner`` () =
                 (CVal.value inputs[1])
 
         let model = [| 0; 0; 0; 0 |]
-        let mutable ok = true
 
         for op in ops do
             match op with
@@ -1145,10 +1070,11 @@ let ``scalar bind2 tracks its inputs and its inner`` () =
                 CVal.set v inputs[i]
                 model[i] <- v
 
-            if AVal.getValue derived <> model[0] * 100 + model[1] * 10 + model[2] then
-                ok <- false
+            let actual = AVal.getValue derived
+            let expected = model[0] * 100 + model[1] * 10 + model[2]
 
-        ok
+            if actual <> expected then
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
 
     Check.One(scalarConfig, prop)
 
@@ -1166,7 +1092,6 @@ let ``scalar bind3 tracks its inputs and its inner`` () =
                 (CVal.value inputs[2])
 
         let model = [| 0; 0; 0; 0 |]
-        let mutable ok = true
 
         for op in ops do
             match op with
@@ -1174,13 +1099,11 @@ let ``scalar bind3 tracks its inputs and its inner`` () =
                 CVal.set v inputs[i]
                 model[i] <- v
 
-            if
-                AVal.getValue derived
-                <> model[0] * 1000 + model[1] * 100 + model[2] * 10 + model[3]
-            then
-                ok <- false
+            let actual = AVal.getValue derived
+            let expected = model[0] * 1000 + model[1] * 100 + model[2] * 10 + model[3]
 
-        ok
+            if actual <> expected then
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
 
     Check.One(scalarConfig, prop)
 
@@ -1233,6 +1156,43 @@ type ListScenario =
     { initial: (int * int) list
       ops: ListChange list }
 
+/// A two-list scenario for bind/concat: each op targets one of the two
+/// lists, and Switch selects the bound list. Case names avoid ListChange's
+/// (F# resolves colliding union case names to the last-defined type).
+type TwoListOp =
+    | InsertInto of element: int * payload: int * listIndex: int
+    | RemoveFrom of payload: int * listIndex: int
+    | UpdateIn of element: int * payload: int * listIndex: int
+    | Switch of listIndex: int
+
+type TwoListScenario =
+    { initialA: (int * int) list
+      initialB: (int * int) list
+      ops: TwoListOp list }
+
+/// Applies one typed list change to a changeable list and its mirror. The
+/// position is derived from the mirror length, so it is always valid for the
+/// current state; SetValue has no list-content effect.
+let applyListChange (op: ListChange) (l: ChangeableList<int>) (model: ResizeArray<int>) =
+    match op with
+    | Insert(element, payload) ->
+        let position = payload % (model.Count + 1)
+        CList.insertAt position element l
+        model.Insert(position, element)
+    | RemoveAt payload ->
+        let position = payload % (model.Count + 1)
+
+        if model.Count > 0 && position < model.Count then
+            CList.removeAt position l
+            model.RemoveAt position
+    | UpdateAt(element, payload) ->
+        let position = payload % (model.Count + 1)
+
+        if model.Count > 0 && position < model.Count then
+            CList.updateAt position element l
+            model[position] <- element
+    | ListChange.SetValue _ -> ()
+
 type CrossScenario =
     { initialEntities: (int * int) list
       initialLookups: (int * int) list
@@ -1254,8 +1214,8 @@ let pairGen =
 
 /// Deduplicates the initial pairs with the last value winning (the set/map
 /// semantics), keeping the generated initial state valid for both sides.
-let dedupPairs (xs: (int * int) list) =
-    let d = Dictionary<int, int>()
+let dedupPairs (xs: ('k * 'v) list) =
+    let d = Dictionary<'k, 'v>()
 
     for (k, v) in xs do
         d[k] <- v
@@ -1392,6 +1352,46 @@ let listScenarioGen: Gen<ListScenario> =
         return { initial = initial; ops = ops }
     }
 
+let twoListOpGen: Gen<TwoListOp> =
+    Gen.frequency
+        [ (3,
+           gen {
+               let! e = Gen.choose (0, 9)
+               let! p = Gen.choose (0, 200)
+               let! w = Gen.choose (0, 1)
+               return InsertInto(e, p, w)
+           })
+          (2,
+           gen {
+               let! p = Gen.choose (0, 200)
+               let! w = Gen.choose (0, 1)
+               return TwoListOp.RemoveFrom(p, w)
+           })
+          (2,
+           gen {
+               let! e = Gen.choose (0, 9)
+               let! p = Gen.choose (0, 200)
+               let! w = Gen.choose (0, 1)
+               return TwoListOp.UpdateIn(e, p, w)
+           })
+          (1,
+           gen {
+               let! w = Gen.choose (0, 1)
+               return TwoListOp.Switch w
+           }) ]
+
+let twoListScenarioGen: Gen<TwoListScenario> =
+    gen {
+        let! initialA = Gen.listOf pairGen
+        let! initialB = Gen.listOf pairGen
+        let! ops = Gen.listOf twoListOpGen
+
+        return
+            { initialA = initialA
+              initialB = initialB
+              ops = ops }
+    }
+
 let crossScenarioGen: Gen<CrossScenario> =
     gen {
         let! initialEntities = Gen.listOf pairGen
@@ -1427,6 +1427,7 @@ type ScenarioArbs =
     static member SetScenario() : Arbitrary<SetScenario> = Arb.fromGen setScenarioGen
     static member MapScenario() : Arbitrary<MapScenario> = Arb.fromGen mapScenarioGen
     static member ListScenario() : Arbitrary<ListScenario> = Arb.fromGen listScenarioGen
+    static member TwoListScenario() : Arbitrary<TwoListScenario> = Arb.fromGen twoListScenarioGen
     static member CrossScenario() : Arbitrary<CrossScenario> = Arb.fromGen crossScenarioGen
     static member JoinScenario() : Arbitrary<JoinScenario> = Arb.fromGen joinScenarioGen
     static member ExternalScenario() : Arbitrary<ExternalScenario> = Arb.fromGen externalScenarioGen
@@ -1521,8 +1522,6 @@ let ``ASet mapA matches the reference model`` () =
                             valueRefs[value] <- 1
                             model.Add value |> ignore
 
-        let mutable ok = true
-
         for op in sc.ops do
             apply op
 
@@ -1530,9 +1529,7 @@ let ``ASet mapA matches the reference model`` () =
             let expected = Set.ofSeq model
 
             if actual <> expected then
-                ok <- false
-
-        ok
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
 
     Check.One(scenarioConfig, prop)
 
@@ -1596,8 +1593,6 @@ let ``AList mapA matches the reference model`` () =
                     CVal.set value (values[element])
                     elementValue[element] <- value
 
-        let mutable ok = true
-
         for op in sc.ops do
             apply op
 
@@ -1605,9 +1600,7 @@ let ``AList mapA matches the reference model`` () =
             let expected = elements |> Seq.map (fun e -> elementValue[e]) |> List.ofSeq
 
             if actual <> expected then
-                ok <- false
-
-        ok
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
 
     Check.One(scenarioConfig, prop)
 
@@ -1654,8 +1647,6 @@ let ``AMap mapA matches the reference model`` () =
                     CVal.set value (values[key])
                     model[key] <- value
 
-        let mutable ok = true
-
         for op in sc.ops do
             apply op
 
@@ -1663,9 +1654,7 @@ let ``AMap mapA matches the reference model`` () =
             let expected = Map.ofSeq (seq { for KeyValue(k, v) in model -> k, v })
 
             if actual <> expected then
-                ok <- false
-
-        ok
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
 
     Check.One(scenarioConfig, prop)
 
@@ -1714,8 +1703,6 @@ let ``ASet filterA matches the reference model`` () =
                     CVal.set flag (flags[element])
                     flagValue[element] <- flag
 
-        let mutable ok = true
-
         for op in sc.ops do
             apply op
 
@@ -1731,9 +1718,7 @@ let ``ASet filterA matches the reference model`` () =
                 )
 
             if actual <> expected then
-                ok <- false
-
-        ok
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
 
     Check.One(scenarioConfig, prop)
 
@@ -1777,8 +1762,6 @@ let ``ASet chooseA matches the reference model`` () =
                     CVal.set flag (flags[element])
                     flagValue[element] <- flag
 
-        let mutable ok = true
-
         for op in sc.ops do
             apply op
 
@@ -1794,9 +1777,7 @@ let ``ASet chooseA matches the reference model`` () =
                 )
 
             if actual <> expected then
-                ok <- false
-
-        ok
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
 
     Check.One(scenarioConfig, prop)
 
@@ -1841,13 +1822,9 @@ let ``ASet ofExternal matches the reference model`` () =
                 lastSeen <- HashSet<int>(expected)
                 true
 
-        let mutable ok = true
-
         for op in sc.ops do
             if not (apply op) then
-                ok <- false
-
-        ok
+                failwithf "mismatch after %A" op
 
     Check.One(scenarioConfig, prop)
 
@@ -1912,8 +1889,6 @@ let ``AMap join choose2V with mapA matches the model`` () =
                 modelB.Remove key |> ignore
             | RightEdit(MapOp.SetValue _) -> ()
 
-        let mutable ok = true
-
         for op in sc.ops do
             apply op
 
@@ -1930,9 +1905,7 @@ let ``AMap join choose2V with mapA matches the model`` () =
                 )
 
             if actual <> expected then
-                ok <- false
-
-        ok
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
 
     Check.One(scenarioConfig, prop)
 
@@ -1977,8 +1950,6 @@ let ``AMap mapA with cross-map lookup matches the model`` () =
                 CMap.remove key lookups
                 modelLookups.Remove key |> ignore
 
-        let mutable ok = true
-
         for op in sc.ops do
             apply op
 
@@ -1995,9 +1966,7 @@ let ``AMap mapA with cross-map lookup matches the model`` () =
                 )
 
             if actual <> expected then
-                ok <- false
-
-        ok
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
 
     Check.One(scenarioConfig, prop)
 
@@ -2039,8 +2008,6 @@ let ``ASet mapA with cross-map lookup matches the model`` () =
                 CMap.remove key lookups
                 modelLookups.Remove key |> ignore
 
-        let mutable ok = true
-
         for op in sc.ops do
             apply op
 
@@ -2057,9 +2024,7 @@ let ``ASet mapA with cross-map lookup matches the model`` () =
                 )
 
             if actual <> expected then
-                ok <- false
-
-        ok
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
 
     Check.One(scenarioConfig, prop)
 
@@ -2105,8 +2070,6 @@ let ``AList mapA with cross-map lookup matches the model`` () =
                 CMap.remove key lookups
                 modelLookups.Remove key |> ignore
 
-        let mutable ok = true
-
         for op in sc.ops do
             apply op
 
@@ -2123,9 +2086,7 @@ let ``AList mapA with cross-map lookup matches the model`` () =
                 )
 
             if actual <> expected then
-                ok <- false
-
-        ok
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
 
     Check.One(scenarioConfig, prop)
 
@@ -2152,8 +2113,6 @@ let ``AMap filter with keys matches the model`` () =
                 CMap.remove key resources
                 model.Remove key |> ignore
 
-        let mutable ok = true
-
         for op in ops do
             apply op
 
@@ -2168,10 +2127,8 @@ let ``AMap filter with keys matches the model`` () =
                     }
                 )
 
-            if Set.ofSeq actual <> expected then
-                ok <- false
-
-        ok
+            if actual <> expected then
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
 
     Check.QuickThrowOnFailure prop
 
@@ -2247,8 +2204,6 @@ let ``physics cache refresh matches a fresh computation`` () =
                 CMap.remove id velocities
                 modelVel.Remove id |> ignore
 
-        let mutable ok = true
-
         for op in ops do
             apply op
 
@@ -2256,20 +2211,13 @@ let ``physics cache refresh matches a fresh computation`` () =
             let expected = model ()
 
             if actual.Count <> expected.Count then
-                ok <- false
+                failwithf "count mismatch after %A: actual=%A expected=%A" op actual.Count expected.Count
             else
-                let mutable mismatch = false
-
                 for KeyValue(id, v) in expected do
                     let mutable a = 0.0
 
                     if not (actual.TryGetValue(id, &a)) || a <> v then
-                        mismatch <- true
-
-                if mismatch then
-                    ok <- false
-
-        ok
+                        failwithf "value mismatch after %A for %A: actual=%A expected=%A" op id a v
 
     Check.QuickThrowOnFailure prop
 
@@ -2357,8 +2305,6 @@ let ``physics cache snapshot agrees with the adaptive derivation`` () =
                 CMap.remove id velocities
                 modelVel.Remove id |> ignore
 
-        let mutable ok = true
-
         for op in ops do
             apply op
 
@@ -2371,10 +2317,8 @@ let ``physics cache snapshot agrees with the adaptive derivation`` () =
             let expected = model ()
 
             if Map.count adaptive <> expected.Count then
-                ok <- false
+                failwithf "count mismatch after %A: actual=%A expected=%A" op (Map.count adaptive) expected.Count
             else
-                let mutable mismatch = false
-
                 for KeyValue(id, v) in expected do
                     let mutable a = 0.0
                     let mutable s = 0.0
@@ -2383,12 +2327,13 @@ let ``physics cache snapshot agrees with the adaptive derivation`` () =
                         (not (Map.tryFind id adaptive |> Option.exists (fun x -> x = v)))
                         || (not (snap.TryGetValue(id, &s)) || s <> v)
                     then
-                        mismatch <- true
-
-                if mismatch then
-                    ok <- false
-
-        ok
+                        failwithf
+                            "value mismatch after %A for %A: adaptive=%A snapshot=%A expected=%A"
+                            op
+                            id
+                            (Map.tryFind id adaptive)
+                            s
+                            v
 
     Check.QuickThrowOnFailure prop
 
@@ -2478,15 +2423,14 @@ let ``spatial radius query matches the brute force`` () =
                 CSet.add id live
                 modelLive.Add id |> ignore
 
-        let mutable ok = true
-
         for op in ops do
             apply op
 
-            if query () <> model () then
-                ok <- false
+            let actual = query ()
+            let expected = model ()
 
-        ok
+            if actual <> expected then
+                failwithf "query mismatch after %A: actual=%A expected=%A" op actual expected
 
     Check.QuickThrowOnFailure prop
 
@@ -2525,8 +2469,6 @@ let ``AList choose matches the combat-status model`` () =
                     CList.updateAt position element effects
                     model[position] <- element
 
-        let mutable ok = true
-
         for op in ops do
             apply op
 
@@ -2534,9 +2476,7 @@ let ``AList choose matches the combat-status model`` () =
             let expected = model |> Seq.choose effectKindToStatus |> List.ofSeq
 
             if actual <> expected then
-                ok <- false
-
-        ok
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
 
     Check.QuickThrowOnFailure prop
 
@@ -2585,13 +2525,9 @@ let ``Transaction.run defers application until commit`` () =
             let actualPost = AMap.toMap (CMap.value m)
             actualPre = expectedPre && actualPost = expectedPost
 
-        let mutable ok = true
-
         for op in ops do
             if not (apply op) then
-                ok <- false
-
-        ok
+                failwithf "mismatch after op %A" op
 
     Check.QuickThrowOnFailure prop
 
@@ -2628,13 +2564,9 @@ let ``AMap ofExternal matches the reference model`` () =
                 lastSeen <- expected
                 true
 
-        let mutable ok = true
-
         for op in sc.ops do
             if not (apply op) then
-                ok <- false
-
-        ok
+                failwithf "mismatch after %A" op
 
     Check.One(scenarioConfig, prop)
 
@@ -2667,88 +2599,53 @@ let ``AList ofExternal matches the reference model`` () =
                 lastSeen <- expected
                 true
 
-        let mutable ok = true
-
         for op in sc.ops do
             if not (apply op) then
-                ok <- false
-
-        ok
+                failwithf "mismatch after %A" op
 
     Check.One(scenarioConfig, prop)
 
 [<Fact>]
 let ``AList take matches the model`` () =
-    let prop (ops: int list) =
+    let prop (sc: ListScenario) =
         let l = CList.empty<int>
         let model = ResizeArray<int>()
-        let count = List.length ops % 5
+
+        for (e, _) in sc.initial do
+            CList.append e l
+            model.Add e
+
+        let count = List.length sc.ops % 5
         let taken = AList.take count (CList.value l)
 
-        let apply (op: int) =
-            let kind = op % 3
-            let rest = op / 3
-            let element = rest % 10
+        for op in sc.ops do
+            applyListChange op l model
 
-            let position =
-                let p = (rest / 10) % (model.Count + 1)
-                if p < 0 then p + (model.Count + 1) else p
-
-            match kind with
-            | 0 ->
-                CList.insertAt position element l
-                model.Insert(position, element)
-            | 1 ->
-                if model.Count > 0 && position < model.Count then
-                    CList.removeAt position l
-                    model.RemoveAt position
-            | _ ->
-                if model.Count > 0 && position < model.Count then
-                    CList.updateAt position element l
-                    model[position] <- element
-
+            let actual = AList.toList taken
             let expected = model |> Seq.truncate count |> List.ofSeq
-            AList.toList taken = expected
 
-        let mutable ok = true
+            if actual <> expected then
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
 
-        for op in ops do
-            if not (apply op) then
-                ok <- false
-
-        ok
-
-    Check.QuickThrowOnFailure prop
+    Check.One(scenarioConfig, prop)
 
 [<Fact>]
 let ``AList skip matches the model`` () =
-    let prop (ops: int list) =
+    let prop (sc: ListScenario) =
         let l = CList.empty<int>
         let model = ResizeArray<int>()
-        let count = List.length ops % 5
+
+        for (e, _) in sc.initial do
+            CList.append e l
+            model.Add e
+
+        let count = List.length sc.ops % 5
         let skipped = AList.skip count (CList.value l)
 
-        let apply (op: int) =
-            let kind = op % 3
-            let rest = op / 3
-            let element = rest % 10
+        for op in sc.ops do
+            applyListChange op l model
 
-            let position =
-                let p = (rest / 10) % (model.Count + 1)
-                if p < 0 then p + (model.Count + 1) else p
-
-            match kind with
-            | 0 ->
-                CList.insertAt position element l
-                model.Insert(position, element)
-            | 1 ->
-                if model.Count > 0 && position < model.Count then
-                    CList.removeAt position l
-                    model.RemoveAt position
-            | _ ->
-                if model.Count > 0 && position < model.Count then
-                    CList.updateAt position element l
-                    model[position] <- element
+            let actual = AList.toList skipped
 
             let expected =
                 if model.Count <= count then
@@ -2756,178 +2653,102 @@ let ``AList skip matches the model`` () =
                 else
                     model |> Seq.skip count |> List.ofSeq
 
-            AList.toList skipped = expected
+            if actual <> expected then
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
 
-        let mutable ok = true
-
-        for op in ops do
-            if not (apply op) then
-                ok <- false
-
-        ok
-
-    Check.QuickThrowOnFailure prop
+    Check.One(scenarioConfig, prop)
 
 [<Fact>]
 let ``AList sub matches the model`` () =
-    let prop (ops: int list) =
+    let prop (sc: ListScenario) =
         let l = CList.empty<int>
         let model = ResizeArray<int>()
-        let offset = List.length ops % 3
-        let count = List.length ops % 5
+
+        for (e, _) in sc.initial do
+            CList.append e l
+            model.Add e
+
+        let offset = List.length sc.ops % 3
+        let count = List.length sc.ops % 5
         let sliced = AList.sub offset count (CList.value l)
 
-        let apply (op: int) =
-            let kind = op % 3
-            let rest = op / 3
-            let element = rest % 10
+        for op in sc.ops do
+            applyListChange op l model
 
-            let position =
-                let p = (rest / 10) % (model.Count + 1)
-                if p < 0 then p + (model.Count + 1) else p
-
-            match kind with
-            | 0 ->
-                CList.insertAt position element l
-                model.Insert(position, element)
-            | 1 ->
-                if model.Count > 0 && position < model.Count then
-                    CList.removeAt position l
-                    model.RemoveAt position
-            | _ ->
-                if model.Count > 0 && position < model.Count then
-                    CList.updateAt position element l
-                    model[position] <- element
+            let actual = AList.toList sliced
 
             let expected =
                 let from = min offset model.Count
                 let take = max 0 (min count (model.Count - from))
                 model |> Seq.skip from |> Seq.truncate take |> List.ofSeq
 
-            AList.toList sliced = expected
+            if actual <> expected then
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
 
-        let mutable ok = true
-
-        for op in ops do
-            if not (apply op) then
-                ok <- false
-
-        ok
-
-    Check.QuickThrowOnFailure prop
+    Check.One(scenarioConfig, prop)
 
 [<Fact>]
 let ``AList sort matches the model`` () =
-    let prop (ops: int list) =
+    let prop (sc: ListScenario) =
         let l = CList.empty<int>
         let model = ResizeArray<int>()
+
+        for (e, _) in sc.initial do
+            CList.append e l
+            model.Add e
+
         let sorted = AList.sort (CList.value l)
 
-        let apply (op: int) =
-            let kind = op % 3
-            let rest = op / 3
-            let element = rest % 10
+        for op in sc.ops do
+            applyListChange op l model
 
-            let position =
-                let p = (rest / 10) % (model.Count + 1)
-                if p < 0 then p + (model.Count + 1) else p
-
-            match kind with
-            | 0 ->
-                CList.insertAt position element l
-                model.Insert(position, element)
-            | 1 ->
-                if model.Count > 0 && position < model.Count then
-                    CList.removeAt position l
-                    model.RemoveAt position
-            | _ ->
-                if model.Count > 0 && position < model.Count then
-                    CList.updateAt position element l
-                    model[position] <- element
-
+            let actual = AList.toList sorted
             let expected = model |> Seq.sort |> List.ofSeq
-            AList.toList sorted = expected
 
-        let mutable ok = true
+            if actual <> expected then
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
 
-        for op in ops do
-            if not (apply op) then
-                ok <- false
-
-        ok
-
-    Check.QuickThrowOnFailure prop
+    Check.One(scenarioConfig, prop)
 
 [<Fact>]
 let ``AList rev matches the model`` () =
-    let prop (ops: int list) =
+    let prop (sc: ListScenario) =
         let l = CList.empty<int>
         let model = ResizeArray<int>()
+
+        for (e, _) in sc.initial do
+            CList.append e l
+            model.Add e
+
         let reversed = AList.rev (CList.value l)
 
-        let apply (op: int) =
-            let kind = op % 3
-            let rest = op / 3
-            let element = rest % 10
+        for op in sc.ops do
+            applyListChange op l model
 
-            let position =
-                let p = (rest / 10) % (model.Count + 1)
-                if p < 0 then p + (model.Count + 1) else p
-
-            match kind with
-            | 0 ->
-                CList.insertAt position element l
-                model.Insert(position, element)
-            | 1 ->
-                if model.Count > 0 && position < model.Count then
-                    CList.removeAt position l
-                    model.RemoveAt position
-            | _ ->
-                if model.Count > 0 && position < model.Count then
-                    CList.updateAt position element l
-                    model[position] <- element
-
+            let actual = AList.toList reversed
             let expected = model |> Seq.rev |> List.ofSeq
-            AList.toList reversed = expected
 
-        let mutable ok = true
+            if actual <> expected then
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
 
-        for op in ops do
-            if not (apply op) then
-                ok <- false
-
-        ok
-
-    Check.QuickThrowOnFailure prop
+    Check.One(scenarioConfig, prop)
 
 [<Fact>]
 let ``AList pairwise matches the model`` () =
-    let prop (ops: int list) =
+    let prop (sc: ListScenario) =
         let l = CList.empty<int>
         let model = ResizeArray<int>()
+
+        for (e, _) in sc.initial do
+            CList.append e l
+            model.Add e
+
         let pairs = AList.pairwise (CList.value l)
 
-        let apply (op: int) =
-            let kind = op % 3
-            let rest = op / 3
-            let element = rest % 10
+        for op in sc.ops do
+            applyListChange op l model
 
-            let position =
-                let p = (rest / 10) % (model.Count + 1)
-                if p < 0 then p + (model.Count + 1) else p
-
-            match kind with
-            | 0 ->
-                CList.insertAt position element l
-                model.Insert(position, element)
-            | 1 ->
-                if model.Count > 0 && position < model.Count then
-                    CList.removeAt position l
-                    model.RemoveAt position
-            | _ ->
-                if model.Count > 0 && position < model.Count then
-                    CList.updateAt position element l
-                    model[position] <- element
+            let actual = AList.toList pairs
 
             let expected =
                 seq {
@@ -2936,129 +2757,75 @@ let ``AList pairwise matches the model`` () =
                 }
                 |> List.ofSeq
 
-            AList.toList pairs = expected
+            if actual <> expected then
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
 
-        let mutable ok = true
-
-        for op in ops do
-            if not (apply op) then
-                ok <- false
-
-        ok
-
-    Check.QuickThrowOnFailure prop
+    Check.One(scenarioConfig, prop)
 
 [<Fact>]
 let ``AList sum matches the model`` () =
-    let prop (ops: int list) =
+    let prop (sc: ListScenario) =
         let l = CList.empty<int>
         let model = ResizeArray<int>()
+
+        for (e, _) in sc.initial do
+            CList.append e l
+            model.Add e
+
         let total = AList.sum (CList.value l)
 
-        let apply (op: int) =
-            let kind = op % 3
-            let rest = op / 3
-            let element = rest % 10
+        for op in sc.ops do
+            applyListChange op l model
 
-            let position =
-                let p = (rest / 10) % (model.Count + 1)
-                if p < 0 then p + (model.Count + 1) else p
+            let actual = AVal.getValue total
+            let expected = Seq.sum model
 
-            match kind with
-            | 0 ->
-                CList.insertAt position element l
-                model.Insert(position, element)
-            | 1 ->
-                if model.Count > 0 && position < model.Count then
-                    CList.removeAt position l
-                    model.RemoveAt position
-            | _ ->
-                if model.Count > 0 && position < model.Count then
-                    CList.updateAt position element l
-                    model[position] <- element
+            if actual <> expected then
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
 
-            AVal.getValue total = Seq.sum model
-
-        let mutable ok = true
-
-        for op in ops do
-            if not (apply op) then
-                ok <- false
-
-        ok
-
-    Check.QuickThrowOnFailure prop
+    Check.One(scenarioConfig, prop)
 
 [<Fact>]
 let ``AList countBy matches the model`` () =
-    let prop (ops: int list) =
+    let prop (sc: ListScenario) =
         let l = CList.empty<int>
         let model = ResizeArray<int>()
+
+        for (e, _) in sc.initial do
+            CList.append e l
+            model.Add e
+
         let evenCount = AList.countBy (fun x -> x % 2 = 0) (CList.value l)
 
-        let apply (op: int) =
-            let kind = op % 3
-            let rest = op / 3
-            let element = rest % 10
+        for op in sc.ops do
+            applyListChange op l model
 
-            let position =
-                let p = (rest / 10) % (model.Count + 1)
-                if p < 0 then p + (model.Count + 1) else p
+            let actual = AVal.getValue evenCount
+            let expected = model |> Seq.filter (fun x -> x % 2 = 0) |> Seq.length
 
-            match kind with
-            | 0 ->
-                CList.insertAt position element l
-                model.Insert(position, element)
-            | 1 ->
-                if model.Count > 0 && position < model.Count then
-                    CList.removeAt position l
-                    model.RemoveAt position
-            | _ ->
-                if model.Count > 0 && position < model.Count then
-                    CList.updateAt position element l
-                    model[position] <- element
+            if actual <> expected then
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
 
-            AVal.getValue evenCount = (model |> Seq.filter (fun x -> x % 2 = 0) |> Seq.length)
-
-        let mutable ok = true
-
-        for op in ops do
-            if not (apply op) then
-                ok <- false
-
-        ok
-
-    Check.QuickThrowOnFailure prop
+    Check.One(scenarioConfig, prop)
 
 [<Fact>]
 let ``AList tryMin and tryMax match the model`` () =
-    let prop (ops: int list) =
+    let prop (sc: ListScenario) =
         let l = CList.empty<int>
         let model = ResizeArray<int>()
+
+        for (e, _) in sc.initial do
+            CList.append e l
+            model.Add e
+
         let mn = AList.tryMin (CList.value l)
         let mx = AList.tryMax (CList.value l)
 
-        let apply (op: int) =
-            let kind = op % 3
-            let rest = op / 3
-            let element = rest % 10
+        for op in sc.ops do
+            applyListChange op l model
 
-            let position =
-                let p = (rest / 10) % (model.Count + 1)
-                if p < 0 then p + (model.Count + 1) else p
-
-            match kind with
-            | 0 ->
-                CList.insertAt position element l
-                model.Insert(position, element)
-            | 1 ->
-                if model.Count > 0 && position < model.Count then
-                    CList.removeAt position l
-                    model.RemoveAt position
-            | _ ->
-                if model.Count > 0 && position < model.Count then
-                    CList.updateAt position element l
-                    model[position] <- element
+            let actualMin = AVal.getValue mn
+            let actualMax = AVal.getValue mx
 
             let expectedMin =
                 if model.Count = 0 then
@@ -3072,99 +2839,86 @@ let ``AList tryMin and tryMax match the model`` () =
                 else
                     ValueSome(Seq.max model)
 
-            AVal.getValue mn = expectedMin && AVal.getValue mx = expectedMax
+            if actualMin <> expectedMin || actualMax <> expectedMax then
+                failwithf "mismatch after %A: min=%A max=%A" op actualMin actualMax
 
-        let mutable ok = true
-
-        for op in ops do
-            if not (apply op) then
-                ok <- false
-
-        ok
-
-    Check.QuickThrowOnFailure prop
+    Check.One(scenarioConfig, prop)
 
 [<Fact>]
 let ``AList fold matches the model`` () =
-    let prop (ops: int list) =
+    let prop (sc: ListScenario) =
         let l = CList.empty<int>
         let model = ResizeArray<int>()
+
+        for (e, _) in sc.initial do
+            CList.append e l
+            model.Add e
+
         let acc = AList.fold (fun s x -> s * 10 + x) 0 (CList.value l)
 
-        let apply (op: int) =
-            let kind = op % 3
-            let rest = op / 3
-            let element = rest % 10
+        for op in sc.ops do
+            applyListChange op l model
 
-            let position =
-                let p = (rest / 10) % (model.Count + 1)
-                if p < 0 then p + (model.Count + 1) else p
-
-            match kind with
-            | 0 ->
-                CList.insertAt position element l
-                model.Insert(position, element)
-            | 1 ->
-                if model.Count > 0 && position < model.Count then
-                    CList.removeAt position l
-                    model.RemoveAt position
-            | _ ->
-                if model.Count > 0 && position < model.Count then
-                    CList.updateAt position element l
-                    model[position] <- element
-
+            let actual = AVal.getValue acc
             let expected = model |> Seq.fold (fun s x -> s * 10 + x) 0
-            AVal.getValue acc = expected
 
-        let mutable ok = true
+            if actual <> expected then
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
 
-        for op in ops do
-            if not (apply op) then
-                ok <- false
-
-        ok
-
-    Check.QuickThrowOnFailure prop
+    Check.One(scenarioConfig, prop)
 
 [<Fact>]
 let ``AList bind matches the model`` () =
-    let prop (ops: int list) =
+    let prop (sc: TwoListScenario) =
         let l1 = CList.empty<int>
         let l2 = CList.empty<int>
         let selector = CVal.create 0
         let model1 = ResizeArray<int>()
         let model2 = ResizeArray<int>()
 
+        for (e, _) in sc.initialA do
+            CList.append e l1
+            model1.Add e
+
+        for (e, _) in sc.initialB do
+            CList.append e l2
+            model2.Add e
+
         // The bind switches the whole output when the selector aval changes.
         let bound =
             AList.bind (fun n -> if n = 0 then CList.value l1 else CList.value l2) (CVal.value selector)
 
-        let apply (op: int) =
-            let kind = op % 4
-            let rest = op / 4
-            let element = rest % 10
-            let which = (rest / 10) % 2
-            let target = if which = 0 then l1 else l2
-            let model = if which = 0 then model1 else model2
-
-            let position =
-                let p = (rest / 100) % (model.Count + 1)
-                if p < 0 then p + (model.Count + 1) else p
-
-            match kind with
-            | 0 ->
+        let apply (op: TwoListOp) =
+            match op with
+            | InsertInto(element, payload, which) ->
+                let target = if which = 0 then l1 else l2
+                let model = if which = 0 then model1 else model2
+                let position = payload % (model.Count + 1)
                 CList.insertAt position element target
                 model.Insert(position, element)
-            | 1 ->
+            | RemoveFrom(payload, which) ->
+                let target = if which = 0 then l1 else l2
+                let model = if which = 0 then model1 else model2
+                let position = payload % (model.Count + 1)
+
                 if model.Count > 0 && position < model.Count then
                     CList.removeAt position target
                     model.RemoveAt position
-            | 2 ->
+            | UpdateIn(element, payload, which) ->
+                let target = if which = 0 then l1 else l2
+                let model = if which = 0 then model1 else model2
+                let position = payload % (model.Count + 1)
+
                 if model.Count > 0 && position < model.Count then
                     CList.updateAt position element target
                     model[position] <- element
-            | _ -> // Switch the selector.
-                CVal.set (if which = 0 then 0 else 1) selector
+            | Switch which -> // Switch the selector.
+                CVal.set which selector
+
+        for op in sc.ops do
+            apply op
+
+            let actual = AList.toList bound
 
             let expected =
                 if AVal.getValue (CVal.value selector) = 0 then
@@ -3172,111 +2926,119 @@ let ``AList bind matches the model`` () =
                 else
                     List.ofSeq model2
 
-            AList.toList bound = expected
+            if actual <> expected then
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
 
-        let mutable ok = true
-
-        for op in ops do
-            if not (apply op) then
-                ok <- false
-
-        ok
-
-    Check.QuickThrowOnFailure prop
+    Check.One(scenarioConfig, prop)
 
 [<Fact>]
 let ``AList concat matches the model`` () =
-    let prop (ops: int list) =
+    let prop (sc: TwoListScenario) =
         let l1 = CList.empty<int>
         let l2 = CList.empty<int>
         let model1 = ResizeArray<int>()
         let model2 = ResizeArray<int>()
+
+        for (e, _) in sc.initialA do
+            CList.append e l1
+            model1.Add e
+
+        for (e, _) in sc.initialB do
+            CList.append e l2
+            model2.Add e
+
         let concat = AList.concat [ CList.value l1; CList.value l2 ]
 
-        let apply (op: int) =
-            let kind = op % 3
-            let rest = op / 3
-            let element = rest % 10
-            let which = (rest / 10) % 2
-            let target = if which = 0 then l1 else l2
-            let model = if which = 0 then model1 else model2
-
-            let position =
-                let p = (rest / 100) % (model.Count + 1)
-                if p < 0 then p + (model.Count + 1) else p
-
-            match kind with
-            | 0 ->
+        let apply (op: TwoListOp) =
+            match op with
+            | InsertInto(element, payload, which) ->
+                let target = if which = 0 then l1 else l2
+                let model = if which = 0 then model1 else model2
+                let position = payload % (model.Count + 1)
                 CList.insertAt position element target
                 model.Insert(position, element)
-            | 1 ->
+            | RemoveFrom(payload, which) ->
+                let target = if which = 0 then l1 else l2
+                let model = if which = 0 then model1 else model2
+                let position = payload % (model.Count + 1)
+
                 if model.Count > 0 && position < model.Count then
                     CList.removeAt position target
                     model.RemoveAt position
-            | _ ->
+            | UpdateIn(element, payload, which) ->
+                let target = if which = 0 then l1 else l2
+                let model = if which = 0 then model1 else model2
+                let position = payload % (model.Count + 1)
+
                 if model.Count > 0 && position < model.Count then
                     CList.updateAt position element target
                     model[position] <- element
+            | Switch _ -> () // No selector here: no-op.
 
+        for op in sc.ops do
+            apply op
+
+            let actual = AList.toList concat
             let expected = Seq.append model1 model2 |> List.ofSeq
-            AList.toList concat = expected
 
-        let mutable ok = true
+            if actual <> expected then
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
 
-        for op in ops do
-            if not (apply op) then
-                ok <- false
-
-        ok
-
-    Check.QuickThrowOnFailure prop
+    Check.One(scenarioConfig, prop)
 
 [<Fact>]
 let ``AList mapiA passes the mapping-time position`` () =
-    let prop (ops: int list) =
+    let prop (sc: ListScenario) =
         let l = CList.empty<int>
-        // The mapping encodes the position it was invoked with into the value.
-        let mapped = AList.mapiA (fun i v -> AVal.constant (v * 100 + i)) (CList.value l)
         // Model: element -> the position its mapping ran at (positions stick).
         let model = ResizeArray<struct (int * int)>()
 
-        let apply (op: int) =
-            let kind = op % 3
-            let rest = op / 3
-            let element = rest % 10
+        for (e, _) in sc.initial do
+            CList.append e l
+            model.Add(struct (e, model.Count))
 
-            let position =
-                let p = (rest / 10) % (model.Count + 1)
-                if p < 0 then p + (model.Count + 1) else p
+        // The mapping encodes the position it was invoked with into the value.
+        let mapped = AList.mapiA (fun i v -> AVal.constant (v * 100 + i)) (CList.value l)
 
-            match kind with
-            | 0 ->
+        // Establish the mapping positions at the initial state before any op:
+        // a lazy first load after an op would map the initial elements at
+        // their post-op positions.
+        AList.force mapped |> ignore
+
+        let apply (op: ListChange) =
+            match op with
+            | Insert(element, payload) ->
+                let position = payload % (model.Count + 1)
                 CList.insertAt position element l
                 model.Insert(position, struct (element, position))
-            | 1 ->
+            | RemoveAt payload ->
+                let position = payload % (model.Count + 1)
+
                 if model.Count > 0 && position < model.Count then
                     CList.removeAt position l
                     model.RemoveAt position
-            | _ -> // Update: equal values are a no-op (no re-map, the position sticks).
+            | UpdateAt(element, payload) ->
+                let position = payload % (model.Count + 1)
+
                 if model.Count > 0 && position < model.Count then
+                    // Equal values are a no-op (no re-map, the position sticks).
                     let struct (oldE, _) = model[position]
 
                     if oldE <> element then
                         CList.updateAt position element l
                         model[position] <- struct (element, position)
+            | ListChange.SetValue _ -> ()
 
+        for op in sc.ops do
+            apply op
+
+            let actual = AList.toList mapped
             let expected = model |> Seq.map (fun struct (e, i) -> e * 100 + i) |> List.ofSeq
-            AList.toList mapped = expected
 
-        let mutable ok = true
+            if actual <> expected then
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
 
-        for op in ops do
-            if not (apply op) then
-                ok <- false
-
-        ok
-
-    Check.QuickThrowOnFailure prop
+    Check.One(scenarioConfig, prop)
 
 // =============================================================================
 // Gap coverage: AVal.ofExternal, the changeables' batch ops, and the observed
@@ -3310,13 +3072,9 @@ let ``AVal ofExternal matches the reference model`` () =
                 lastSeen <- expected
                 true
 
-        let mutable ok = true
-
         for op in sc.ops do
             if not (apply op) then
-                ok <- false
-
-        ok
+                failwithf "mismatch after %A" op
 
     Check.One(scenarioConfig, prop)
 
@@ -3459,7 +3217,6 @@ let ``ASet observe delivers the model content after every op`` () =
             ASet.observe (fun view _ -> observed <- Set.ofSeq view) (CSet.value source)
 
         let model = HashSet<int>(List.map fst sc.initial)
-        let mutable ok = true
 
         for op in sc.ops do
             match op with
@@ -3473,11 +3230,12 @@ let ``ASet observe delivers the model content after every op`` () =
 
             // The notification is delivered during the write; the callback
             // must have recorded the new content.
-            if observed <> Set.ofSeq model then
-                ok <- false
+            let expected = Set.ofSeq model
+
+            if observed <> expected then
+                failwithf "mismatch after %A: observed=%A expected=%A" op observed expected
 
         obs.Dispose()
-        ok
 
     Check.One(scenarioConfig, prop)
 
@@ -3501,8 +3259,6 @@ let ``AMap observe delivers the model content after every op`` () =
         for (k, v) in sc.initial do
             model[k] <- v
 
-        let mutable ok = true
-
         for op in sc.ops do
             match op with
             | Upsert(k, v) ->
@@ -3516,10 +3272,9 @@ let ``AMap observe delivers the model content after every op`` () =
             let expected = [ for KeyValue(k, v) in model -> k, v ] |> Map.ofList
 
             if observed <> expected then
-                ok <- false
+                failwithf "mismatch after %A: observed=%A expected=%A" op observed expected
 
         obs.Dispose()
-        ok
 
     Check.One(scenarioConfig, prop)
 
@@ -3537,8 +3292,6 @@ let ``AList observe delivers the model content after every op`` () =
 
         let obs =
             AList.observe (fun view _ -> observed <- List.ofSeq view) (CList.value source)
-
-        let mutable ok = true
 
         for op in sc.ops do
             match op with
@@ -3558,10 +3311,281 @@ let ``AList observe delivers the model content after every op`` () =
                     model[pos] <- e
             | SetValue _ -> ()
 
-            if observed <> List.ofSeq model then
-                ok <- false
+            let expected = List.ofSeq model
+
+            if observed <> expected then
+                failwithf "mismatch after %A: observed=%A expected=%A" op observed expected
 
         obs.Dispose()
-        ok
 
     Check.One(scenarioConfig, prop)
+
+// =============================================================================
+// Non-int element types: the same reference-model shape with struct, string,
+// and Guid elements. The int tests cover the full op matrix; these cover the
+// element-type paths (struct hashing, reference-type elements, and keys
+// without an int representation).
+// =============================================================================
+
+type StructListChange =
+    | Insert of element: struct (int * int) * payload: int
+    | RemoveAt of payload: int
+
+type StructListScenario =
+    { initial: struct (int * int) list
+      ops: StructListChange list }
+
+type StringSetOp =
+    | Add of element: string * value: int
+    | Remove of element: string
+
+type StringSetScenario =
+    { initial: (string * int) list
+      ops: StringSetOp list }
+
+type GuidMapOp =
+    | Upsert of key: Guid * value: int
+    | Remove of key: Guid
+
+type GuidMapScenario =
+    { initial: (Guid * int) list
+      ops: GuidMapOp list }
+
+let structPairGen =
+    gen {
+        let! a = Gen.choose (0, 19)
+        let! b = Gen.choose (0, 19)
+        return struct (a, b)
+    }
+
+let structListChangeGen: Gen<StructListChange> =
+    Gen.frequency
+        [ (3,
+           gen {
+               let! e = structPairGen
+               let! p = Gen.choose (0, 200)
+               return Insert(e, p)
+           })
+          (2,
+           gen {
+               let! p = Gen.choose (0, 200)
+               return RemoveAt p
+           }) ]
+
+let structListScenarioGen: Gen<StructListScenario> =
+    gen {
+        let! initial = Gen.listOf structPairGen
+        let! ops = Gen.listOf structListChangeGen
+        return { initial = initial; ops = ops }
+    }
+
+let stringGen = Gen.elements [ "alpha"; "beta"; "gamma"; "delta"; "epsilon" ]
+
+let stringSetOpGen: Gen<StringSetOp> =
+    Gen.frequency
+        [ (3,
+           gen {
+               let! e = stringGen
+               let! v = Gen.choose (0, 99)
+               return Add(e, v)
+           })
+          (2,
+           gen {
+               let! e = stringGen
+               return StringSetOp.Remove e
+           }) ]
+
+let stringSetScenarioGen: Gen<StringSetScenario> =
+    gen {
+        let! initial =
+            Gen.listOf (
+                gen {
+                    let! e = stringGen
+                    let! v = Gen.choose (0, 99)
+                    return e, v
+                }
+            )
+
+        let! ops = Gen.listOf stringSetOpGen
+
+        return
+            { initial = dedupPairs initial
+              ops = ops }
+    }
+
+let guidGen =
+    Gen.elements [ for i in 0..19 -> Guid("00000000-0000-0000-0000-" + i.ToString("000000000000")) ]
+
+let guidMapOpGen: Gen<GuidMapOp> =
+    Gen.frequency
+        [ (3,
+           gen {
+               let! k = guidGen
+               let! v = Gen.choose (0, 99)
+               return Upsert(k, v)
+           })
+          (2,
+           gen {
+               let! k = guidGen
+               return GuidMapOp.Remove k
+           }) ]
+
+let guidMapScenarioGen: Gen<GuidMapScenario> =
+    gen {
+        let! initial =
+            Gen.listOf (
+                gen {
+                    let! k = guidGen
+                    let! v = Gen.choose (0, 99)
+                    return k, v
+                }
+            )
+
+        let! ops = Gen.listOf guidMapOpGen
+
+        return
+            { initial = dedupPairs initial
+              ops = ops }
+    }
+
+type NonIntArbs =
+    static member StructListScenario() : Arbitrary<StructListScenario> = Arb.fromGen structListScenarioGen
+    static member StringSetScenario() : Arbitrary<StringSetScenario> = Arb.fromGen stringSetScenarioGen
+    static member GuidMapScenario() : Arbitrary<GuidMapScenario> = Arb.fromGen guidMapScenarioGen
+
+let private nonIntConfig =
+    Config.QuickThrowOnFailure.WithArbitrary([| typeof<NonIntArbs> |])
+
+[<Fact>]
+let ``AList sort over struct pairs matches the model`` () =
+    let prop (sc: StructListScenario) =
+        let l = CList.empty<struct (int * int)>
+        let model = ResizeArray<struct (int * int)>()
+
+        for e in sc.initial do
+            CList.append e l
+            model.Add e
+
+        let sorted = AList.sort (CList.value l)
+
+        for op in sc.ops do
+            match op with
+            | Insert(element, payload) ->
+                let position = payload % (model.Count + 1)
+                CList.insertAt position element l
+                model.Insert(position, element)
+            | RemoveAt payload ->
+                let position = payload % (model.Count + 1)
+
+                if model.Count > 0 && position < model.Count then
+                    CList.removeAt position l
+                    model.RemoveAt position
+
+            let actual = AList.toList sorted
+            let expected = model |> Seq.sort |> List.ofSeq
+
+            if actual <> expected then
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
+
+    Check.One(nonIntConfig, prop)
+
+[<Fact>]
+let ``ASet mapA over strings matches the reference model`` () =
+    let prop (sc: StringSetScenario) =
+        let source = CSet.empty<string>
+        let values = Dictionary<string, cval<int>>()
+
+        for (e, v) in sc.initial do
+            CSet.add e source
+            values[e] <- CVal.create v
+
+        let mapped = ASet.mapA (fun v -> CVal.value values[v]) (CSet.value source)
+        // Model: element -> current value; value -> occurrence count; the output.
+        let elementValue = Dictionary<string, int>()
+        let valueRefs = Dictionary<int, int>()
+        let model = HashSet<int>()
+
+        for (e, v) in sc.initial do
+            elementValue[e] <- v
+
+            match valueRefs.TryGetValue v with
+            | true, r -> valueRefs[v] <- r + 1
+            | false, _ ->
+                valueRefs[v] <- 1
+                model.Add v |> ignore
+
+        for op in sc.ops do
+            match op with
+            | Add(element, value) -> // Add the element with a fresh aval holding the value.
+                CSet.add element source
+
+                if not (elementValue.ContainsKey element) then
+                    values[element] <- CVal.create value
+                    elementValue[element] <- value
+
+                    match valueRefs.TryGetValue value with
+                    | true, r -> valueRefs[value] <- r + 1
+                    | false, _ ->
+                        valueRefs[value] <- 1
+                        model.Add value |> ignore
+            | StringSetOp.Remove element -> // Remove the element.
+                CSet.remove element source
+
+                if elementValue.ContainsKey element then
+                    let v = elementValue[element]
+                    elementValue.Remove element |> ignore
+                    values.Remove element |> ignore
+                    let r = valueRefs[v] - 1
+
+                    if r = 0 then
+                        valueRefs.Remove v |> ignore
+                        model.Remove v |> ignore
+                    else
+                        valueRefs[v] <- r
+
+            let actual = Set.ofSeq (ASet.toSet mapped)
+            let expected = Set.ofSeq model
+
+            if actual <> expected then
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
+
+    Check.One(nonIntConfig, prop)
+
+[<Fact>]
+let ``AMap mapA over Guid keys matches the reference model`` () =
+    let prop (sc: GuidMapScenario) =
+        let source = CMap.empty<Guid, int>
+        let values = Dictionary<Guid, cval<int>>()
+
+        for (k, v) in sc.initial do
+            CMap.addOrUpdate k v source
+            values[k] <- CVal.create v
+
+        let mapped = AMap.mapA (fun k _ -> CVal.value values[k]) (CMap.value source)
+        let model = Dictionary<Guid, int>()
+
+        for (k, v) in sc.initial do
+            model[k] <- v
+
+        for op in sc.ops do
+            match op with
+            | Upsert(key, value) -> // AddOrUpdate the key: a fresh key gets a fresh aval.
+                CMap.addOrUpdate key value source
+
+                if not (model.ContainsKey key) then
+                    values[key] <- CVal.create value
+                    model[key] <- value
+            | GuidMapOp.Remove key -> // Remove the key.
+                CMap.remove key source
+
+                if model.ContainsKey key then
+                    model.Remove key |> ignore
+
+            let actual = AMap.toMap mapped
+
+            let expected = Map.ofSeq (seq { for KeyValue(k, v) in model -> k, v })
+
+            if actual <> expected then
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
+
+    Check.One(nonIntConfig, prop)

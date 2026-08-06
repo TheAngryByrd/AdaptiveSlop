@@ -1575,8 +1575,9 @@ let ``Map delta sequences match a reference model`` () =
         let k = rng.Next(30)
 
         if rng.NextDouble() < 0.6 then
-            source.AddOrUpdate k (rng.Next(100))
-            model <- model.Add(k, AMap.toMap (CMap.value source) |> Map.find k)
+            let v = rng.Next(100)
+            source.AddOrUpdate k v
+            model <- model.Add(k, v)
         else
             source.Remove(k)
             model <- model.Remove k
@@ -1961,21 +1962,18 @@ let ``Stress: posts interleaved with pumps and reads stay consistent`` () =
                 a.Post(rng.Next(1000)))
 
     // Pump and read while the producer runs.
-    let mutable ok = true
-
     while not producer.IsCompleted do
         Posting.pump ()
         let v = AVal.getValue m
 
         if v < 1 || v > 1000 then
-            ok <- false
+            failwithf "read an out-of-range value: %d" v
 
         Thread.Yield() |> ignore
 
     producer.Wait()
     Posting.pump ()
     let final = AVal.getValue (CVal.value a)
-    Assert.True(ok, "read an out-of-range value")
     Assert.InRange(final, 0, 999)
     Assert.Equal(final + 1, AVal.getValue m)
 
