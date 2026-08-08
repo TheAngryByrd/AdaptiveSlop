@@ -2971,6 +2971,49 @@ let ``derived set stays consistent after add and remove between reads`` () =
     Assert.Equal(1, ASet.force derived |> Seq.filter (fun x -> x = 2) |> Seq.length)
 
 [<Fact>]
+let ``AMap toASet contains on a derived map notifies an observed branch`` () =
+    // Regression: MapToSetNode never received the wake channel, so an
+    // observed branch over AMap.toASet of a derived source went stale.
+    let source = CMap.ofSeq [ "a", 1; "b", 2 ]
+    let derived = source |> CMap.value |> AMap.map (fun _ v -> v * 2)
+
+    let branch =
+        derived |> AMap.toASet |> ASet.contains (struct ("a", 2)) |> AVal.map id
+
+    let mutable observed = None
+
+    use obs = AVal.observe (fun v -> observed <- Some v) branch
+
+    Assert.True(AVal.getValue branch)
+    Assert.Equal(None, observed)
+    CMap.remove "a" source
+    Assert.Equal(Some false, observed)
+
+[<Fact>]
+let ``AMap mapUse tryFind on a derived map notifies an observed branch`` () =
+    // Regression: MapUseMapNode never received the wake channel, so an
+    // observed branch over AMap.mapUse of a derived source went stale.
+    let source = CMap.ofSeq [ "a", 1; "b", 2 ]
+    let derived = source |> CMap.value |> AMap.map (fun _ v -> v * 2)
+
+    let newDisposable () =
+        { new IDisposable with
+            member _.Dispose() = () }
+
+    let disp, used = derived |> AMap.mapUse (fun _ _ -> newDisposable ())
+    let branch = used |> AMap.tryFind "a" |> AVal.map id
+    let mutable fires = 0
+
+    use obs = AVal.observe (fun _ -> fires <- fires + 1) branch
+
+    AVal.getValue branch |> ignore
+    Assert.Equal(0, fires)
+    CMap.addOrUpdate "a" 5 source
+    Assert.True(fires > 0, "the observed branch must be woken by the upstream write")
+
+    disp.Dispose()
+
+[<Fact>]
 let ``AMap reduce updates subtract the old value`` () =
     let source = CMap.empty<string, int>
     let total = AMap.reduce (AdaptiveReduction.sum ()) (CMap.value source)

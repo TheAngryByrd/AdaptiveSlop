@@ -897,6 +897,15 @@ type MapToSetNode<'K, 'V, 'T when 'K: equality and 'T: equality>
                 Collections.journalAppendMap &state.Journal sets setCnt rems remCnt
                 state.Version <- state.Version + 1L
                 GraphContext.Default.MarkFrom(state.Edges)
+                Collections.wakeSinks &state.Sinks
+
+    interface IWakeSink with
+        member this.OnWake() =
+            if not disposed then
+                if state.Edges.Count > 0 then
+                    GraphContext.Default.MarkFrom(state.Edges)
+
+                Collections.wakeSinks &state.Sinks
 
     interface IAdaptiveSet<'T> with
         member this.GetValue() =
@@ -1625,6 +1634,15 @@ type MapUseMapNode<'K, 'V, 'W when 'K: equality and 'W: equality and 'W :> IDisp
                 Collections.journalAppendMap &state.Journal sets setCnt rems remCnt
                 state.Version <- state.Version + 1L
                 GraphContext.Default.MarkFrom(state.Edges)
+                Collections.wakeSinks &state.Sinks
+
+    interface IWakeSink with
+        member this.OnWake() =
+            if not disposed then
+                if state.Edges.Count > 0 then
+                    GraphContext.Default.MarkFrom(state.Edges)
+
+                Collections.wakeSinks &state.Sinks
 
     interface IAdaptiveMap<'K, 'W> with
         member this.GetValue() =
