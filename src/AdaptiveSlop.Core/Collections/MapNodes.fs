@@ -1609,3 +1609,296 @@ type MapUseMapNode<'K, 'V, 'W when 'K: equality and 'W: equality and 'W :> IDisp
         member _.EdgeCount = state.Edges.Count
         member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
         member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
+
+// =============================================================================
+// Scalar escape hatches: per-key lookup and incremental count.
+//
+// Unlike the transform nodes above, these nodes produce an aval, not an amap.
+// They register as delta sinks (the MapReduceNode pattern) so that a write to
+// an unrelated key never reaches them: the delta is scanned for the watched
+// key (O(delta)), and the node marks its parents only when its own output
+// value actually changed. This is the per-key precision that the plain
+// AdaptiveNode-over-GetValue pattern cannot express (the whole-map version
+// and the flat edge list carry no key information).
+// =============================================================================
+
+/// <summary>
+/// A per-key lookup over an adaptive map (the node behind <c>AMap.tryFind</c>
+/// and <c>AMap.find</c>). Registers as a delta sink on the source; a delta
+/// marks the node only when it touches the watched key, and only when the
+/// value at that key actually changed (net-delta equality gate). Writes to
+/// unrelated keys cost this node and its parents nothing. The value is applied
+/// from the delta at delivery time (the delta carries it; no source read);
+/// reads are O(1).
+/// </summary>
+/// <remarks>
+/// Application order inside one delta matches <c>MapReduceNode.Drain</c>:
+/// removals first, then sets (a set wins for a key that appears in both,
+/// which a net delta never produces).
+/// </remarks>
+type MapLookupNode<'K, 'V when 'K: equality>(source: IAdaptiveMap<'K, 'V>, key: 'K) =
+    let mutable version = 0L
+    let edges = ParentEdges()
+    let mutable depVersion = 0L
+    let mutable initialized = false
+    let mutable disposed = false
+    let mutable value = ValueNone
+
+    member private this.Register() =
+        match box source with
+        | :? IMapSinkRegistry as r -> r.AddMapSink(box (this :> IMapDeltaSink<'K, 'V>))
+        | _ -> ()
+
+    member private this.Unregister() =
+        match box source with
+        | :? IMapSinkRegistry as r -> r.RemoveMapSink(box (this :> IMapDeltaSink<'K, 'V>))
+        | _ -> ()
+
+    interface IMapDeltaSink<'K, 'V> with
+        member this.OnDeltas(sets: struct ('K * 'V)[], setCnt: int, rems: 'K[], remCnt: int) =
+            if not disposed then
+                let comparer = EqualityComparer<'K>.Default
+                let mutable next = value
+                let mutable i = 0
+
+                while i < remCnt do
+                    if comparer.Equals(rems[i], key) then
+                        next <- ValueNone
+
+                    i <- i + 1
+
+                i <- 0
+
+                while i < setCnt do
+                    let struct (k, v) = sets[i]
+
+                    if comparer.Equals(k, key) then
+                        next <- ValueSome v
+
+                    i <- i + 1
+
+                // Equality gate: a delta that touches the key but leaves the
+                // value unchanged marks nothing (no version bump, no parents).
+                if not (EqualityComparer<'V voption>.Default.Equals(value, next)) then
+                    value <- next
+                    version <- version + 1L
+                    GraphContext.Default.MarkFrom(edges)
+
+                // The delivery consumed every change pending at the source:
+                // re-sync so the Version getter does not report a dirty
+                // indicator for changes the gate already filtered out.
+                depVersion <- source.Version
+
+    interface IAdaptiveValue<'V voption> with
+        member this.GetValue() =
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
+
+            try
+                if disposed then
+                    invalidOp "This adaptive value has been disposed."
+
+                // Internal source reads (the init snapshot, the drain
+                // forcing below) are machinery of this node, not dependencies
+                // of the consumer: suppress collection so the caller's frame
+                // sees only this node. Without this, the whole-map
+                // dependency leaks into the consumer's frame and defeats the
+                // per-key gate.
+                let collector = ctx.Collector
+                let wasCollecting = ctx.CollectorActive
+
+                // A throwaway frame, popped and discarded below: toggling
+                // CollectorActive instead is NOT safe — a nested evaluation
+                // inside the reads would reset the collector out from under
+                // the caller's frame.
+                if wasCollecting then
+                    collector.PushFrame()
+
+                try
+                    if not initialized then
+                        // Snapshot first, register between (the MapReduceNode
+                        // pattern): a dirty source draining during the snapshot
+                        // read pushes to registered sinks only, so the snapshot
+                        // must be complete before this sink is visible.
+                        let view = source.GetValue()
+                        let mutable v = Unchecked.defaultof<'V>
+                        value <- if view.TryGetValue(key, &v) then ValueSome v else ValueNone
+                        this.Register()
+                        depVersion <- source.Version
+                        initialized <- true
+
+                    if source.Version <> depVersion then
+                        // Force the source drain: it pushes the pending output
+                        // delta, which OnDeltas applies to the cached value.
+                        source.GetValue() |> ignore
+                        depVersion <- source.Version
+                finally
+                    if wasCollecting then
+                        collector.PopFrame() |> ignore
+
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                value
+            finally
+                ctx.ReleaseOwner()
+
+        member this.Version =
+            // Dirty indicator (the ExternalValueNode pattern): while the
+            // source has unprocessed changes, report version + 1 so
+            // version-checking consumers re-read exactly once; the drain at
+            // GetValue applies the gate and decides the real version. This
+            // covers derived sources, whose output delta is computed lazily
+            // at drain time (pull-lazy): the gate cannot run at write time
+            // because the delta does not exist yet.
+            if source.Version <> depVersion then
+                version + 1L
+            else
+                version
+
+    interface IEdgeTarget with
+        member _.EdgeCount = edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                this.Unregister()
+
+/// <summary>
+/// An incremental count over an adaptive map, projected through
+/// <paramref name="view"/> (the node behind <c>AMap.count</c> with
+/// <c>id</c> and <c>AMap.isEmpty</c> with <c>fun c -&gt; c = 0</c>). Registers
+/// as a delta sink and maintains the count per delta (O(delta)); the node
+/// marks its parents only when the projected output changed, so an update of
+/// an existing key (no count change) or a count change that the projection
+/// collapses (2 -&gt; 3 under isEmpty) costs this node and its parents
+/// nothing.
+/// </summary>
+/// <remarks>
+/// Keeps a mirror of the present keys: a map delta does not distinguish a Set
+/// on a new key from an update of an existing one, but only the former moves
+/// the count.
+/// </remarks>
+type MapCountNode<'K, 'V, 'Out when 'K: equality>(source: IAdaptiveMap<'K, 'V>, [<InlineIfLambda>] view: int -> 'Out) =
+    let mutable version = 0L
+    let edges = ParentEdges()
+    let mutable depVersion = 0L
+    let mutable initialized = false
+    let mutable disposed = false
+    let mirror = HashSet<'K>()
+    let mutable count = 0
+    let mutable out = Unchecked.defaultof<'Out>
+
+    member private this.Register() =
+        match box source with
+        | :? IMapSinkRegistry as r -> r.AddMapSink(box (this :> IMapDeltaSink<'K, 'V>))
+        | _ -> ()
+
+    member private this.Unregister() =
+        match box source with
+        | :? IMapSinkRegistry as r -> r.RemoveMapSink(box (this :> IMapDeltaSink<'K, 'V>))
+        | _ -> ()
+
+    interface IMapDeltaSink<'K, 'V> with
+        member this.OnDeltas(sets: struct ('K * 'V)[], setCnt: int, rems: 'K[], remCnt: int) =
+            if not disposed then
+                let mutable c = count
+                let mutable i = 0
+
+                while i < setCnt do
+                    let struct (k, _) = sets[i]
+
+                    if mirror.Add k then
+                        c <- c + 1
+
+                    i <- i + 1
+
+                i <- 0
+
+                while i < remCnt do
+                    if mirror.Remove rems[i] then
+                        c <- c - 1
+
+                    i <- i + 1
+
+                if c <> count then
+                    count <- c
+                    let nextOut = view c
+
+                    // Output gate: the count moved, but the projection may
+                    // not (isEmpty above 1). Mark only when the output moved.
+                    if not (EqualityComparer<'Out>.Default.Equals(out, nextOut)) then
+                        out <- nextOut
+                        version <- version + 1L
+                        GraphContext.Default.MarkFrom(edges)
+
+                // Re-sync after the delivery (see MapLookupNode).
+                depVersion <- source.Version
+
+    interface IAdaptiveValue<'Out> with
+        member this.GetValue() =
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
+
+            try
+                if disposed then
+                    invalidOp "This adaptive value has been disposed."
+
+                // Internal source reads are machinery of this node, not
+                // dependencies of the consumer (see MapLookupNode.GetValue).
+                let collector = ctx.Collector
+                let wasCollecting = ctx.CollectorActive
+
+                // A throwaway frame, popped and discarded below: toggling
+                // CollectorActive instead is NOT safe — a nested evaluation
+                // inside the reads would reset the collector out from under
+                // the caller's frame.
+                if wasCollecting then
+                    collector.PushFrame()
+
+                try
+                    if not initialized then
+                        // Snapshot first, register between (the MapLookupNode
+                        // pattern).
+                        let data = Collections.asDictionary (source.GetValue())
+
+                        for KeyValue(k, _) in data do
+                            mirror.Add k |> ignore
+
+                        count <- data.Count
+                        out <- view count
+                        this.Register()
+                        depVersion <- source.Version
+                        initialized <- true
+
+                    if source.Version <> depVersion then
+                        source.GetValue() |> ignore
+                        depVersion <- source.Version
+                finally
+                    if wasCollecting then
+                        collector.PopFrame() |> ignore
+
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                out
+            finally
+                ctx.ReleaseOwner()
+
+        member this.Version =
+            // Dirty indicator (see MapLookupNode.Version).
+            if source.Version <> depVersion then
+                version + 1L
+            else
+                version
+
+    interface IEdgeTarget with
+        member _.EdgeCount = edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                this.Unregister()
+                mirror.Clear()

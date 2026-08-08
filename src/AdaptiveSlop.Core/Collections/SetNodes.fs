@@ -1077,3 +1077,255 @@ type MapUseSetNode<'A, 'B when 'A: equality and 'B: equality and 'B :> IDisposab
         member _.EdgeCount = state.Edges.Count
         member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
         member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
+
+// =============================================================================
+// Scalar escape hatches: per-element contains and incremental count.
+//
+// Delta-sink scalar nodes (the SetReduceNode pattern): a delta is scanned for
+// the watched element (O(delta)), and the node marks its parents only when
+// its own output value actually changed. A write to an unrelated element
+// costs the node and its parents nothing — the per-element precision that the
+// plain AdaptiveNode-over-GetValue pattern cannot express.
+// =============================================================================
+
+/// <summary>
+/// A per-element membership test over an adaptive set (the node behind
+/// <c>ASet.contains</c>). Registers as a delta sink on the source; a delta
+/// marks the node only when it adds or removes the watched element. The
+/// result is applied from the delta at delivery time; reads are O(1).
+/// </summary>
+/// <remarks>
+/// Application order inside one delta matches <c>SetReduceNode.Drain</c>:
+/// removals first, then additions.
+/// </remarks>
+type SetContainsNode<'T when 'T: equality>(source: IAdaptiveSet<'T>, element: 'T) =
+    let mutable version = 0L
+    let edges = ParentEdges()
+    let mutable depVersion = 0L
+    let mutable initialized = false
+    let mutable disposed = false
+    let mutable present = false
+
+    member private this.Register() =
+        match box source with
+        | :? ISetSinkRegistry as r -> r.AddSetSink(box (this :> ISetDeltaSink<'T>))
+        | _ -> ()
+
+    member private this.Unregister() =
+        match box source with
+        | :? ISetSinkRegistry as r -> r.RemoveSetSink(box (this :> ISetDeltaSink<'T>))
+        | _ -> ()
+
+    interface ISetDeltaSink<'T> with
+        member this.OnDeltas(adds: 'T[], addCnt: int, rems: 'T[], remCnt: int) =
+            if not disposed then
+                let comparer = EqualityComparer<'T>.Default
+                let mutable next = present
+                let mutable i = 0
+
+                while i < remCnt do
+                    if comparer.Equals(rems[i], element) then
+                        next <- false
+
+                    i <- i + 1
+
+                i <- 0
+
+                while i < addCnt do
+                    if comparer.Equals(adds[i], element) then
+                        next <- true
+
+                    i <- i + 1
+
+                if next <> present then
+                    present <- next
+                    version <- version + 1L
+                    GraphContext.Default.MarkFrom(edges)
+
+                // The delivery consumed every change pending at the source:
+                // re-sync so the Version getter does not report a dirty
+                // indicator for changes the gate already filtered out.
+                depVersion <- source.Version
+
+    interface IAdaptiveValue<bool> with
+        member this.GetValue() =
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
+
+            try
+                if disposed then
+                    invalidOp "This adaptive value has been disposed."
+
+                // Internal source reads (the init snapshot, the drain
+                // forcing below) are machinery of this node, not dependencies
+                // of the consumer: suppress collection so the caller's frame
+                // sees only this node. Without this, the whole-set dependency
+                // leaks into the consumer's frame and defeats the
+                // per-element gate.
+                let collector = ctx.Collector
+                let wasCollecting = ctx.CollectorActive
+
+                // A throwaway frame, popped and discarded below: toggling
+                // CollectorActive instead is NOT safe — a nested evaluation
+                // inside the reads would reset the collector out from under
+                // the caller's frame.
+                if wasCollecting then
+                    collector.PushFrame()
+
+                try
+                    if not initialized then
+                        // Snapshot first, register between (the SetReduceNode
+                        // pattern): a dirty source draining during the snapshot
+                        // read pushes to registered sinks only.
+                        present <- source.GetValue().Contains element
+                        this.Register()
+                        depVersion <- source.Version
+                        initialized <- true
+
+                    if source.Version <> depVersion then
+                        // Force the source drain: it pushes the pending output
+                        // delta, which OnDeltas applies to the cached result.
+                        source.GetValue() |> ignore
+                        depVersion <- source.Version
+                finally
+                    if wasCollecting then
+                        collector.PopFrame() |> ignore
+
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                present
+            finally
+                ctx.ReleaseOwner()
+
+        member this.Version =
+            // Dirty indicator (the ExternalValueNode pattern): while the
+            // source has unprocessed changes, report version + 1 so
+            // version-checking consumers re-read exactly once; the drain at
+            // GetValue applies the gate and decides the real version. This
+            // covers derived sources, whose output delta is computed lazily
+            // at drain time (pull-lazy): the gate cannot run at write time
+            // because the delta does not exist yet.
+            if source.Version <> depVersion then
+                version + 1L
+            else
+                version
+
+    interface IEdgeTarget with
+        member _.EdgeCount = edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                this.Unregister()
+
+/// <summary>
+/// An incremental count over an adaptive set, projected through
+/// <paramref name="view"/> (the node behind <c>ASet.count</c> with <c>id</c>
+/// and <c>ASet.isEmpty</c> with <c>fun c -&gt; c = 0</c>). Registers as a delta
+/// sink and maintains the count per delta (O(delta)); the node marks its
+/// parents only when the projected output changed, so a count change that the
+/// projection collapses (2 -&gt; 3 under isEmpty) costs this node and its
+/// parents nothing.
+/// </summary>
+type SetCountNode<'T, 'Out when 'T: equality>(source: IAdaptiveSet<'T>, [<InlineIfLambda>] view: int -> 'Out) =
+    let mutable version = 0L
+    let edges = ParentEdges()
+    let mutable depVersion = 0L
+    let mutable initialized = false
+    let mutable disposed = false
+    let mutable count = 0
+    let mutable out = Unchecked.defaultof<'Out>
+
+    member private this.Register() =
+        match box source with
+        | :? ISetSinkRegistry as r -> r.AddSetSink(box (this :> ISetDeltaSink<'T>))
+        | _ -> ()
+
+    member private this.Unregister() =
+        match box source with
+        | :? ISetSinkRegistry as r -> r.RemoveSetSink(box (this :> ISetDeltaSink<'T>))
+        | _ -> ()
+
+    interface ISetDeltaSink<'T> with
+        member this.OnDeltas(_adds: 'T[], addCnt: int, _rems: 'T[], remCnt: int) =
+            if not disposed then
+                // Set deltas are net membership changes: every add is a new
+                // element, every rem a departed one. No mirror needed.
+                let c = count + addCnt - remCnt
+
+                if c <> count then
+                    count <- c
+                    let nextOut = view c
+
+                    // Output gate: the count moved, but the projection may
+                    // not (isEmpty above 1). Mark only when the output moved.
+                    if not (EqualityComparer<'Out>.Default.Equals(out, nextOut)) then
+                        out <- nextOut
+                        version <- version + 1L
+                        GraphContext.Default.MarkFrom(edges)
+
+                // Re-sync after the delivery (see SetContainsNode).
+                depVersion <- source.Version
+
+    interface IAdaptiveValue<'Out> with
+        member this.GetValue() =
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
+
+            try
+                if disposed then
+                    invalidOp "This adaptive value has been disposed."
+
+                // Internal source reads are machinery of this node, not
+                // dependencies of the consumer (see SetContainsNode.GetValue).
+                let collector = ctx.Collector
+                let wasCollecting = ctx.CollectorActive
+
+                // A throwaway frame, popped and discarded below: toggling
+                // CollectorActive instead is NOT safe — a nested evaluation
+                // inside the reads would reset the collector out from under
+                // the caller's frame.
+                if wasCollecting then
+                    collector.PushFrame()
+
+                try
+                    if not initialized then
+                        // Snapshot first, register between (the SetContainsNode
+                        // pattern).
+                        count <- source.GetValue().Count
+                        out <- view count
+                        this.Register()
+                        depVersion <- source.Version
+                        initialized <- true
+
+                    if source.Version <> depVersion then
+                        source.GetValue() |> ignore
+                        depVersion <- source.Version
+                finally
+                    if wasCollecting then
+                        collector.PopFrame() |> ignore
+
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                out
+            finally
+                ctx.ReleaseOwner()
+
+        member this.Version =
+            // Dirty indicator (see SetContainsNode.Version).
+            if source.Version <> depVersion then
+                version + 1L
+            else
+                version
+
+    interface IEdgeTarget with
+        member _.EdgeCount = edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                this.Unregister()

@@ -353,17 +353,26 @@ module ASet =
         : aval<'s> =
         reduce (AdaptiveReduction.halfGroup zero add trySubtract) set
 
-    /// <summary>Adaptively gets the number of elements.</summary>
-    let inline count (set: aset<'T>) : aval<int> =
-        AdaptiveNode<int>(fun () -> set.GetValue().Count)
+    /// <summary>
+    /// Adaptively gets the number of elements. Incremental: maintained per
+    /// delta, no full rescan.
+    /// </summary>
+    let inline count (set: aset<'T>) : aval<int> = new SetCountNode<'T, int>(set, id)
 
-    /// <summary>Adaptively tests if the set is empty.</summary>
+    /// <summary>
+    /// Adaptively tests if the set is empty. Incremental: only a change that
+    /// crosses the empty/non-empty boundary re-evaluates this value or its
+    /// dependents.
+    /// </summary>
     let inline isEmpty (set: aset<'T>) : aval<bool> =
-        AdaptiveNode<bool>(fun () -> set.GetValue().Count = 0)
+        new SetCountNode<'T, bool>(set, fun c -> c = 0)
 
-    /// <summary>Adaptively tests if the set contains the given element.</summary>
-    let inline contains (value: 'T) (set: aset<'T>) : aval<bool> =
-        AdaptiveNode<bool>(fun () -> set.GetValue().Contains value)
+    /// <summary>
+    /// Adaptively tests if the set contains the given element. Per-element
+    /// precise (O(1) on read): a write to an unrelated element does not
+    /// re-evaluate this value or its dependents.
+    /// </summary>
+    let inline contains (value: 'T) (set: aset<'T>) : aval<bool> = new SetContainsNode<'T>(set, value)
 
     /// <summary>Adaptively tests if any element satisfies the predicate.</summary>
     let inline exists ([<InlineIfLambda>] predicate: 'T -> bool) (set: aset<'T>) : aval<bool> =
@@ -1109,9 +1118,12 @@ module AMap =
         reduceBy (AdaptiveReduction.sum ()) mapping mapValue
 
 
-    /// <summary>Adaptively gets the number of entries.</summary>
+    /// <summary>
+    /// Adaptively gets the number of entries. Incremental: an update of an
+    /// existing key does not re-evaluate this value or its dependents.
+    /// </summary>
     let inline count (mapValue: amap<'K, 'V>) : aval<int> =
-        AdaptiveNode<int>(fun () -> mapValue.GetValue().Count)
+        new MapCountNode<'K, 'V, int>(mapValue, id)
 
     /// <summary>
     /// Adaptively averages the mapped entries (needs a numeric type with
@@ -1123,9 +1135,13 @@ module AMap =
             (reduceBy (AdaptiveReduction.sum ()) mapping mapValue)
             (count mapValue)
 
-    /// <summary>Adaptively tests if the map is empty.</summary>
+    /// <summary>
+    /// Adaptively tests if the map is empty. Incremental: only a change that
+    /// crosses the empty/non-empty boundary re-evaluates this value or its
+    /// dependents.
+    /// </summary>
     let inline isEmpty (mapValue: amap<'K, 'V>) : aval<bool> =
-        AdaptiveNode<bool>(fun () -> mapValue.GetValue().Count = 0)
+        new MapCountNode<'K, 'V, bool>(mapValue, fun c -> c = 0)
 
     /// <summary>Adaptively tests if any entry satisfies the predicate.</summary>
     let inline exists ([<InlineIfLambda>] predicate: 'K -> 'V -> bool) (mapValue: amap<'K, 'V>) : aval<bool> =
@@ -1149,29 +1165,23 @@ module AMap =
 
     /// <summary>
     /// Adaptively looks up the key: the value, or <c>ValueNone</c> when the
-    /// key is absent. The lookup is O(1) on read.
+    /// key is absent. The lookup is per-key precise (O(1) on read): a write
+    /// to an unrelated key does not re-evaluate this value or its dependents.
     /// </summary>
     let inline tryFind (key: 'K) (mapValue: amap<'K, 'V>) : aval<'V voption> =
-        AdaptiveNode<'V voption>(fun () ->
-            let view = mapValue.GetValue()
-            let mutable v = Unchecked.defaultof<'V>
-
-            if view.TryGetValue(key, &v) then ValueSome v else ValueNone)
-
+        new MapLookupNode<'K, 'V>(mapValue, key)
 
     /// <summary>
     /// Adaptively looks up the key. Reading the value throws
-    /// <see cref="KeyNotFoundException"/> when the key is absent.
+    /// <see cref="KeyNotFoundException"/> when the key is absent. Per-key
+    /// precise, like <see cref="tryFind"/>.
     /// </summary>
     let inline find (key: 'K) (mapValue: amap<'K, 'V>) : aval<'V> =
-        AdaptiveNode<'V>(fun () ->
-            let view = mapValue.GetValue()
-            let mutable v = Unchecked.defaultof<'V>
-
-            if view.TryGetValue(key, &v) then
-                v
-            else
-                raise (KeyNotFoundException(sprintf "could not get key: %A" key)))
+        tryFind key mapValue
+        |> AVal.map (fun v ->
+            match v with
+            | ValueSome value -> value
+            | ValueNone -> raise (KeyNotFoundException(sprintf "could not get key: %A" key)))
 
     /// <summary>A constant map with a single entry.</summary>
     let inline single (key: 'K) (value: 'V) : amap<'K, 'V> =
@@ -1504,13 +1514,20 @@ module AList =
     /// <summary>Materializes the array counterpart.</summary>
     let inline toArray (list: alist<'T>) : 'T[] = Seq.toArray (list.GetValue())
 
-    /// <summary>Adaptively gets the number of elements.</summary>
-    let inline count (list: alist<'T>) : aval<int> =
-        AdaptiveNode<int>(fun () -> list.GetValue().Count)
+    /// <summary>
+    /// Adaptively gets the number of elements. Incremental: maintained per
+    /// delta, no full rescan; an update does not re-evaluate this value or
+    /// its dependents.
+    /// </summary>
+    let inline count (list: alist<'T>) : aval<int> = new ListCountNode<'T, int>(list, id)
 
-    /// <summary>Adaptively tests if the list is empty.</summary>
+    /// <summary>
+    /// Adaptively tests if the list is empty. Incremental: only a change that
+    /// crosses the empty/non-empty boundary re-evaluates this value or its
+    /// dependents.
+    /// </summary>
     let inline isEmpty (list: alist<'T>) : aval<bool> =
-        AdaptiveNode<bool>(fun () -> list.GetValue().Count = 0)
+        new ListCountNode<'T, bool>(list, fun c -> c = 0)
 
     /// <summary>
     /// Adaptively reduces the list with the given <see cref="AdaptiveReduction"/>
@@ -1640,36 +1657,30 @@ module AList =
     /// <summary>
     /// Adaptively looks up the element at the given position (FDA
     /// <c>AList.tryAt</c> parity; the position is the <c>int</c> input
-    /// position, the positional deviation).
+    /// position, the positional deviation). Per-position precise (O(1) on
+    /// read): an op that does not touch the position (an insert or remove
+    /// after it, an update elsewhere) does not re-evaluate this value or its
+    /// dependents.
     /// </summary>
-    let inline tryAt (index: int) (list: alist<'T>) : aval<'T voption> =
-        AdaptiveNode(fun () ->
-            let view = list.GetValue()
-
-            if index >= 0 && index < view.Count then
-                ValueSome view[index]
-            else
-                ValueNone)
+    let inline tryAt (index: int) (list: alist<'T>) : aval<'T voption> = new ListLookupNode<'T>(list, index)
 
     /// <summary>Alias of <see cref="tryAt"/> (FDA parity name; both take the <c>int</c> position).</summary>
     let inline tryGet (index: int) (list: alist<'T>) : aval<'T voption> = tryAt index list
 
-    /// <summary>Adaptively gets the first element, or <c>ValueNone</c> when empty (FDA <c>AList.tryFirst</c> parity).</summary>
-    let inline tryFirst (list: alist<'T>) : aval<'T voption> =
-        AdaptiveNode(fun () ->
-            let view = list.GetValue()
+    /// <summary>
+    /// Adaptively gets the first element, or <c>ValueNone</c> when empty (FDA
+    /// <c>AList.tryFirst</c> parity). Per-position precise, like
+    /// <see cref="tryAt"/>.
+    /// </summary>
+    let inline tryFirst (list: alist<'T>) : aval<'T voption> = new ListLookupNode<'T>(list, 0)
 
-            if view.Count > 0 then ValueSome view[0] else ValueNone)
-
-    /// <summary>Adaptively gets the last element, or <c>ValueNone</c> when empty (FDA <c>AList.tryLast</c> parity).</summary>
-    let inline tryLast (list: alist<'T>) : aval<'T voption> =
-        AdaptiveNode(fun () ->
-            let view = list.GetValue()
-
-            if view.Count > 0 then
-                ValueSome view[view.Count - 1]
-            else
-                ValueNone)
+    /// <summary>
+    /// Adaptively gets the last element, or <c>ValueNone</c> when empty (FDA
+    /// <c>AList.tryLast</c> parity). Per-position precise: only an op that
+    /// changes the last element (append, remove or update of the last
+    /// element) re-evaluates this value or its dependents.
+    /// </summary>
+    let inline tryLast (list: alist<'T>) : aval<'T voption> = new ListLastNode<'T>(list)
 
     /// <summary>
     /// Materializes the list as an adaptive value. Every change materializes a

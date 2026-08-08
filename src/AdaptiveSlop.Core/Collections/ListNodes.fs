@@ -1289,3 +1289,425 @@ type MapUseListNode<'T, 'W when 'W: equality and 'W :> IDisposable>
         member _.EdgeCount = edges.Count
         member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
         member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
+
+// =============================================================================
+// Scalar escape hatches: positional lookup and incremental count.
+//
+// Delta-sink scalar nodes (the ListReduceNode pattern): an op affects a fixed
+// watched position i when it inserts/removes at p &lt;= i (the position shifts)
+// or updates at p = i. The node marks its parents only when an op affects the
+// watched position; the value itself is re-read lazily on the next read (O(1),
+// pull-lazy). Ops on unrelated positions cost the node and its parents
+// nothing.
+// =============================================================================
+
+/// <summary>
+/// A positional lookup over an adaptive list (the node behind
+/// <c>AList.tryAt</c>/<c>AList.tryGet</c>/<c>AList.tryFirst</c>). Registers as
+/// a delta sink on the source; a delta marks the node only when an op touches
+/// the watched position (insert/remove at p &lt;= index, update at p = index).
+/// The value is re-read from the source view on the next read (O(1)).
+/// </summary>
+type ListLookupNode<'T>(source: IAdaptiveList<'T>, index: int) =
+    let mutable version = 0L
+    let edges = ParentEdges()
+    let mutable depVersion = 0L
+    let mutable initialized = false
+    let mutable disposed = false
+    let mutable value = ValueNone
+    // An affecting op landed: the cached value is stale and must be re-read
+    // on the next GetValue. Tracked apart from depVersion: OnDeltas re-syncs
+    // depVersion at delivery (so the dirty indicator stays precise for
+    // non-affecting ops), which the version check alone cannot distinguish.
+    let mutable stale = false
+
+    member private this.ReadView() =
+        let view = source.GetValue()
+
+        value <-
+            if index >= 0 && index < view.Count then
+                ValueSome view[index]
+            else
+                ValueNone
+
+    member private this.Register() =
+        match box source with
+        | :? IListSinkRegistry as r -> r.AddListSink(box (this :> IListDeltaSink<'T>))
+        | _ -> ()
+
+    member private this.Unregister() =
+        match box source with
+        | :? IListSinkRegistry as r -> r.RemoveListSink(box (this :> IListDeltaSink<'T>))
+        | _ -> ()
+
+    interface IListDeltaSink<'T> with
+        member this.OnDeltas(ops: ListOp<'T>[], opCnt: int) =
+            if not disposed then
+                let mutable affected = false
+                let mutable i = 0
+
+                while not affected && i < opCnt do
+                    let op = ops[i]
+
+                    match op.Kind with
+                    | ListOpKind.Insert
+                    | ListOpKind.Remove ->
+                        if op.Position <= index then
+                            affected <- true
+                    | _ -> // Update (Clear is never delivered)
+                        if op.Position = index then
+                            affected <- true
+
+                    i <- i + 1
+
+                if affected then
+                    stale <- true
+                    version <- version + 1L
+                    GraphContext.Default.MarkFrom(edges)
+
+                // The delivery consumed every change pending at the source:
+                // re-sync so the Version getter does not report a dirty
+                // indicator for changes the gate already filtered out.
+                depVersion <- source.Version
+
+    interface IAdaptiveValue<'T voption> with
+        member this.GetValue() =
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
+
+            try
+                if disposed then
+                    invalidOp "This adaptive value has been disposed."
+
+                // Internal source reads (the init snapshot, the drain
+                // forcing below) are machinery of this node, not dependencies
+                // of the consumer: suppress collection so the caller's frame
+                // sees only this node. Without this, the whole-list
+                // dependency leaks into the consumer's frame and defeats the
+                // per-position gate.
+                let collector = ctx.Collector
+                let wasCollecting = ctx.CollectorActive
+
+                // A throwaway frame, popped and discarded below: toggling
+                // CollectorActive instead is NOT safe — a nested evaluation
+                // inside the reads would reset the collector out from under
+                // the caller's frame.
+                if wasCollecting then
+                    collector.PushFrame()
+
+                try
+                    if not initialized then
+                        // Snapshot first, register between (the ListReduceNode
+                        // pattern): a dirty source draining during the snapshot
+                        // read pushes to registered sinks only.
+                        this.ReadView()
+                        this.Register()
+                        depVersion <- source.Version
+                        initialized <- true
+
+                    if source.Version <> depVersion then
+                        // Force the source drain and re-read the position.
+                        this.ReadView()
+                        depVersion <- source.Version
+                        stale <- false
+
+                    if stale then
+                        // An affecting op landed since the last read (the
+                        // delivery re-synced depVersion, so the version
+                        // check above cannot see it).
+                        this.ReadView()
+                        stale <- false
+                finally
+                    if wasCollecting then
+                        collector.PopFrame() |> ignore
+
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                value
+            finally
+                ctx.ReleaseOwner()
+
+        member this.Version =
+            // Dirty indicator (the ExternalValueNode pattern): while the
+            // source has unprocessed changes, report version + 1 so
+            // version-checking consumers re-read exactly once; the drain at
+            // GetValue applies the gate and decides the real version. This
+            // covers derived sources, whose output delta is computed lazily
+            // at drain time (pull-lazy): the gate cannot run at write time
+            // because the delta does not exist yet.
+            if source.Version <> depVersion then
+                version + 1L
+            else
+                version
+
+    interface IEdgeTarget with
+        member _.EdgeCount = edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                this.Unregister()
+
+/// <summary>
+/// A last-element lookup over an adaptive list (the node behind
+/// <c>AList.tryLast</c>). Registers as a delta sink on the source and tracks
+/// the element count per op; a delta marks the node only when it changes the
+/// last element: an append (insert at p = count), a remove of the last
+/// element, or an update of the last element. An insert or remove elsewhere
+/// shifts positions but leaves the last element untouched, so it marks
+/// nothing. The value is re-read from the source view on the next read (O(1)).
+/// </summary>
+type ListLastNode<'T>(source: IAdaptiveList<'T>) =
+    let mutable version = 0L
+    let edges = ParentEdges()
+    let mutable depVersion = 0L
+    let mutable initialized = false
+    let mutable disposed = false
+    let mutable count = 0
+    let mutable value = ValueNone
+    // An affecting op landed: re-read on the next GetValue (see
+    // ListLookupNode for why this is separate from depVersion).
+    let mutable stale = false
+
+    member private this.ReadView() =
+        let view = source.GetValue()
+
+        value <-
+            if view.Count > 0 then
+                ValueSome view[view.Count - 1]
+            else
+                ValueNone
+
+    member private this.Register() =
+        match box source with
+        | :? IListSinkRegistry as r -> r.AddListSink(box (this :> IListDeltaSink<'T>))
+        | _ -> ()
+
+    member private this.Unregister() =
+        match box source with
+        | :? IListSinkRegistry as r -> r.RemoveListSink(box (this :> IListDeltaSink<'T>))
+        | _ -> ()
+
+    interface IListDeltaSink<'T> with
+        member this.OnDeltas(ops: ListOp<'T>[], opCnt: int) =
+            if not disposed then
+                // Positions refer to the state as of the previous op, so the
+                // running count tracks the ops in order.
+                let mutable c = count
+                let mutable affected = false
+                let mutable i = 0
+
+                while i < opCnt do
+                    let op = ops[i]
+
+                    match op.Kind with
+                    | ListOpKind.Insert ->
+                        if op.Position = c then
+                            affected <- true
+
+                        c <- c + 1
+                    | ListOpKind.Remove ->
+                        if op.Position = c - 1 then
+                            affected <- true
+
+                        c <- c - 1
+                    | _ -> // Update (Clear is never delivered)
+                        if op.Position = c - 1 then
+                            affected <- true
+
+                    i <- i + 1
+
+                count <- c
+
+                if affected then
+                    stale <- true
+                    version <- version + 1L
+                    GraphContext.Default.MarkFrom(edges)
+
+                // Re-sync after the delivery (see ListLookupNode).
+                depVersion <- source.Version
+
+    interface IAdaptiveValue<'T voption> with
+        member this.GetValue() =
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
+
+            try
+                if disposed then
+                    invalidOp "This adaptive value has been disposed."
+
+                // Internal source reads are machinery of this node, not
+                // dependencies of the consumer (see ListLookupNode.GetValue).
+                let collector = ctx.Collector
+                let wasCollecting = ctx.CollectorActive
+
+                // A throwaway frame, popped and discarded below: toggling
+                // CollectorActive instead is NOT safe — a nested evaluation
+                // inside the reads would reset the collector out from under
+                // the caller's frame.
+                if wasCollecting then
+                    collector.PushFrame()
+
+                try
+                    if not initialized then
+                        // Snapshot first, register between (the ListLookupNode
+                        // pattern).
+                        this.ReadView()
+                        count <- source.GetValue().Count
+                        this.Register()
+                        depVersion <- source.Version
+                        initialized <- true
+
+                    if source.Version <> depVersion then
+                        this.ReadView()
+                        depVersion <- source.Version
+                        stale <- false
+
+                    if stale then
+                        this.ReadView()
+                        stale <- false
+                finally
+                    if wasCollecting then
+                        collector.PopFrame() |> ignore
+
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                value
+            finally
+                ctx.ReleaseOwner()
+
+        member this.Version =
+            // Dirty indicator (see ListLookupNode.Version).
+            if source.Version <> depVersion then
+                version + 1L
+            else
+                version
+
+    interface IEdgeTarget with
+        member _.EdgeCount = edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                this.Unregister()
+
+/// <summary>
+/// An incremental count over an adaptive list, projected through
+/// <paramref name="view"/> (the node behind <c>AList.count</c> with <c>id</c>
+/// and <c>AList.isEmpty</c> with <c>fun c -&gt; c = 0</c>). Registers as a
+/// delta sink and maintains the count per op (O(delta)); the node marks its
+/// parents only when the projected output changed, so an update (no count
+/// change) or a count change that the projection collapses (2 -&gt; 3 under
+/// isEmpty) costs this node and its parents nothing.
+/// </summary>
+type ListCountNode<'T, 'Out>(source: IAdaptiveList<'T>, [<InlineIfLambda>] view: int -> 'Out) =
+    let mutable version = 0L
+    let edges = ParentEdges()
+    let mutable depVersion = 0L
+    let mutable initialized = false
+    let mutable disposed = false
+    let mutable count = 0
+    let mutable out = Unchecked.defaultof<'Out>
+
+    member private this.Register() =
+        match box source with
+        | :? IListSinkRegistry as r -> r.AddListSink(box (this :> IListDeltaSink<'T>))
+        | _ -> ()
+
+    member private this.Unregister() =
+        match box source with
+        | :? IListSinkRegistry as r -> r.RemoveListSink(box (this :> IListDeltaSink<'T>))
+        | _ -> ()
+
+    interface IListDeltaSink<'T> with
+        member this.OnDeltas(ops: ListOp<'T>[], opCnt: int) =
+            if not disposed then
+                let mutable c = count
+                let mutable i = 0
+
+                while i < opCnt do
+                    match ops[i].Kind with
+                    | ListOpKind.Insert -> c <- c + 1
+                    | ListOpKind.Remove -> c <- c - 1
+                    | _ -> ()
+
+                    i <- i + 1
+
+                if c <> count then
+                    count <- c
+                    let nextOut = view c
+
+                    // Output gate: the count moved, but the projection may
+                    // not (isEmpty above 1). Mark only when the output moved.
+                    if not (EqualityComparer<'Out>.Default.Equals(out, nextOut)) then
+                        out <- nextOut
+                        version <- version + 1L
+                        GraphContext.Default.MarkFrom(edges)
+
+                // Re-sync after the delivery (see ListLookupNode).
+                depVersion <- source.Version
+
+    interface IAdaptiveValue<'Out> with
+        member this.GetValue() =
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
+
+            try
+                if disposed then
+                    invalidOp "This adaptive value has been disposed."
+
+                // Internal source reads are machinery of this node, not
+                // dependencies of the consumer (see ListLookupNode.GetValue).
+                let collector = ctx.Collector
+                let wasCollecting = ctx.CollectorActive
+
+                // A throwaway frame, popped and discarded below: toggling
+                // CollectorActive instead is NOT safe — a nested evaluation
+                // inside the reads would reset the collector out from under
+                // the caller's frame.
+                if wasCollecting then
+                    collector.PushFrame()
+
+                try
+                    if not initialized then
+                        // Snapshot first, register between (the ListLookupNode
+                        // pattern).
+                        count <- source.GetValue().Count
+                        out <- view count
+                        this.Register()
+                        depVersion <- source.Version
+                        initialized <- true
+
+                    if source.Version <> depVersion then
+                        source.GetValue() |> ignore
+                        depVersion <- source.Version
+                finally
+                    if wasCollecting then
+                        collector.PopFrame() |> ignore
+
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                out
+            finally
+                ctx.ReleaseOwner()
+
+        member this.Version =
+            // Dirty indicator (see ListLookupNode.Version).
+            if source.Version <> depVersion then
+                version + 1L
+            else
+                version
+
+    interface IEdgeTarget with
+        member _.EdgeCount = edges.Count
+        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
+        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                this.Unregister()
