@@ -51,6 +51,10 @@ type ExternalSetNode<'T when 'T: equality>([<InlineIfLambda>] snapshot: unit -> 
         if Environment.CurrentManagedThreadId = ownerThread then
             dirty <- true
             ctx.MarkFrom state.Edges
+            // Wake the pull-lazy sinks (scalar escapes, derived nodes): their
+            // output delta does not exist until the next read's Poll, but
+            // observed branches must be marked at invalidate time (IWakeSink).
+            Collections.wakeSinks &state.Sinks
         else if Interlocked.CompareExchange(&posted, 1, 0) = 0 then
             ctx.PostRing.Enqueue(this :> obj)
 
@@ -133,6 +137,8 @@ type ExternalMapNode<'K, 'V when 'K: equality>([<InlineIfLambda>] snapshot: unit
         if Environment.CurrentManagedThreadId = ownerThread then
             dirty <- true
             ctx.MarkFrom state.Edges
+            // Wake the pull-lazy sinks (see ExternalSetNode.Invalidate).
+            Collections.wakeSinks &state.Sinks
         else if Interlocked.CompareExchange(&posted, 1, 0) = 0 then
             ctx.PostRing.Enqueue(this :> obj)
 
@@ -216,6 +222,8 @@ type ExternalListNode<'T when 'T: equality>([<InlineIfLambda>] snapshot: unit ->
         if Environment.CurrentManagedThreadId = ownerThread then
             dirty <- true
             ctx.MarkFrom edges
+            // Wake the pull-lazy sinks (see ExternalSetNode.Invalidate).
+            Collections.wakeSinks &sinks
         else if Interlocked.CompareExchange(&posted, 1, 0) = 0 then
             ctx.PostRing.Enqueue(this :> obj)
 

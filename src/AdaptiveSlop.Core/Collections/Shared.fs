@@ -120,8 +120,17 @@ type internal DeltaBuffer<'T> =
 type SetDelta<'T> =
     val mutable internal Adds: DeltaBuffer<'T>
     val mutable internal Rems: DeltaBuffer<'T>
+    // Shared in-drain flag (a one-slot array: the drains work on struct
+    // copies, so a plain field would not be visible to reentrant appends).
+    // Nonzero while a drain is replaying this journal; the append-time
+    // cross-kind coalescing (see journalAppendSet) is suspended then, so it
+    // can never remove an entry the in-flight drain is about to process.
+    val mutable internal InDrain: int[]
 
-    internal new(adds: DeltaBuffer<'T>, rems: DeltaBuffer<'T>) = { Adds = adds; Rems = rems }
+    internal new(adds: DeltaBuffer<'T>, rems: DeltaBuffer<'T>) =
+        { Adds = adds
+          Rems = rems
+          InDrain = Array.zeroCreate 1 }
 
     static member internal Create() =
         SetDelta(DeltaBuffer<_>.Create(), DeltaBuffer<_>.Create())
@@ -214,8 +223,13 @@ type SetDeltaBuilder<'T>() =
 type MapDelta<'K, 'V> =
     val mutable internal Sets: DeltaBuffer<struct ('K * 'V)>
     val mutable internal Rems: DeltaBuffer<'K>
+    // Shared in-drain flag; see SetDelta.InDrain.
+    val mutable internal InDrain: int[]
 
-    internal new(sets: DeltaBuffer<struct ('K * 'V)>, rems: DeltaBuffer<'K>) = { Sets = sets; Rems = rems }
+    internal new(sets: DeltaBuffer<struct ('K * 'V)>, rems: DeltaBuffer<'K>) =
+        { Sets = sets
+          Rems = rems
+          InDrain = Array.zeroCreate 1 }
 
     static member internal Create() =
         MapDelta(DeltaBuffer<_>.Create(), DeltaBuffer<_>.Create())
@@ -418,6 +432,19 @@ type internal IListSinkRegistry =
     abstract member RemoveListSink: sink: obj -> unit
 
 /// <summary>
+/// Internal. A sink that must be woken at write time, before its source's
+/// output delta exists. Implemented by the derived collection nodes (which
+/// propagate the wake up the chain) and by the per-key/per-position scalar
+/// escape nodes (which conservatively mark their parents and re-check at the
+/// next read). Pull-lazy sources deliver their output delta only at drain
+/// time, so a version check alone cannot wake an observed branch; the wake
+/// restores the write-time mark path without evaluating anything (invariant
+/// 3: the gate still runs at the next read).
+/// </summary>
+type internal IWakeSink =
+    abstract member OnWake: unit -> unit
+
+/// <summary>
 /// Registered consumers of a collection node. Passed by value to the push
 /// operations, so reentrant sink growth during delivery is safe.
 /// </summary>
@@ -602,23 +629,171 @@ module internal Collections =
             buffer.Items[buffer.Count] <- item
             DeltaBuffer(buffer.Items, buffer.Count + 1)
 
+    /// Drop the entries of <paramref name="buffer" /> whose key appears in
+    /// <paramref name="keys" />, preserving order (shift-compact, one pass).
+    /// Linear scan for small products (zero allocation); a hash set above the
+    /// threshold. The caller guarantees no drain is in flight, so every entry
+    /// in the buffer is quiescent and removable.
+    let coalesceDeltaKeys<'T, 'S, 'K when 'K: equality>
+        (keyOfItem: 'T -> 'K)
+        (keyOfKey: 'S -> 'K)
+        (buffer: DeltaBuffer<'T> byref)
+        (keys: 'S[])
+        (keyCnt: int)
+        =
+        if keyCnt > 0 && buffer.Count > 0 then
+            let comparer = EqualityComparer<'K>.Default
+            let mutable w = 0
+
+            if int64 keyCnt * int64 buffer.Count <= 4096L then
+                for r in 0 .. buffer.Count - 1 do
+                    let item = buffer.Items[r]
+                    let key = keyOfItem item
+                    let mutable found = false
+                    let mutable j = 0
+
+                    while not found && j < keyCnt do
+                        if comparer.Equals(key, keyOfKey keys[j]) then
+                            found <- true
+
+                        j <- j + 1
+
+                    if not found then
+                        buffer.Items[w] <- item
+                        w <- w + 1
+            else
+                let keySet = HashSet<'K>()
+
+                for j in 0 .. keyCnt - 1 do
+                    keySet.Add(keyOfKey keys[j]) |> ignore
+
+                for r in 0 .. buffer.Count - 1 do
+                    let item = buffer.Items[r]
+
+                    if not (keySet.Contains(keyOfItem item)) then
+                        buffer.Items[w] <- item
+                        w <- w + 1
+
+            buffer.Count <- w
+
+    /// Cancel cross-kind duplicates between a journal buffer and an incoming
+    /// batch: an incoming entry with a pending opposite-kind entry of the
+    /// same key drops BOTH (the element never left the derived state, so
+    /// replaying the survivor alone would double its refcount and
+    /// double-count a reduction). The pending buffer is compacted in place
+    /// and the surviving incoming entries are appended to
+    /// <paramref name="target" />. Linear for small products (zero
+    /// allocation); hash sets above the threshold. The caller guarantees no
+    /// drain is in flight (the InDrain flag).
+    let cancelCrossKind<'T when 'T: equality>
+        (pending: DeltaBuffer<'T> byref)
+        (incoming: 'T[])
+        (incomingCnt: int)
+        (target: DeltaBuffer<'T> byref)
+        =
+        if incomingCnt > 0 then
+            if pending.Count = 0 then
+                ensureCapacity &target.Items (target.Count + incomingCnt)
+                Array.Copy(incoming, 0, target.Items, target.Count, incomingCnt)
+                target.Count <- target.Count + incomingCnt
+            elif int64 incomingCnt * int64 pending.Count <= 4096L then
+                let comparer = EqualityComparer<'T>.Default
+                ensureCapacity &target.Items (target.Count + incomingCnt)
+                let mutable tw = target.Count
+
+                for i in 0 .. incomingCnt - 1 do
+                    let x = incoming[i]
+                    let mutable found = -1
+                    let mutable j = 0
+
+                    while found < 0 && j < pending.Count do
+                        if comparer.Equals(pending.Items[j], x) then
+                            found <- j
+
+                        j <- j + 1
+
+                    if found >= 0 then
+                        for k in found .. pending.Count - 2 do
+                            pending.Items[k] <- pending.Items[k + 1]
+
+                        pending.Count <- pending.Count - 1
+                    else
+                        target.Items[tw] <- x
+                        tw <- tw + 1
+
+                target.Count <- tw
+            else
+                let pendingKeys = HashSet<'T>()
+                let incomingKeys = HashSet<'T>()
+
+                for j in 0 .. pending.Count - 1 do
+                    pendingKeys.Add(pending.Items[j]) |> ignore
+
+                for i in 0 .. incomingCnt - 1 do
+                    incomingKeys.Add(incoming[i]) |> ignore
+
+                let mutable w = 0
+
+                for j in 0 .. pending.Count - 1 do
+                    let item = pending.Items[j]
+
+                    if not (incomingKeys.Contains item) then
+                        pending.Items[w] <- item
+                        w <- w + 1
+
+                pending.Count <- w
+                ensureCapacity &target.Items (target.Count + incomingCnt)
+                let mutable tw = target.Count
+
+                for i in 0 .. incomingCnt - 1 do
+                    let x = incoming[i]
+
+                    if not (pendingKeys.Contains x) then
+                        target.Items[tw] <- x
+                        tw <- tw + 1
+
+                target.Count <- tw
+
     /// Append a delta to a set journal (called at write time by the pusher).
-    let journalAppendSet (journal: SetDelta<'T> byref) (adds: 'T[]) (addCnt: int) (rems: 'T[]) (remCnt: int) =
-        ensureCapacity &journal.Adds.Items (journal.Adds.Count + addCnt)
-        Array.Copy(adds, 0, journal.Adds.Items, journal.Adds.Count, addCnt)
-        journal.Adds.Count <- journal.Adds.Count + addCnt
-        ensureCapacity &journal.Rems.Items (journal.Rems.Count + remCnt)
-        Array.Copy(rems, 0, journal.Rems.Items, journal.Rems.Count, remCnt)
-        journal.Rems.Count <- journal.Rems.Count + remCnt
+    /// Cross-kind duplicates are cancelled first (an add cancels a pending
+    /// rem of the same element and vice versa; arrival order = append order):
+    /// without this the journal can hold [add x, rem x] across two deliveries
+    /// with no drain between, and the drain replays rems before adds
+    /// regardless of arrival order, leaving x present although the source
+    /// removed it. Suspended while a drain is in flight (the InDrain flag):
+    /// the drain works on a struct copy, so a removal then could shift
+    /// entries under its captured indexes and double-process them.
+    let journalAppendSet<'T when 'T: equality>
+        (journal: SetDelta<'T> byref)
+        (adds: 'T[])
+        (addCnt: int)
+        (rems: 'T[])
+        (remCnt: int)
+        =
+        if journal.InDrain[0] = 0 then
+            cancelCrossKind &journal.Rems adds addCnt &journal.Adds
+            cancelCrossKind &journal.Adds rems remCnt &journal.Rems
+        else
+            ensureCapacity &journal.Adds.Items (journal.Adds.Count + addCnt)
+            Array.Copy(adds, 0, journal.Adds.Items, journal.Adds.Count, addCnt)
+            journal.Adds.Count <- journal.Adds.Count + addCnt
+            ensureCapacity &journal.Rems.Items (journal.Rems.Count + remCnt)
+            Array.Copy(rems, 0, journal.Rems.Items, journal.Rems.Count, remCnt)
+            journal.Rems.Count <- journal.Rems.Count + remCnt
 
     /// Append a delta to a map journal (called at write time by the pusher).
-    let journalAppendMap
+    /// Cross-kind duplicates are coalesced first (see journalAppendSet).
+    let journalAppendMap<'K, 'V when 'K: equality>
         (journal: MapDelta<'K, 'V> byref)
         (sets: struct ('K * 'V)[])
         (setCnt: int)
         (rems: 'K[])
         (remCnt: int)
         =
+        if journal.InDrain[0] = 0 then
+            coalesceDeltaKeys id (fun (struct (k, _)) -> k) &journal.Rems sets setCnt
+            coalesceDeltaKeys (fun (struct (k, _)) -> k) id &journal.Sets rems remCnt
+
         ensureCapacity &journal.Sets.Items (journal.Sets.Count + setCnt)
         Array.Copy(sets, 0, journal.Sets.Items, journal.Sets.Count, setCnt)
         journal.Sets.Count <- journal.Sets.Count + setCnt
@@ -711,6 +886,25 @@ module internal Collections =
                 struct (state, false)
         else
             struct (state, false)
+
+    /// Wake every registered IWakeSink at write time (the scalar-escape and
+    /// derived-node wake channel; see <see cref="IWakeSink"/>). Dead entries
+    /// are skipped (compacted by the next delivery). No evaluation happens
+    /// here: the woken sinks only mark and set a stale flag, and the gate
+    /// runs at the next read's drain.
+    let wakeSinks (sinks: SinkList byref) =
+        let bound = sinks.Count
+        let mutable i = 0
+
+        while i < bound do
+            let target = sinks.Sinks[i].Target
+
+            match target with
+            | null -> ()
+            | :? IWakeSink as w -> w.OnWake()
+            | _ -> ()
+
+            i <- i + 1
 
     /// Push a set delta to every registered sink. The batch delivers only to
     /// the sinks registered at the start (bound captured): a sink registered
@@ -1083,6 +1277,10 @@ module internal Collections =
         let ctx = GraphContext.Current
         let wasActive = ctx.TxActive
         ctx.TxActive <- true
+        // Suspend the append-time coalescing while the journal is replayed:
+        // the drain works on a struct copy, and a removal from the real
+        // journal could shift entries under the copy's captured indexes.
+        state.Journal.InDrain[0] <- 1
 
         try
             let struct (s2, changed) = drainRefSet map state
@@ -1092,6 +1290,7 @@ module internal Collections =
                 pushSetDelta &state.Sinks state.Out
                 state.Out.Clear()
         finally
+            state.Journal.InDrain[0] <- 0
             ctx.TxActive <- wasActive
 
         if not wasActive then
@@ -1102,6 +1301,7 @@ module internal Collections =
         let ctx = GraphContext.Current
         let wasActive = ctx.TxActive
         ctx.TxActive <- true
+        state.Journal.InDrain[0] <- 1
 
         try
             let struct (s2, changed) = drainPlainSet map state
@@ -1111,6 +1311,7 @@ module internal Collections =
                 pushSetDelta &state.Sinks state.Out
                 state.Out.Clear()
         finally
+            state.Journal.InDrain[0] <- 0
             ctx.TxActive <- wasActive
 
         if not wasActive then
@@ -1122,6 +1323,7 @@ module internal Collections =
         let ctx = GraphContext.Current
         let wasActive = ctx.TxActive
         ctx.TxActive <- true
+        state.Journal.InDrain[0] <- 1
 
         try
             let struct (s2, changed) = drainMap map state
@@ -1131,6 +1333,7 @@ module internal Collections =
                 pushMapDelta &state.Sinks state.Out
                 state.Out.Clear()
         finally
+            state.Journal.InDrain[0] <- 0
             ctx.TxActive <- wasActive
 
         if not wasActive then
@@ -1864,6 +2067,8 @@ module internal Collections =
         let ctx = GraphContext.Current
         let wasActive = ctx.TxActive
         ctx.TxActive <- true
+        state.JournalL.InDrain[0] <- 1
+        state.JournalR.InDrain[0] <- 1
 
         try
             let struct (s2, changed) = drainChoose2 mapping state
@@ -1873,6 +2078,8 @@ module internal Collections =
                 pushMapDelta &state.Sinks state.OutDelta
                 state.OutDelta.Clear()
         finally
+            state.JournalL.InDrain[0] <- 0
+            state.JournalR.InDrain[0] <- 0
             ctx.TxActive <- wasActive
 
         if not wasActive then

@@ -2846,6 +2846,131 @@ let ``AList count and isEmpty recompute only when their output changes`` () =
     Assert.Equal(2, emptyEvals)
 
 [<Fact>]
+let ``AMap tryFind on a derived map notifies an observed branch`` () =
+    // Regression: observed branches over pull-lazy (derived) sources used to
+    // go stale — the write-time mark never reached them (the delta-sink
+    // channel delivers only at drain time). The wake channel restores the
+    // conservative write-time mark: the callback fires per upstream change
+    // and the value is correct.
+    let source = CMap.ofSeq [ "a", 1; "b", 2 ]
+    let derived = source |> CMap.value |> AMap.map (fun _ v -> v * 2)
+    let branch = derived |> AMap.tryFind "a" |> AVal.map id
+    let mutable observed = None
+
+    use obs = AVal.observe (fun v -> observed <- Some v) branch
+
+    Assert.Equal(ValueSome 2, AVal.getValue branch)
+    Assert.Equal(None, observed)
+    CMap.addOrUpdate "a" 5 source
+    Assert.Equal(Some(ValueSome 10), observed)
+    CMap.addOrUpdate "b" 20 source
+    // Unrelated upstream change: still a conservative wake (the branch
+    // re-reads and the gate filters), the value stays correct.
+    Assert.Equal(ValueSome 10, AVal.getValue branch)
+    CMap.remove "a" source
+    Assert.Equal(Some ValueNone, observed)
+
+[<Fact>]
+let ``AList tryLast on a derived list notifies an observed branch`` () =
+    let source = CList.ofSeq [ 1; 2; 3 ]
+    let derived = source |> CList.value |> AList.map (fun x -> x * 10)
+    let branch = derived |> AList.tryLast |> AVal.map id
+    let mutable observed = None
+
+    use obs = AVal.observe (fun v -> observed <- Some v) branch
+
+    Assert.Equal(ValueSome 30, AVal.getValue branch)
+    CList.append 4 source
+    Assert.Equal(Some(ValueSome 40), observed)
+
+[<Fact>]
+let ``AMap count on a derived map notifies an observed branch`` () =
+    let source = CMap.ofSeq [ "a", 1 ]
+    let derived = source |> CMap.value |> AMap.map (fun _ v -> v * 2)
+    let branch = derived |> AMap.count |> AVal.map id
+    let mutable observed = -1
+
+    use obs = AVal.observe (fun v -> observed <- v) branch
+
+    Assert.Equal(1, AVal.getValue branch)
+    CMap.addOrUpdate "b" 2 source
+    Assert.Equal(2, observed)
+
+[<Fact>]
+let ``AMap tryFind on a two-level derived chain stays correct`` () =
+    // The wake must cascade through intermediate derived nodes: only the
+    // first level receives a delta at write time; the second level only
+    // wakes.
+    let source = CMap.ofSeq [ "a", 1; "b", 2 ]
+
+    let derived =
+        source
+        |> CMap.value
+        |> AMap.map (fun _ v -> v * 2)
+        |> AMap.filter (fun _ v -> v % 3 = 0)
+
+    let branch = derived |> AMap.tryFind "a" |> AVal.map id
+    let mutable observed = None
+
+    use obs = AVal.observe (fun v -> observed <- Some v) branch
+
+    // a*2 = 2 -> filtered out.
+    Assert.Equal(ValueNone, AVal.getValue branch)
+    CMap.addOrUpdate "a" 6 source
+    // a*2 = 12 -> passes the filter now.
+    Assert.Equal(Some(ValueSome 12), observed)
+    Assert.Equal(ValueSome 12, AVal.getValue branch)
+    // A second watched write after the branch stabilized: the wake must
+    // still reach it.
+    CMap.addOrUpdate "a" 9 source
+    Assert.Equal(ValueSome 18, AVal.getValue branch)
+
+[<Fact>]
+let ``derived map stays consistent after set and remove between reads`` () =
+    // Regression (pre-existing journal-order divergence): set k then remove k
+    // with no drain between used to leave k present in the derived map (the
+    // journal replayed rems before sets regardless of arrival order). The
+    // append-time coalescing keeps the journal net.
+    let source = CMap.ofSeq [ "a", 1 ]
+    let derived = source |> CMap.value |> AMap.map (fun _ v -> v)
+
+    let lookup = derived |> AMap.tryFind "b" |> AVal.map id
+
+    Assert.Equal(ValueNone, AVal.getValue lookup)
+    CMap.addOrUpdate "b" 2 source
+    CMap.remove "b" source
+    Assert.False((AMap.force derived).ContainsKey "b")
+    Assert.Equal(ValueNone, AVal.getValue lookup)
+    // The reverse order (rem then set) keeps the set.
+    CMap.addOrUpdate "c" 3 source
+    CMap.remove "c" source
+    CMap.addOrUpdate "c" 4 source
+    Assert.True((AMap.force derived).ContainsKey "c")
+    Assert.Equal(ValueSome 4, AVal.getValue (derived |> AMap.tryFind "c"))
+
+[<Fact>]
+let ``derived set stays consistent after add and remove between reads`` () =
+    // The set analogue: add x then remove x with no drain between. The
+    // cancelled pair must not replay the add alone (the refcount would
+    // ratchet and the mapped output would keep a ghost element).
+    let source = CSet.ofSeq [ 1 ]
+    let derived = source |> CSet.value |> ASet.map (fun x -> x + 1)
+
+    let contains = derived |> ASet.contains 3 |> AVal.map id
+
+    Assert.Equal(false, AVal.getValue contains)
+    CSet.add 2 source |> ignore
+    CSet.remove 2 source |> ignore
+    Assert.False((ASet.force derived).Contains 3)
+    Assert.Equal(false, AVal.getValue contains)
+    // And the reverse order: rem then add cancels too (the element never
+    // left the derived state, so the refcount must not grow).
+    CSet.remove 1 source |> ignore
+    CSet.add 1 source |> ignore
+    Assert.True((ASet.force derived).Contains 2)
+    Assert.Equal(1, ASet.force derived |> Seq.filter (fun x -> x = 2) |> Seq.length)
+
+[<Fact>]
 let ``AMap reduce updates subtract the old value`` () =
     let source = CMap.empty<string, int>
     let total = AMap.reduce (AdaptiveReduction.sum ()) (CMap.value source)

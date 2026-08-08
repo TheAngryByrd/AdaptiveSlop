@@ -369,8 +369,11 @@ module ASet =
 
     /// <summary>
     /// Adaptively tests if the set contains the given element. Per-element
-    /// precise (O(1) on read): a write to an unrelated element does not
-    /// re-evaluate this value or its dependents.
+    /// precise (O(1) on read) for a direct changeable source: a write to an
+    /// unrelated element does not re-evaluate this value or its dependents.
+    /// On a derived source the branch re-evaluates at most once per upstream
+    /// change (pull-lazy: the per-element gate runs at the next read's
+    /// drain), and observed branches are woken conservatively per change.
     /// </summary>
     let inline contains (value: 'T) (set: aset<'T>) : aval<bool> = new SetContainsNode<'T>(set, value)
 
@@ -1165,8 +1168,12 @@ module AMap =
 
     /// <summary>
     /// Adaptively looks up the key: the value, or <c>ValueNone</c> when the
-    /// key is absent. The lookup is per-key precise (O(1) on read): a write
-    /// to an unrelated key does not re-evaluate this value or its dependents.
+    /// key is absent. The lookup is per-key precise (O(1) on read) for a
+    /// direct changeable source: a write to an unrelated key does not
+    /// re-evaluate this value or its dependents. On a derived source the
+    /// branch re-evaluates at most once per upstream change (pull-lazy: the
+    /// per-key gate runs at the next read's drain), and observed branches
+    /// are woken conservatively per change.
     /// </summary>
     let inline tryFind (key: 'K) (mapValue: amap<'K, 'V>) : aval<'V voption> =
         new MapLookupNode<'K, 'V>(mapValue, key)
@@ -1658,9 +1665,11 @@ module AList =
     /// Adaptively looks up the element at the given position (FDA
     /// <c>AList.tryAt</c> parity; the position is the <c>int</c> input
     /// position, the positional deviation). Per-position precise (O(1) on
-    /// read): an op that does not touch the position (an insert or remove
-    /// after it, an update elsewhere) does not re-evaluate this value or its
-    /// dependents.
+    /// read) for a direct changeable source: an op that does not touch the
+    /// position (an insert or remove after it, an update elsewhere) does not
+    /// re-evaluate this value or its dependents. On a derived source the
+    /// branch re-evaluates at most once per upstream change (pull-lazy: the
+    /// gate runs at the next read's drain).
     /// </summary>
     let inline tryAt (index: int) (list: alist<'T>) : aval<'T voption> = new ListLookupNode<'T>(list, index)
 

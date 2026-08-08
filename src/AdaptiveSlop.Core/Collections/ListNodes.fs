@@ -214,6 +214,15 @@ type FilterMapListNode<'T, 'U>(source: IAdaptiveList<'T>, [<InlineIfLambda>] map
                 Collections.journalAppendList &journal ops opCnt
                 version <- version + 1L
                 GraphContext.Default.MarkFrom(edges)
+                Collections.wakeSinks &sinks
+
+    interface IWakeSink with
+        member this.OnWake() =
+            if not disposed then
+                if edges.Count > 0 then
+                    GraphContext.Default.MarkFrom(edges)
+
+                Collections.wakeSinks &sinks
 
     interface IAdaptiveList<'U> with
         member this.GetValue() =
@@ -387,6 +396,15 @@ type AppendListNode<'T>(left: IAdaptiveList<'T>, right: IAdaptiveList<'T>) =
                 this.JournalAppend(ops, opCnt, 1uy)
                 version <- version + 1L
                 GraphContext.Default.MarkFrom(edges)
+                Collections.wakeSinks &sinks
+
+    interface IWakeSink with
+        member this.OnWake() =
+            if not disposed then
+                if edges.Count > 0 then
+                    GraphContext.Default.MarkFrom(edges)
+
+                Collections.wakeSinks &sinks
 
     interface IAdaptiveList<'T> with
         member this.GetValue() =
@@ -707,6 +725,15 @@ type ToSetListNode<'T when 'T: equality>(source: IAdaptiveList<'T>) =
                 Collections.journalAppendList &journal ops opCnt
                 version <- version + 1L
                 GraphContext.Default.MarkFrom(edges)
+                Collections.wakeSinks &sinks
+
+    interface IWakeSink with
+        member this.OnWake() =
+            if not disposed then
+                if edges.Count > 0 then
+                    GraphContext.Default.MarkFrom(edges)
+
+                Collections.wakeSinks &sinks
 
     interface IAdaptiveSet<'T> with
         member this.GetValue() =
@@ -1242,6 +1269,15 @@ type MapUseListNode<'T, 'W when 'W: equality and 'W :> IDisposable>
                 Collections.journalAppendList &journal ops opCnt
                 version <- version + 1L
                 GraphContext.Default.MarkFrom(edges)
+                Collections.wakeSinks &sinks
+
+    interface IWakeSink with
+        member this.OnWake() =
+            if not disposed then
+                if edges.Count > 0 then
+                    GraphContext.Default.MarkFrom(edges)
+
+                Collections.wakeSinks &sinks
 
     interface IAdaptiveList<'W> with
         member this.GetValue() =
@@ -1299,6 +1335,13 @@ type MapUseListNode<'T, 'W when 'W: equality and 'W :> IDisposable>
 // watched position; the value itself is re-read lazily on the next read (O(1),
 // pull-lazy). Ops on unrelated positions cost the node and its parents
 // nothing.
+//
+// Pull-lazy sources (derived nodes, ofExternal) deliver their output delta
+// only at drain time, so these nodes also implement IWakeSink: the source's
+// write-time wake marks the node's parents conservatively and sets a stale
+// flag, and the gate runs at the next read's drain. Direct changeable
+// sources never wake — their delivery is synchronous, so the gate alone is
+// exact.
 // =============================================================================
 
 /// <summary>
@@ -1370,6 +1413,14 @@ type ListLookupNode<'T>(source: IAdaptiveList<'T>, index: int) =
                 // indicator for changes the gate already filtered out.
                 depVersion <- source.Version
 
+    interface IWakeSink with
+        member this.OnWake() =
+            if not disposed then
+                stale <- true
+
+                if edges.Count > 0 then
+                    GraphContext.Default.MarkFrom(edges)
+
     interface IAdaptiveValue<'T voption> with
         member this.GetValue() =
             let ctx = GraphContext.Default
@@ -1428,13 +1479,13 @@ type ListLookupNode<'T>(source: IAdaptiveList<'T>, index: int) =
 
         member this.Version =
             // Dirty indicator (the ExternalValueNode pattern): while the
-            // source has unprocessed changes, report version + 1 so
-            // version-checking consumers re-read exactly once; the drain at
-            // GetValue applies the gate and decides the real version. This
-            // covers derived sources, whose output delta is computed lazily
-            // at drain time (pull-lazy): the gate cannot run at write time
-            // because the delta does not exist yet.
-            if source.Version <> depVersion then
+            // source has unprocessed changes (or a wake is pending), report
+            // version + 1 so version-checking consumers re-read exactly once;
+            // the drain at GetValue applies the gate and decides the real
+            // version. This covers derived sources, whose output delta is
+            // computed lazily at drain time (pull-lazy): the gate cannot run
+            // at write time because the delta does not exist yet.
+            if stale || source.Version <> depVersion then
                 version + 1L
             else
                 version
@@ -1529,6 +1580,14 @@ type ListLastNode<'T>(source: IAdaptiveList<'T>) =
                 // Re-sync after the delivery (see ListLookupNode).
                 depVersion <- source.Version
 
+    interface IWakeSink with
+        member this.OnWake() =
+            if not disposed then
+                stale <- true
+
+                if edges.Count > 0 then
+                    GraphContext.Default.MarkFrom(edges)
+
     interface IAdaptiveValue<'T voption> with
         member this.GetValue() =
             let ctx = GraphContext.Default
@@ -1579,7 +1638,7 @@ type ListLastNode<'T>(source: IAdaptiveList<'T>) =
 
         member this.Version =
             // Dirty indicator (see ListLookupNode.Version).
-            if source.Version <> depVersion then
+            if stale || source.Version <> depVersion then
                 version + 1L
             else
                 version
@@ -1612,6 +1671,8 @@ type ListCountNode<'T, 'Out>(source: IAdaptiveList<'T>, [<InlineIfLambda>] view:
     let mutable disposed = false
     let mutable count = 0
     let mutable out = Unchecked.defaultof<'Out>
+    // Write-time wake flag (see ListLookupNode.stale).
+    let mutable stale = false
 
     member private this.Register() =
         match box source with
@@ -1651,6 +1712,14 @@ type ListCountNode<'T, 'Out>(source: IAdaptiveList<'T>, [<InlineIfLambda>] view:
                 // Re-sync after the delivery (see ListLookupNode).
                 depVersion <- source.Version
 
+    interface IWakeSink with
+        member this.OnWake() =
+            if not disposed then
+                stale <- true
+
+                if edges.Count > 0 then
+                    GraphContext.Default.MarkFrom(edges)
+
     interface IAdaptiveValue<'Out> with
         member this.GetValue() =
             let ctx = GraphContext.Default
@@ -1682,9 +1751,10 @@ type ListCountNode<'T, 'Out>(source: IAdaptiveList<'T>, [<InlineIfLambda>] view:
                         depVersion <- source.Version
                         initialized <- true
 
-                    if source.Version <> depVersion then
+                    if stale || source.Version <> depVersion then
                         source.GetValue() |> ignore
                         depVersion <- source.Version
+                        stale <- false
                 finally
                     if wasCollecting then
                         collector.PopFrame() |> ignore
@@ -1696,7 +1766,7 @@ type ListCountNode<'T, 'Out>(source: IAdaptiveList<'T>, [<InlineIfLambda>] view:
 
         member this.Version =
             // Dirty indicator (see ListLookupNode.Version).
-            if source.Version <> depVersion then
+            if stale || source.Version <> depVersion then
                 version + 1L
             else
                 version

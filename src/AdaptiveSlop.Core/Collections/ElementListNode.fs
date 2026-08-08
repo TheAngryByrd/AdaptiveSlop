@@ -397,6 +397,15 @@ type ElementListNode<'T, 'U>(source: IAdaptiveList<'T>, [<InlineIfLambda>] mappi
                 Collections.journalAppendList &journal ops opCnt
                 version <- version + 1L
                 GraphContext.Default.MarkFrom(edges)
+                Collections.wakeSinks &sinks
+
+    interface IWakeSink with
+        member this.OnWake() =
+            if not disposed then
+                if edges.Count > 0 then
+                    GraphContext.Default.MarkFrom(edges)
+
+                Collections.wakeSinks &sinks
 
     interface IAdaptiveList<'U> with
         member this.GetValue() =

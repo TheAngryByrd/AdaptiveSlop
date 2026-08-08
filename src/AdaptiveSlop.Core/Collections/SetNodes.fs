@@ -41,7 +41,8 @@ type ConstantSet<'T>([<InlineIfLambda>] create: unit -> FrozenSet<'T>) =
 /// <c>ValueNone</c> to drop an element). Duplicate outputs share one reference
 /// count.
 /// </summary>
-type MapSetNode<'T, 'U when 'U: equality>(source: IAdaptiveSet<'T>, [<InlineIfLambda>] mapping: 'T -> 'U voption) =
+type MapSetNode<'T, 'U when 'T: equality and 'U: equality>
+    (source: IAdaptiveSet<'T>, [<InlineIfLambda>] mapping: 'T -> 'U voption) =
     let mutable state = SetNodeState<'T, 'U>.Create(1)
     let mutable initialized = false
     let mutable disposed = false
@@ -77,6 +78,15 @@ type MapSetNode<'T, 'U when 'U: equality>(source: IAdaptiveSet<'T>, [<InlineIfLa
                 Collections.journalAppendSet &state.Journal adds addCnt rems remCnt
                 state.Version <- state.Version + 1L
                 GraphContext.Default.MarkFrom(state.Edges)
+                Collections.wakeSinks &state.Sinks
+
+    interface IWakeSink with
+        member this.OnWake() =
+            if not disposed then
+                if state.Edges.Count > 0 then
+                    GraphContext.Default.MarkFrom(state.Edges)
+
+                Collections.wakeSinks &state.Sinks
 
     interface IAdaptiveSet<'U> with
         member this.GetValue() =
@@ -154,6 +164,15 @@ type FilterSetNode<'T when 'T: equality>(source: IAdaptiveSet<'T>, [<InlineIfLam
                 Collections.journalAppendSet &state.Journal adds addCnt rems remCnt
                 state.Version <- state.Version + 1L
                 GraphContext.Default.MarkFrom(state.Edges)
+                Collections.wakeSinks &state.Sinks
+
+    interface IWakeSink with
+        member this.OnWake() =
+            if not disposed then
+                if state.Edges.Count > 0 then
+                    GraphContext.Default.MarkFrom(state.Edges)
+
+                Collections.wakeSinks &state.Sinks
 
     interface IAdaptiveSet<'T> with
         member this.GetValue() =
@@ -236,6 +255,15 @@ type UnionSetNode<'T when 'T: equality>(left: IAdaptiveSet<'T>, right: IAdaptive
                 Collections.journalAppendSet &state.Journal adds addCnt rems remCnt
                 state.Version <- state.Version + 1L
                 GraphContext.Default.MarkFrom(state.Edges)
+                Collections.wakeSinks &state.Sinks
+
+    interface IWakeSink with
+        member this.OnWake() =
+            if not disposed then
+                if state.Edges.Count > 0 then
+                    GraphContext.Default.MarkFrom(state.Edges)
+
+                Collections.wakeSinks &state.Sinks
 
     interface IAdaptiveSet<'T> with
         member this.GetValue() =
@@ -337,6 +365,15 @@ type TwoSourceSetNode<'T when 'T: equality>(op: TwoSetOp, left: IAdaptiveSet<'T>
 
                 state.Version <- state.Version + 1L
                 GraphContext.Default.MarkFrom(state.Edges)
+                Collections.wakeSinks &state.Sinks
+
+    interface IWakeSink with
+        member this.OnWake() =
+            if not disposed then
+                if state.Edges.Count > 0 then
+                    GraphContext.Default.MarkFrom(state.Edges)
+
+                Collections.wakeSinks &state.Sinks
 
     interface IAdaptiveSet<'T> with
         member this.GetValue() =
@@ -703,6 +740,7 @@ type CollectSetNode<'T, 'U when 'T: equality and 'U: equality>
                     state.Inner[key] <- entry
                     state.Version <- state.Version + 1L
                     GraphContext.Default.MarkFrom(state.Edges)
+                    Collections.wakeSinks &state.Sinks
 
     interface ISetDeltaSink<'T> with
         member this.OnDeltas(adds: 'T[], addCnt: int, rems: 'T[], remCnt: int) =
@@ -710,6 +748,15 @@ type CollectSetNode<'T, 'U when 'T: equality and 'U: equality>
                 Collections.journalAppendSet &state.Journal adds addCnt rems remCnt
                 state.Version <- state.Version + 1L
                 GraphContext.Default.MarkFrom(state.Edges)
+                Collections.wakeSinks &state.Sinks
+
+    interface IWakeSink with
+        member this.OnWake() =
+            if not disposed then
+                if state.Edges.Count > 0 then
+                    GraphContext.Default.MarkFrom(state.Edges)
+
+                Collections.wakeSinks &state.Sinks
 
     interface IAdaptiveSet<'U> with
         member this.GetValue() =
@@ -877,6 +924,15 @@ type BindSetNode<'T, 'U when 'U: equality>
                 Collections.journalAppendSet &state.Journal adds addCnt rems remCnt
                 state.Version <- state.Version + 1L
                 GraphContext.Default.MarkFrom(state.Edges)
+                Collections.wakeSinks &state.Sinks
+
+    interface IWakeSink with
+        member this.OnWake() =
+            if not disposed then
+                if state.Edges.Count > 0 then
+                    GraphContext.Default.MarkFrom(state.Edges)
+
+                Collections.wakeSinks &state.Sinks
 
     interface IAdaptiveSet<'U> with
         member this.GetValue() =
@@ -1027,6 +1083,15 @@ type MapUseSetNode<'A, 'B when 'A: equality and 'B: equality and 'B :> IDisposab
                 Collections.journalAppendSet &state.Journal adds addCnt rems remCnt
                 state.Version <- state.Version + 1L
                 GraphContext.Default.MarkFrom(state.Edges)
+                Collections.wakeSinks &state.Sinks
+
+    interface IWakeSink with
+        member this.OnWake() =
+            if not disposed then
+                if state.Edges.Count > 0 then
+                    GraphContext.Default.MarkFrom(state.Edges)
+
+                Collections.wakeSinks &state.Sinks
 
     interface IAdaptiveSet<'B> with
         member this.GetValue() =
@@ -1086,6 +1151,13 @@ type MapUseSetNode<'A, 'B when 'A: equality and 'B: equality and 'B :> IDisposab
 // its own output value actually changed. A write to an unrelated element
 // costs the node and its parents nothing — the per-element precision that the
 // plain AdaptiveNode-over-GetValue pattern cannot express.
+//
+// Pull-lazy sources (derived nodes, ofExternal) deliver their output delta
+// only at drain time, so these nodes also implement IWakeSink: the source's
+// write-time wake marks the node's parents conservatively and sets a stale
+// flag, and the gate runs at the next read's drain. Direct changeable
+// sources never wake — their delivery is synchronous, so the gate alone is
+// exact.
 // =============================================================================
 
 /// <summary>
@@ -1105,6 +1177,8 @@ type SetContainsNode<'T when 'T: equality>(source: IAdaptiveSet<'T>, element: 'T
     let mutable initialized = false
     let mutable disposed = false
     let mutable present = false
+    // Write-time wake flag (see MapLookupNode.stale).
+    let mutable stale = false
 
     member private this.Register() =
         match box source with
@@ -1147,6 +1221,14 @@ type SetContainsNode<'T when 'T: equality>(source: IAdaptiveSet<'T>, element: 'T
                 // indicator for changes the gate already filtered out.
                 depVersion <- source.Version
 
+    interface IWakeSink with
+        member this.OnWake() =
+            if not disposed then
+                stale <- true
+
+                if edges.Count > 0 then
+                    GraphContext.Default.MarkFrom(edges)
+
     interface IAdaptiveValue<bool> with
         member this.GetValue() =
             let ctx = GraphContext.Default
@@ -1182,11 +1264,12 @@ type SetContainsNode<'T when 'T: equality>(source: IAdaptiveSet<'T>, element: 'T
                         depVersion <- source.Version
                         initialized <- true
 
-                    if source.Version <> depVersion then
+                    if stale || source.Version <> depVersion then
                         // Force the source drain: it pushes the pending output
                         // delta, which OnDeltas applies to the cached result.
                         source.GetValue() |> ignore
                         depVersion <- source.Version
+                        stale <- false
                 finally
                     if wasCollecting then
                         collector.PopFrame() |> ignore
@@ -1197,14 +1280,8 @@ type SetContainsNode<'T when 'T: equality>(source: IAdaptiveSet<'T>, element: 'T
                 ctx.ReleaseOwner()
 
         member this.Version =
-            // Dirty indicator (the ExternalValueNode pattern): while the
-            // source has unprocessed changes, report version + 1 so
-            // version-checking consumers re-read exactly once; the drain at
-            // GetValue applies the gate and decides the real version. This
-            // covers derived sources, whose output delta is computed lazily
-            // at drain time (pull-lazy): the gate cannot run at write time
-            // because the delta does not exist yet.
-            if source.Version <> depVersion then
+            // Dirty indicator (see MapLookupNode.Version).
+            if stale || source.Version <> depVersion then
                 version + 1L
             else
                 version
@@ -1237,6 +1314,8 @@ type SetCountNode<'T, 'Out when 'T: equality>(source: IAdaptiveSet<'T>, [<Inline
     let mutable disposed = false
     let mutable count = 0
     let mutable out = Unchecked.defaultof<'Out>
+    // Write-time wake flag (see MapLookupNode.stale).
+    let mutable stale = false
 
     member private this.Register() =
         match box source with
@@ -1269,6 +1348,14 @@ type SetCountNode<'T, 'Out when 'T: equality>(source: IAdaptiveSet<'T>, [<Inline
                 // Re-sync after the delivery (see SetContainsNode).
                 depVersion <- source.Version
 
+    interface IWakeSink with
+        member this.OnWake() =
+            if not disposed then
+                stale <- true
+
+                if edges.Count > 0 then
+                    GraphContext.Default.MarkFrom(edges)
+
     interface IAdaptiveValue<'Out> with
         member this.GetValue() =
             let ctx = GraphContext.Default
@@ -1300,9 +1387,10 @@ type SetCountNode<'T, 'Out when 'T: equality>(source: IAdaptiveSet<'T>, [<Inline
                         depVersion <- source.Version
                         initialized <- true
 
-                    if source.Version <> depVersion then
+                    if stale || source.Version <> depVersion then
                         source.GetValue() |> ignore
                         depVersion <- source.Version
+                        stale <- false
                 finally
                     if wasCollecting then
                         collector.PopFrame() |> ignore
@@ -1314,7 +1402,7 @@ type SetCountNode<'T, 'Out when 'T: equality>(source: IAdaptiveSet<'T>, [<Inline
 
         member this.Version =
             // Dirty indicator (see SetContainsNode.Version).
-            if source.Version <> depVersion then
+            if stale || source.Version <> depVersion then
                 version + 1L
             else
                 version

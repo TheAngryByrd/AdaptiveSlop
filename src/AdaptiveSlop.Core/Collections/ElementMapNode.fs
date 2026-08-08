@@ -132,6 +132,9 @@ type ElementMapNode<'K, 'V, 'U when 'K: equality>
         let remStart = rems.Count
         let setStart = sets.Count
         let mutable i = 0
+        // Suspend the append-time cross-kind cancellation while the journal
+        // is replayed (see journalAppendSet).
+        state.Journal.InDrain[0] <- 1
         // Consumed counts: entries before these positions were applied and
         // must never be applied again; the throwing entry (and reentrant
         // entries appended live, beyond the start bounds) survive.
@@ -188,6 +191,7 @@ type ElementMapNode<'K, 'V, 'U when 'K: equality>
                 i <- i + 1
                 setsDone <- i
         finally
+            state.Journal.InDrain[0] <- 0
             // Compact against the LIVE journal counts (see ElementSetNode).
             let remLive = state.Journal.Rems.Count
 
@@ -292,6 +296,15 @@ type ElementMapNode<'K, 'V, 'U when 'K: equality>
                 Collections.journalAppendMap &state.Journal setEntries setCnt removedKeys remCnt
                 state.Version <- state.Version + 1L
                 GraphContext.Default.MarkFrom(state.Edges)
+                Collections.wakeSinks &state.Sinks
+
+    interface IWakeSink with
+        member this.OnWake() =
+            if not disposed then
+                if state.Edges.Count > 0 then
+                    GraphContext.Default.MarkFrom(state.Edges)
+
+                Collections.wakeSinks &state.Sinks
 
     interface IAdaptiveMap<'K, 'U> with
         member this.GetValue() =
