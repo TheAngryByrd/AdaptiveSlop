@@ -1635,6 +1635,130 @@ type MapABenchmarks() =
         ()
 
 // =============================================================================
+// Scalar Escape Benchmarks (per-key/per-position precise nodes)
+//
+// The branch is: source |> tryFind watched |> AVal.map x3. One write plus one
+// root read per iteration. The unrelated-write benchmarks are the precision
+// case: the per-key gate must keep them at write cost only (no branch
+// recompute); the watched-write benchmarks pay the recompute by design.
+// FDA is shown for context: its tryFind re-evaluates on every map change.
+// =============================================================================
+
+[<MemoryDiagnoser>]
+type ScalarEscapeBenchmarks() =
+    let mutable slopMap: AdaptiveSlop.Core.ChangeableMap<int, int> =
+        Unchecked.defaultof<_>
+
+    let mutable slopBranch: AdaptiveSlop.Core.IAdaptiveValue<int voption> =
+        Unchecked.defaultof<_>
+
+    let mutable slopCountBranch: AdaptiveSlop.Core.IAdaptiveValue<int> =
+        Unchecked.defaultof<_>
+
+    let mutable slopSet: AdaptiveSlop.Core.ChangeableSet<int> = Unchecked.defaultof<_>
+
+    let mutable slopContainsBranch: AdaptiveSlop.Core.IAdaptiveValue<bool> =
+        Unchecked.defaultof<_>
+
+    let mutable fdaMap: cmap<int, int> = Unchecked.defaultof<_>
+    let mutable fdaBranch: aval<int option> = Unchecked.defaultof<_>
+
+    [<Params(1000)>]
+    member val Iterations = 0 with get, set
+
+    [<GlobalSetup>]
+    member _.Setup() =
+        slopMap <- AdaptiveSlop.Core.CMap.ofSeq (seq { for i in 1..100 -> i, i * 10 })
+
+        slopBranch <-
+            slopMap
+            |> AdaptiveSlop.Core.CMap.value
+            |> AdaptiveSlop.Core.AMap.tryFind 50
+            |> AdaptiveSlop.Core.AVal.map (ValueOption.map ((+) 1))
+            |> AdaptiveSlop.Core.AVal.map (ValueOption.map ((+) 1))
+            |> AdaptiveSlop.Core.AVal.map (ValueOption.map ((+) 1))
+
+        slopCountBranch <-
+            slopMap
+            |> AdaptiveSlop.Core.CMap.value
+            |> AdaptiveSlop.Core.AMap.count
+            |> AdaptiveSlop.Core.AVal.map ((+) 1)
+            |> AdaptiveSlop.Core.AVal.map ((+) 1)
+            |> AdaptiveSlop.Core.AVal.map ((+) 1)
+
+        slopSet <- AdaptiveSlop.Core.CSet.ofSeq (seq { 1..100 })
+
+        slopContainsBranch <-
+            slopSet
+            |> AdaptiveSlop.Core.CSet.value
+            |> AdaptiveSlop.Core.ASet.contains 50
+            |> AdaptiveSlop.Core.AVal.map not
+            |> AdaptiveSlop.Core.AVal.map not
+            |> AdaptiveSlop.Core.AVal.map not
+
+        fdaMap <- cmap (seq { for i in 1..100 -> i, i * 10 })
+
+        fdaBranch <-
+            fdaMap
+            |> AMap.tryFind 50
+            |> AVal.map (Option.map ((+) 1))
+            |> AVal.map (Option.map ((+) 1))
+            |> AVal.map (Option.map ((+) 1))
+
+    [<Benchmark(Baseline = true)>]
+    member this.SlopTryFindUnrelatedWrite() =
+        for i in 1 .. this.Iterations do
+            slopMap.AddOrUpdate 1 i
+            let _ = AdaptiveSlop.Core.AVal.getValue slopBranch
+            ()
+
+    [<Benchmark>]
+    member this.SlopTryFindWatchedWrite() =
+        for i in 1 .. this.Iterations do
+            slopMap.AddOrUpdate 50 i
+            let _ = AdaptiveSlop.Core.AVal.getValue slopBranch
+            ()
+
+    [<Benchmark>]
+    member this.FdaTryFindUnrelatedWrite() =
+        for i in 1 .. this.Iterations do
+            transact (fun () -> fdaMap.[1] <- i)
+            let _ = AVal.force fdaBranch
+            ()
+
+    [<Benchmark>]
+    member this.SlopCountUpdateWrite() =
+        for i in 1 .. this.Iterations do
+            slopMap.AddOrUpdate 2 i
+            let _ = AdaptiveSlop.Core.AVal.getValue slopCountBranch
+            ()
+
+    [<Benchmark>]
+    member this.SlopCountAddWrite() =
+        for i in 1 .. this.Iterations do
+            slopMap.AddOrUpdate (1000 + i) i
+            let _ = AdaptiveSlop.Core.AVal.getValue slopCountBranch
+            ()
+
+    [<Benchmark>]
+    member this.SlopContainsUnrelatedWrite() =
+        for i in 1 .. this.Iterations do
+            slopSet.Add(2000 + i) |> ignore
+            let _ = AdaptiveSlop.Core.AVal.getValue slopContainsBranch
+            ()
+
+    [<Benchmark>]
+    member this.SlopContainsWatchedWrite() =
+        for i in 1 .. this.Iterations do
+            if i % 2 = 0 then
+                slopSet.Add 50 |> ignore
+            else
+                slopSet.Remove 50 |> ignore
+
+            let _ = AdaptiveSlop.Core.AVal.getValue slopContainsBranch
+            ()
+
+// =============================================================================
 // Entry Point
 // =============================================================================
 
