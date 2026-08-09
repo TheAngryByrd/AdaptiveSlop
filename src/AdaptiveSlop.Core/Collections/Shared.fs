@@ -1864,6 +1864,10 @@ module internal Collections =
             if not (next.ContainsKey k) then
                 state.Out.Rems <- bufferAppend state.Out.Rems k
                 removeCount <- removeCount + 1
+                // Removals are a change too: without this, a removals-only poll
+                // leaves Out uncleared and the stale removals replay on the
+                // next diff, deleting freshly added entries.
+                changed <- true
 
         for i in 0 .. state.Out.Rems.Count - 1 do
             state.Data.Remove state.Out.Rems.Items[i] |> ignore
