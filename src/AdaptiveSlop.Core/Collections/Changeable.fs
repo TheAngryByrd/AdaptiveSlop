@@ -7,9 +7,9 @@ open System.Threading
 // =============================================================================
 // Changeable collection sources (PLAN.md Section 6.9)
 //
-// A source write: updates the internal state, advances the version, appends the
-// net delta to the journal of every registered sink, and marks the scalar
-// parents. Writes never process a delta; processing happens on read (drain).
+// A source write: updates the internal state, advances the version, and
+// appends the net delta to the journal of every registered sink. Writes
+// never process a delta; processing happens on read (drain).
 //
 // Cross-thread posting (the cval.Post handoff pattern, per node): a post from
 // any thread lands in a per-node pending-op ring (PostedOpRing); the first op
@@ -154,7 +154,6 @@ type ChangeableSet<'T>(initial: seq<'T>) =
     let ctx = GraphContext.Current
     let mutable version = 0L
     let data = HashSet<'T>(initial)
-    let edges = ParentEdges()
     let mutable sinks = SinkList.Create()
     let mutable outDelta = SetDelta<'T>.Create()
     // Ordered transaction journal; replayed at commit for a net delta.
@@ -172,10 +171,10 @@ type ChangeableSet<'T>(initial: seq<'T>) =
     let mutable postedOps: PostedOpRing<SetPostOp<'T>> = null
     let mutable posted = 0
 
-    member private this.PushAndMark() =
+    member private this.PushAndBump() =
         if not outDelta.IsEmpty then
             version <- version + 1L
-            Collections.pushAndMarkSet ctx outDelta &sinks edges
+            Collections.pushAndBumpSet ctx outDelta &sinks
             outDelta.Clear()
 
     member private this.Apply(newValue: seq<'T>) =
@@ -199,7 +198,7 @@ type ChangeableSet<'T>(initial: seq<'T>) =
             if data.Add item then
                 outDelta.Adds <- Collections.bufferAppend outDelta.Adds item
 
-        this.PushAndMark()
+        this.PushAndBump()
 
     member private this.ApplyAndFlush(item: 'T, isAdd: bool) =
         let mutable changed = if isAdd then data.Add item else data.Remove item
@@ -212,7 +211,7 @@ type ChangeableSet<'T>(initial: seq<'T>) =
             else
                 outDelta.Rems <- Collections.bufferAppend outDelta.Rems item
 
-            this.PushAndMark()
+            this.PushAndBump()
 
     member private this.CommitJournal() =
         // The current batch's flush is already enqueued (we are running from
@@ -247,7 +246,7 @@ type ChangeableSet<'T>(initial: seq<'T>) =
                 outDelta.Rems <- Collections.bufferAppend outDelta.Rems item
 
             journalCount <- 0
-            this.PushAndMark()
+            this.PushAndBump()
 
     /// <summary>Replaces the whole set. Supersedes the whole batch inside a
     /// transaction (later writes of the batch are discarded; matches the
@@ -380,7 +379,7 @@ type ChangeableSet<'T>(initial: seq<'T>) =
                     data.Remove item |> ignore
                     outDelta.Rems <- Collections.bufferAppend outDelta.Rems item
 
-                this.PushAndMark()
+                this.PushAndBump()
 
     /// <summary>
     /// Posts an add. Safe from any thread: the operation is queued and
@@ -457,10 +456,9 @@ type ChangeableSet<'T>(initial: seq<'T>) =
 
     interface IDisposable with
         member this.Dispose() =
-            // Real teardown: detach every sink and parent edge so derived
-            // nodes and observations do not keep this source alive.
+            // Real teardown: detach every sink so derived nodes do not keep
+            // this source alive.
             Collections.clearSinks &sinks
-            edges.Clear()
 
     /// Internal. Number of registered derived sinks (tests).
     member internal _.SinkCount = sinks.Count
@@ -469,11 +467,6 @@ type ChangeableSet<'T>(initial: seq<'T>) =
         member this.AddSetSink(sink) = Collections.addSink &sinks sink
 
         member this.RemoveSetSink(sink) = Collections.removeSink &sinks sink
-
-    interface IEdgeTarget with
-        member _.EdgeCount = edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
 
     interface IPostSource with
         member this.ApplyPosted() = this.ApplyPostedBatch()
@@ -489,7 +482,6 @@ type ChangeableMap<'K, 'V when 'K: equality>(initial: seq<'K * 'V>) =
     let ctx = GraphContext.Current
     let mutable version = 0L
     let data = Dictionary<'K, 'V>()
-    let edges = ParentEdges()
     let mutable sinks = SinkList.Create()
     let mutable outDelta = MapDelta<'K, 'V>.Create()
     // Ordered transaction journal; replayed at commit for a net delta.
@@ -512,10 +504,10 @@ type ChangeableMap<'K, 'V when 'K: equality>(initial: seq<'K * 'V>) =
         for (k, v) in initial do
             data[k] <- v
 
-    member private this.PushAndMark() =
+    member private this.PushAndBump() =
         if not outDelta.IsEmpty then
             version <- version + 1L
-            Collections.pushAndMarkMap ctx outDelta &sinks edges
+            Collections.pushAndBumpMap ctx outDelta &sinks
             outDelta.Clear()
 
     member private this.Apply(newValue: seq<'K * 'V>) =
@@ -543,7 +535,7 @@ type ChangeableMap<'K, 'V when 'K: equality>(initial: seq<'K * 'V>) =
                 data[k] <- v
                 outDelta.Sets <- Collections.bufferAppend outDelta.Sets (struct (k, v))
 
-        this.PushAndMark()
+        this.PushAndBump()
 
     member private this.ApplyAndFlush(key: 'K, valueToSet: 'V, isRemove: bool) =
         let mutable changed = false
@@ -570,7 +562,7 @@ type ChangeableMap<'K, 'V when 'K: equality>(initial: seq<'K * 'V>) =
             else
                 outDelta.Sets <- Collections.bufferAppend outDelta.Sets (struct (key, valueToSet))
 
-            this.PushAndMark()
+            this.PushAndBump()
 
     member private this.CommitJournal() =
         // The current batch's flush is already enqueued (we are running from
@@ -610,7 +602,7 @@ type ChangeableMap<'K, 'V when 'K: equality>(initial: seq<'K * 'V>) =
                 outDelta.Rems <- Collections.bufferAppend outDelta.Rems k
 
             journalCount <- 0
-            this.PushAndMark()
+            this.PushAndBump()
 
     /// <summary>Adds or updates an entry. No-op when the value is unchanged.</summary>
     member this.AddOrUpdate (key: 'K) (valueToSet: 'V) =
@@ -748,7 +740,7 @@ type ChangeableMap<'K, 'V when 'K: equality>(initial: seq<'K * 'V>) =
                     data.Remove k |> ignore
                     outDelta.Rems <- Collections.bufferAppend outDelta.Rems k
 
-                this.PushAndMark()
+                this.PushAndBump()
 
     /// <summary>
     /// Posts an add or update. Safe from any thread: the operation is queued
@@ -840,10 +832,9 @@ type ChangeableMap<'K, 'V when 'K: equality>(initial: seq<'K * 'V>) =
 
     interface IDisposable with
         member this.Dispose() =
-            // Real teardown: detach every sink and parent edge so derived
-            // nodes and observations do not keep this source alive.
+            // Real teardown: detach every sink so derived nodes do not keep
+            // this source alive.
             Collections.clearSinks &sinks
-            edges.Clear()
 
     /// Internal. Number of registered derived sinks (tests).
     member internal _.SinkCount = sinks.Count
@@ -852,11 +843,6 @@ type ChangeableMap<'K, 'V when 'K: equality>(initial: seq<'K * 'V>) =
         member this.AddMapSink(sink) = Collections.addSink &sinks sink
 
         member this.RemoveMapSink(sink) = Collections.removeSink &sinks sink
-
-    interface IEdgeTarget with
-        member _.EdgeCount = edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
 
     interface IPostSource with
         member this.ApplyPosted() = this.ApplyPostedBatch()
@@ -893,7 +879,6 @@ type ChangeableList<'T>(initial: seq<'T>) =
     let ctx = GraphContext.Current
     let mutable version = 0L
     let data = ResizeArray<'T>(initial)
-    let edges = ParentEdges()
     let mutable sinks = SinkList.Create()
     let mutable outDelta = ListDelta<'T>.Create()
     // Ordered transaction journal; replayed in order at commit (no netting).
@@ -930,10 +915,10 @@ type ChangeableList<'T>(initial: seq<'T>) =
             copy
         | ValueSome r -> r
 
-    member private this.PushAndMark() =
+    member private this.PushAndBump() =
         if not outDelta.IsEmpty then
             version <- version + 1L
-            Collections.pushAndMarkList ctx outDelta &sinks edges
+            Collections.pushAndBumpList ctx outDelta &sinks
             outDelta.Clear()
 
     member private this.JournalOp(op: ListOp<'T>) =
@@ -1017,13 +1002,13 @@ type ChangeableList<'T>(initial: seq<'T>) =
     member private this.Apply(newValues: seq<'T>) =
         outDelta.Clear()
         this.ApplyDiff(data, ResizeArray<'T>(newValues))
-        this.PushAndMark()
+        this.PushAndBump()
 
     /// Apply one operation to the data and push it as a one-op delta.
     member private this.ApplyAndFlush(op: ListOp<'T>) =
         outDelta.Clear()
         outDelta.Ops <- Collections.bufferAppend outDelta.Ops op
-        this.PushAndMark()
+        this.PushAndBump()
 
     /// Replay the transaction journal in order against the data and push the
     /// whole batch as one delta. Every journaled op was validated against the
@@ -1072,7 +1057,7 @@ type ChangeableList<'T>(initial: seq<'T>) =
                 i <- i + 1
 
             journalCount <- 0
-            this.PushAndMark()
+            this.PushAndBump()
 
         journalReplay <- ValueNone
 
@@ -1242,7 +1227,7 @@ type ChangeableList<'T>(initial: seq<'T>) =
                             outDelta.Ops
                             (ListOp(ListOpKind.Remove, p, Unchecked.defaultof<'T>, 0uy))
 
-                this.PushAndMark()
+                this.PushAndBump()
         finally
             ctx.ReleaseOwner()
 
@@ -1536,10 +1521,9 @@ type ChangeableList<'T>(initial: seq<'T>) =
 
     interface IDisposable with
         member this.Dispose() =
-            // Real teardown: detach every sink and parent edge so derived
-            // nodes and observations do not keep this source alive.
+            // Real teardown: detach every sink so derived nodes do not keep
+            // this source alive.
             Collections.clearSinks &sinks
-            edges.Clear()
 
     /// Internal. Number of registered derived sinks (tests).
     member internal _.SinkCount = sinks.Count
@@ -1548,11 +1532,6 @@ type ChangeableList<'T>(initial: seq<'T>) =
         member this.AddListSink(sink) = Collections.addSink &sinks sink
 
         member this.RemoveListSink(sink) = Collections.removeSink &sinks sink
-
-    interface IEdgeTarget with
-        member _.EdgeCount = edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
 
     interface IPostSource with
         member this.ApplyPosted() = this.ApplyPostedBatch()

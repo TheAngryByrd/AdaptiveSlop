@@ -68,7 +68,7 @@ type MapMapNode<'K, 'V, 'U when 'K: equality>
             if not disposed then
                 Collections.journalAppendMap &state.Journal sets setCnt rems remCnt
                 state.Version <- state.Version + 1L
-                GraphContext.Default.MarkFrom(state.Edges)
+                GraphContext.Default.BumpWriteGeneration()
 
     interface IAdaptiveMap<'K, 'U> with
         member this.GetValue() =
@@ -108,11 +108,6 @@ type MapMapNode<'K, 'V, 'U when 'K: equality>
         member this.RemoveMapSink(sink) =
             Collections.removeSink &state.Sinks sink
 
-    interface IEdgeTarget with
-        member _.EdgeCount = state.Edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
-
 /// <summary>Keeps the entries of a map that satisfy a predicate.</summary>
 type FilterMapNode<'K, 'V when 'K: equality>
     (source: IAdaptiveMap<'K, 'V>, [<InlineIfLambda>] predicate: 'K -> 'V -> bool) =
@@ -150,7 +145,7 @@ type FilterMapNode<'K, 'V when 'K: equality>
             if not disposed then
                 Collections.journalAppendMap &state.Journal sets setCnt rems remCnt
                 state.Version <- state.Version + 1L
-                GraphContext.Default.MarkFrom(state.Edges)
+                GraphContext.Default.BumpWriteGeneration()
 
     interface IAdaptiveMap<'K, 'V> with
         member this.GetValue() =
@@ -189,11 +184,6 @@ type FilterMapNode<'K, 'V when 'K: equality>
 
         member this.RemoveMapSink(sink) =
             Collections.removeSink &state.Sinks sink
-
-    interface IEdgeTarget with
-        member _.EdgeCount = state.Edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
 
 /// <summary>
 /// Merges two maps with a mapping over both side values (voptions). The
@@ -243,13 +233,13 @@ type Choose2MapNode<'K, 'V1, 'V2, 'V3 when 'K: equality>
         if not disposed then
             Collections.journalAppendMap &state.JournalL sets setCnt rems remCnt
             state.Version <- state.Version + 1L
-            GraphContext.Default.MarkFrom(state.Edges)
+            GraphContext.Default.BumpWriteGeneration()
 
     member private this.OnRightDeltas(sets: struct ('K * 'V2)[], setCnt: int, rems: 'K[], remCnt: int) =
         if not disposed then
             Collections.journalAppendMap &state.JournalR sets setCnt rems remCnt
             state.Version <- state.Version + 1L
-            GraphContext.Default.MarkFrom(state.Edges)
+            GraphContext.Default.BumpWriteGeneration()
 
     interface Collections.ISideMapSinkTarget with
         member this.OnSideDeltas(side: int, sets: obj, setCnt: int, rems: obj, remCnt: int) =
@@ -260,7 +250,7 @@ type Choose2MapNode<'K, 'V1, 'V2, 'V3 when 'K: equality>
                     Collections.journalAppendMap &state.JournalR (unbox sets) setCnt (unbox rems) remCnt
 
                 state.Version <- state.Version + 1L
-                GraphContext.Default.MarkFrom(state.Edges)
+                GraphContext.Default.BumpWriteGeneration()
 
     member private this.EnsureInitialized() =
         if not initialized then
@@ -325,16 +315,10 @@ type Choose2MapNode<'K, 'V1, 'V2, 'V3 when 'K: equality>
         member this.RemoveMapSink(sink) =
             Collections.removeSink &state.Sinks sink
 
-    interface IEdgeTarget with
-        member _.EdgeCount = state.Edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
-
 /// <summary>Internal. State of a set-to-map node (one value per key).</summary>
 [<Struct>]
 type internal SetToMapState<'K, 'V, 'T when 'K: equality> =
     val mutable Version: int64
-    val mutable Edges: ParentEdges
     val mutable Sinks: SinkList
     val mutable DepVersions: int64[]
     val mutable Data: Dictionary<'K, 'V>
@@ -344,7 +328,6 @@ type internal SetToMapState<'K, 'V, 'T when 'K: equality> =
     new
         (
             version: int64,
-            edges: ParentEdges,
             sinks: SinkList,
             depVersions: int64[],
             data: Dictionary<'K, 'V>,
@@ -352,7 +335,6 @@ type internal SetToMapState<'K, 'V, 'T when 'K: equality> =
             out: MapDelta<'K, 'V>
         ) =
         { Version = version
-          Edges = edges
           Sinks = sinks
           DepVersions = depVersions
           Data = data
@@ -362,7 +344,6 @@ type internal SetToMapState<'K, 'V, 'T when 'K: equality> =
     static member Create(depCount: int) =
         SetToMapState(
             0L,
-            ParentEdges(),
             SinkList.Create(),
             Array.zeroCreate depCount,
             Dictionary<'K, 'V>(),
@@ -411,7 +392,7 @@ type SetToMapNode<'K, 'V, 'T when 'K: equality>
             if not disposed then
                 Collections.journalAppendSet &state.Journal adds addCnt rems remCnt
                 state.Version <- state.Version + 1L
-                GraphContext.Default.MarkFrom(state.Edges)
+                GraphContext.Default.BumpWriteGeneration()
 
     interface IAdaptiveMap<'K, 'V> with
         member this.GetValue() =
@@ -508,9 +489,6 @@ type SetToMapNode<'K, 'V, 'T when 'K: equality>
                     finally
                         ctx2.TxActive <- wasActive
 
-                    if not wasActive then
-                        ctx2.DeliverNotifications()
-
                 AdaptiveRuntime.addDependency (this :> IAdaptiveObject) state.Version
                 state.Data :> IReadOnlyDictionary<'K, 'V>
             finally
@@ -531,16 +509,10 @@ type SetToMapNode<'K, 'V, 'T when 'K: equality>
         member this.RemoveMapSink(sink) =
             Collections.removeSink &state.Sinks sink
 
-    interface IEdgeTarget with
-        member _.EdgeCount = state.Edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
-
 /// <summary>Internal. State of a keep-all set-to-map node (per-key value sets).</summary>
 [<Struct>]
 type internal SetToMapKeepAllState<'K, 'V, 'T when 'K: equality> =
     val mutable Version: int64
-    val mutable Edges: ParentEdges
     val mutable Sinks: SinkList
     val mutable DepVersions: int64[]
     val mutable Data: Dictionary<'K, HashSet<'V>>
@@ -550,7 +522,6 @@ type internal SetToMapKeepAllState<'K, 'V, 'T when 'K: equality> =
     new
         (
             version: int64,
-            edges: ParentEdges,
             sinks: SinkList,
             depVersions: int64[],
             data: Dictionary<'K, HashSet<'V>>,
@@ -558,7 +529,6 @@ type internal SetToMapKeepAllState<'K, 'V, 'T when 'K: equality> =
             out: MapDelta<'K, HashSet<'V>>
         ) =
         { Version = version
-          Edges = edges
           Sinks = sinks
           DepVersions = depVersions
           Data = data
@@ -568,7 +538,6 @@ type internal SetToMapKeepAllState<'K, 'V, 'T when 'K: equality> =
     static member Create(depCount: int) =
         SetToMapKeepAllState(
             0L,
-            ParentEdges(),
             SinkList.Create(),
             Array.zeroCreate depCount,
             Dictionary<'K, HashSet<'V>>(),
@@ -624,7 +593,7 @@ type SetToMapKeepAllNode<'K, 'V, 'T when 'K: equality>
             if not disposed then
                 Collections.journalAppendSet &state.Journal adds addCnt rems remCnt
                 state.Version <- state.Version + 1L
-                GraphContext.Default.MarkFrom(state.Edges)
+                GraphContext.Default.BumpWriteGeneration()
 
     interface IAdaptiveMap<'K, HashSet<'V>> with
         member this.GetValue() =
@@ -730,9 +699,6 @@ type SetToMapKeepAllNode<'K, 'V, 'T when 'K: equality>
                     finally
                         ctx2.TxActive <- wasActive
 
-                    if not wasActive then
-                        ctx2.DeliverNotifications()
-
                 AdaptiveRuntime.addDependency (this :> IAdaptiveObject) state.Version
                 state.Data :> IReadOnlyDictionary<'K, HashSet<'V>>
             finally
@@ -753,16 +719,10 @@ type SetToMapKeepAllNode<'K, 'V, 'T when 'K: equality>
         member this.RemoveMapSink(sink) =
             Collections.removeSink &state.Sinks sink
 
-    interface IEdgeTarget with
-        member _.EdgeCount = state.Edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
-
 /// <summary>Internal. State of a map-to-set node (keys or distinct values).</summary>
 [<Struct>]
 type internal MapToSetState<'K, 'V, 'T when 'K: equality and 'T: equality> =
     val mutable Version: int64
-    val mutable Edges: ParentEdges
     val mutable Sinks: SinkList
     val mutable DepVersions: int64[]
     val mutable Mirror: Dictionary<'K, 'T>
@@ -773,7 +733,6 @@ type internal MapToSetState<'K, 'V, 'T when 'K: equality and 'T: equality> =
     new
         (
             version: int64,
-            edges: ParentEdges,
             sinks: SinkList,
             depVersions: int64[],
             mirror: Dictionary<'K, 'T>,
@@ -782,7 +741,6 @@ type internal MapToSetState<'K, 'V, 'T when 'K: equality and 'T: equality> =
             outDelta: SetDelta<'T>
         ) =
         { Version = version
-          Edges = edges
           Sinks = sinks
           DepVersions = depVersions
           Mirror = mirror
@@ -793,7 +751,6 @@ type internal MapToSetState<'K, 'V, 'T when 'K: equality and 'T: equality> =
     static member Create(depCount: int) =
         MapToSetState(
             0L,
-            ParentEdges(),
             SinkList.Create(),
             Array.zeroCreate depCount,
             Dictionary<'K, 'T>(),
@@ -849,7 +806,7 @@ type MapToSetNode<'K, 'V, 'T when 'K: equality and 'T: equality>
             if not disposed then
                 Collections.journalAppendMap &state.Journal sets setCnt rems remCnt
                 state.Version <- state.Version + 1L
-                GraphContext.Default.MarkFrom(state.Edges)
+                GraphContext.Default.BumpWriteGeneration()
 
     interface IAdaptiveSet<'T> with
         member this.GetValue() =
@@ -958,9 +915,6 @@ type MapToSetNode<'K, 'V, 'T when 'K: equality and 'T: equality>
                     finally
                         ctx2.TxActive <- wasActive
 
-                    if not wasActive then
-                        ctx2.DeliverNotifications()
-
                 AdaptiveRuntime.addDependency (this :> IAdaptiveObject) state.Version
                 state.Out.Data :> IReadOnlySet<'T>
             finally
@@ -981,11 +935,6 @@ type MapToSetNode<'K, 'V, 'T when 'K: equality and 'T: equality>
         member this.RemoveSetSink(sink) =
             Collections.removeSink &state.Sinks sink
 
-    interface IEdgeTarget with
-        member _.EdgeCount = state.Edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
-
 /// <summary>
 /// An adaptive map over an adaptive value of a sequence of entries. Every
 /// change of the value replaces the whole state and emits the diff as the
@@ -993,16 +942,11 @@ type MapToSetNode<'K, 'V, 'T when 'K: equality and 'T: equality>
 /// </summary>
 type OfAvalMapNode<'K, 'V, 'S when 'K: equality and 'S :> seq<'K * 'V>>(value: IAdaptiveValue<'S>) =
     let mutable state = MapNodeState<'K, 'V, 'V>.Create(1)
-    let mutable edgeInValue = -1
     let mutable initialized = false
     let mutable disposed = false
 
     member private this.EnsureInitialized() =
         if not initialized then
-            match value with
-            | :? IEdgeTarget as t -> edgeInValue <- t.AddEdge(this :> IAdaptiveNode, -1)
-            | _ -> ()
-
             // Initial load: materialize the value and build the state.
             // The flag is set last: an exception leaves the node uninitialized.
             // The init diff is not pushed: clear the out buffer so it cannot
@@ -1034,21 +978,10 @@ type OfAvalMapNode<'K, 'V, 'S when 'K: equality and 'S :> seq<'K * 'V>>(value: I
                 // source only when it changed (a stuck version makes
                 // derived nodes stale forever).
                 state.Version <- state.Version + 1L
-                Collections.pushAndMarkMap GraphContext.Current state.Out &state.Sinks state.Edges
+                Collections.pushAndBumpMap GraphContext.Current state.Out &state.Sinks
                 state.Out.Clear()
 
             state.DepVersions[0] <- value.Version
-
-    interface IAdaptiveNode with
-        member this.MarkDirty() =
-            GraphContext.Default.MarkFrom(state.Edges)
-
-        member _.SetDepSlot(depIndex: int, parentIndex: int) =
-            if depIndex = -1 then
-                edgeInValue <- parentIndex
-
-        member _.OnFirstParent() = ()
-        member _.OnLastParent() = ()
 
     interface IAdaptiveMap<'K, 'V> with
         member this.GetValue() =
@@ -1075,11 +1008,6 @@ type OfAvalMapNode<'K, 'V, 'S when 'K: equality and 'S :> seq<'K * 'V>>(value: I
         member this.Dispose() =
             if not disposed then
                 disposed <- true
-
-                match value with
-                | :? IEdgeTarget as t -> t.RemoveEdgeAt(edgeInValue)
-                | _ -> ()
-
                 Collections.clearSinks &state.Sinks
 
     interface IMapSinkRegistry with
@@ -1087,11 +1015,6 @@ type OfAvalMapNode<'K, 'V, 'S when 'K: equality and 'S :> seq<'K * 'V>>(value: I
 
         member this.RemoveMapSink(sink) =
             Collections.removeSink &state.Sinks sink
-
-    interface IEdgeTarget with
-        member _.EdgeCount = state.Edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
 
 /// <summary>
 /// An adaptive map whose content is driven by a compute function (FDA
@@ -1122,7 +1045,7 @@ type CustomMapNode<'K, 'V when 'K: equality>
                     state.Data.Remove rems.Items[i] |> ignore
 
                 state.Version <- state.Version + 1L
-                Collections.pushAndMarkMap GraphContext.Current (writer.Snapshot()) &state.Sinks state.Edges
+                Collections.pushAndBumpMap GraphContext.Current (writer.Snapshot()) &state.Sinks
                 writer.Clear()
 
     interface IAdaptiveMap<'K, 'V> with
@@ -1156,11 +1079,6 @@ type CustomMapNode<'K, 'V when 'K: equality>
         member this.RemoveMapSink(sink) =
             Collections.removeSink &state.Sinks sink
 
-    interface IEdgeTarget with
-        member _.EdgeCount = state.Edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
-
 /// <summary>
 /// An adaptive map bound to a scalar value (<c>AMap.bind</c>, PLAN.md Section
 /// 7.4): <c>mapping value</c> selects the inner map; when the value changes, the
@@ -1175,7 +1093,6 @@ type BindMapNode<'K, 'V, 'T when 'K: equality>
     let mutable inner: IAdaptiveMap<'K, 'V> = Unchecked.defaultof<IAdaptiveMap<'K, 'V>>
     let mutable hasInner = false
     let mutable innerVersion = 0L
-    let mutable edgeInValue = -1
     let mutable current: 'T = Unchecked.defaultof<'T>
     let mutable initialized = false
     let mutable disposed = false
@@ -1216,33 +1133,18 @@ type BindMapNode<'K, 'V, 'T when 'K: equality>
 
     member private this.EnsureInitialized() =
         if not initialized then
-            match value with
-            | :? IEdgeTarget as t -> edgeInValue <- t.AddEdge(this :> IAdaptiveNode, -1)
-            | _ -> ()
-
             current <- value.GetValue()
             inner <- mapping current
             this.LoadInner()
             state.DepVersions[0] <- value.Version
             initialized <- true
 
-    interface IAdaptiveNode with
-        member this.MarkDirty() =
-            GraphContext.Default.MarkFrom(state.Edges)
-
-        member _.SetDepSlot(depIndex: int, parentIndex: int) =
-            if depIndex = -1 then
-                edgeInValue <- parentIndex
-
-        member _.OnFirstParent() = ()
-        member _.OnLastParent() = ()
-
     interface IMapDeltaSink<'K, 'V> with
         member this.OnDeltas(sets: struct ('K * 'V)[], setCnt: int, rems: 'K[], remCnt: int) =
             if not disposed then
                 Collections.journalAppendMap &state.Journal sets setCnt rems remCnt
                 state.Version <- state.Version + 1L
-                GraphContext.Default.MarkFrom(state.Edges)
+                GraphContext.Default.BumpWriteGeneration()
 
     interface IAdaptiveMap<'K, 'V> with
         member this.GetValue() =
@@ -1281,11 +1183,6 @@ type BindMapNode<'K, 'V, 'T when 'K: equality>
             if not disposed then
                 disposed <- true
                 this.UnregisterInner()
-
-                match value with
-                | :? IEdgeTarget as t -> t.RemoveEdgeAt(edgeInValue)
-                | _ -> ()
-
                 Collections.clearSinks &state.Sinks
 
     interface IMapSinkRegistry with
@@ -1293,11 +1190,6 @@ type BindMapNode<'K, 'V, 'T when 'K: equality>
 
         member this.RemoveMapSink(sink) =
             Collections.removeSink &state.Sinks sink
-
-    interface IEdgeTarget with
-        member _.EdgeCount = state.Edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
 
 /// <summary>
 /// An adaptive map of a list of entries (FDA <c>AMap.ofAList</c> parity). The
@@ -1307,7 +1199,6 @@ type BindMapNode<'K, 'V, 'T when 'K: equality>
 /// </summary>
 type AListToMapNode<'K, 'V when 'K: equality>(source: IAdaptiveList<'K * 'V>) =
     let mutable version = 0L
-    let mutable edges = ParentEdges()
     let mutable sinks = SinkList.Create()
     let mutable depVersion = 0L
     let mutable initialized = false
@@ -1374,14 +1265,14 @@ type AListToMapNode<'K, 'V when 'K: equality>(source: IAdaptiveList<'K * 'V>) =
 
             journal.Ops.Count <- 0
             version <- version + 1L
-            Collections.pushAndMarkMap GraphContext.Current out &sinks edges
+            Collections.pushAndBumpMap GraphContext.Current out &sinks
 
     interface IListDeltaSink<'K * 'V> with
         member this.OnDeltas(ops: ListOp<'K * 'V>[], opCnt: int) =
             if not disposed then
                 Collections.journalAppendList &journal ops opCnt
                 version <- version + 1L
-                GraphContext.Default.MarkFrom(edges)
+                GraphContext.Default.BumpWriteGeneration()
 
     interface IAdaptiveMap<'K, 'V> with
         member this.GetValue() =
@@ -1420,11 +1311,6 @@ type AListToMapNode<'K, 'V when 'K: equality>(source: IAdaptiveList<'K * 'V>) =
 
         member this.RemoveMapSink(sink) = Collections.removeSink &sinks sink
 
-    interface IEdgeTarget with
-        member _.EdgeCount = edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
-
 /// <summary>
 /// An adaptive list of a map's entries (FDA <c>AMap.toAList</c> parity, poll
 /// node). The order is the map's iteration order, stable while the map does
@@ -1435,7 +1321,6 @@ type MapToAListNode<'K, 'V when 'K: equality>(source: IAdaptiveMap<'K, 'V>) =
     let mutable out = ListDelta<'K * 'V>.Create()
     let mutable version = 0L
     let mutable sinks = SinkList.Create()
-    let edges = ParentEdges()
     let mutable disposed = false
 
     member private this.Poll() =
@@ -1447,7 +1332,7 @@ type MapToAListNode<'K, 'V when 'K: equality>(source: IAdaptiveMap<'K, 'V>) =
 
             if Collections.rebuildListDiff next data &out then
                 version <- version + 1L
-                Collections.pushAndMarkList GraphContext.Current out &sinks edges
+                Collections.pushAndBumpList GraphContext.Current out &sinks
 
             out.Clear()
 
@@ -1480,11 +1365,6 @@ type MapToAListNode<'K, 'V when 'K: equality>(source: IAdaptiveMap<'K, 'V>) =
         member this.AddListSink(sink) = Collections.addSink &sinks sink
 
         member this.RemoveListSink(sink) = Collections.removeSink &sinks sink
-
-    interface IEdgeTarget with
-        member _.EdgeCount = edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
 
 /// <summary>
 /// Maps every entry, disposing the mapped value when its key leaves (FDA
@@ -1551,7 +1431,7 @@ type MapUseMapNode<'K, 'V, 'W when 'K: equality and 'W: equality and 'W :> IDisp
 
         state.Journal.Clear()
         state.Version <- state.Version + 1L
-        Collections.pushAndMarkMap GraphContext.Current state.Out &state.Sinks state.Edges
+        Collections.pushAndBumpMap GraphContext.Current state.Out &state.Sinks
         state.Out.Clear()
 
     interface IMapDeltaSink<'K, 'V> with
@@ -1559,7 +1439,7 @@ type MapUseMapNode<'K, 'V, 'W when 'K: equality and 'W: equality and 'W :> IDisp
             if not disposed then
                 Collections.journalAppendMap &state.Journal sets setCnt rems remCnt
                 state.Version <- state.Version + 1L
-                GraphContext.Default.MarkFrom(state.Edges)
+                GraphContext.Default.BumpWriteGeneration()
 
     interface IAdaptiveMap<'K, 'W> with
         member this.GetValue() =
@@ -1604,8 +1484,3 @@ type MapUseMapNode<'K, 'V, 'W when 'K: equality and 'W: equality and 'W :> IDisp
 
         member this.RemoveMapSink(sink) =
             Collections.removeSink &state.Sinks sink
-
-    interface IEdgeTarget with
-        member _.EdgeCount = state.Edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)

@@ -8,9 +8,9 @@ open System.Collections.Frozen
 // AdaptiveSet transform nodes (PLAN.md Section 6.9)
 //
 // A derived node registers with its dependencies on first read. A dependency
-// push appends to the journal, advances the version, and marks the scalar
-// parents. Reads cascade over changed dependencies, drain the journal, and
-// return a transient view of the internal state. `force` materializes a
+// push appends to the journal and advances the version and the write
+// generation. Reads cascade over changed dependencies, drain the journal,
+// and return a transient view of the internal state. `force` materializes a
 // FrozenSet. Disposal unregisters and stops all delta processing.
 // =============================================================================
 
@@ -76,7 +76,7 @@ type MapSetNode<'T, 'U when 'U: equality>(source: IAdaptiveSet<'T>, [<InlineIfLa
             if not disposed then
                 Collections.journalAppendSet &state.Journal adds addCnt rems remCnt
                 state.Version <- state.Version + 1L
-                GraphContext.Default.MarkFrom(state.Edges)
+                GraphContext.Default.BumpWriteGeneration()
 
     interface IAdaptiveSet<'U> with
         member this.GetValue() =
@@ -116,11 +116,6 @@ type MapSetNode<'T, 'U when 'U: equality>(source: IAdaptiveSet<'T>, [<InlineIfLa
         member this.RemoveSetSink(sink) =
             Collections.removeSink &state.Sinks sink
 
-    interface IEdgeTarget with
-        member _.EdgeCount = state.Edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
-
 /// <summary>Keeps the elements of a set that satisfy a predicate.</summary>
 type FilterSetNode<'T when 'T: equality>(source: IAdaptiveSet<'T>, [<InlineIfLambda>] predicate: 'T -> bool) =
     let mapOpt = fun x -> if predicate x then ValueSome x else ValueNone
@@ -153,7 +148,7 @@ type FilterSetNode<'T when 'T: equality>(source: IAdaptiveSet<'T>, [<InlineIfLam
             if not disposed then
                 Collections.journalAppendSet &state.Journal adds addCnt rems remCnt
                 state.Version <- state.Version + 1L
-                GraphContext.Default.MarkFrom(state.Edges)
+                GraphContext.Default.BumpWriteGeneration()
 
     interface IAdaptiveSet<'T> with
         member this.GetValue() =
@@ -193,11 +188,6 @@ type FilterSetNode<'T when 'T: equality>(source: IAdaptiveSet<'T>, [<InlineIfLam
         member this.RemoveSetSink(sink) =
             Collections.removeSink &state.Sinks sink
 
-    interface IEdgeTarget with
-        member _.EdgeCount = state.Edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
-
 /// <summary>The union of two sets. One reference count per element across both sides.</summary>
 type UnionSetNode<'T when 'T: equality>(left: IAdaptiveSet<'T>, right: IAdaptiveSet<'T>) =
     let deps = [| left; right |]
@@ -235,7 +225,7 @@ type UnionSetNode<'T when 'T: equality>(left: IAdaptiveSet<'T>, right: IAdaptive
             if not disposed then
                 Collections.journalAppendSet &state.Journal adds addCnt rems remCnt
                 state.Version <- state.Version + 1L
-                GraphContext.Default.MarkFrom(state.Edges)
+                GraphContext.Default.BumpWriteGeneration()
 
     interface IAdaptiveSet<'T> with
         member this.GetValue() =
@@ -276,11 +266,6 @@ type UnionSetNode<'T when 'T: equality>(left: IAdaptiveSet<'T>, right: IAdaptive
 
         member this.RemoveSetSink(sink) =
             Collections.removeSink &state.Sinks sink
-
-    interface IEdgeTarget with
-        member _.EdgeCount = state.Edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
 
 /// <summary>
 /// A binary set operation over two sources: difference (left minus right),
@@ -336,7 +321,7 @@ type TwoSourceSetNode<'T when 'T: equality>(op: TwoSetOp, left: IAdaptiveSet<'T>
                     Collections.journalAppendSet &state.JournalR adds addCnt rems remCnt
 
                 state.Version <- state.Version + 1L
-                GraphContext.Default.MarkFrom(state.Edges)
+                GraphContext.Default.BumpWriteGeneration()
 
     interface IAdaptiveSet<'T> with
         member this.GetValue() =
@@ -381,11 +366,6 @@ type TwoSourceSetNode<'T when 'T: equality>(op: TwoSetOp, left: IAdaptiveSet<'T>
         member this.RemoveSetSink(sink) =
             Collections.removeSink &state.Sinks sink
 
-    interface IEdgeTarget with
-        member _.EdgeCount = state.Edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
-
 /// <summary>
 /// An adaptive set over an adaptive value of a sequence. Every change of the
 /// value replaces the whole state and emits the diff as the delta (the value
@@ -394,16 +374,11 @@ type TwoSourceSetNode<'T when 'T: equality>(op: TwoSetOp, left: IAdaptiveSet<'T>
 /// </summary>
 type OfAvalSetNode<'T, 'S when 'T: equality and 'S :> seq<'T>>(value: IAdaptiveValue<'S>) =
     let mutable state = SetNodeState<'T, 'T>.Create(1)
-    let mutable edgeInValue = -1
     let mutable initialized = false
     let mutable disposed = false
 
     member private this.EnsureInitialized() =
         if not initialized then
-            match value with
-            | :? IEdgeTarget as t -> edgeInValue <- t.AddEdge(this :> IAdaptiveNode, -1)
-            | _ -> ()
-
             // Initial load: materialize the value and build the state.
             // The flag is set last: an exception leaves the node uninitialized.
             // The init diff is not pushed: clear the out buffer so it cannot
@@ -428,21 +403,10 @@ type OfAvalSetNode<'T, 'S when 'T: equality and 'S :> seq<'T>>(value: IAdaptiveV
                 // source only when it changed (a stuck version makes
                 // derived nodes stale forever).
                 state.Version <- state.Version + 1L
-                Collections.pushAndMarkSet GraphContext.Current state.Out &state.Sinks state.Edges
+                Collections.pushAndBumpSet GraphContext.Current state.Out &state.Sinks
                 state.Out.Clear()
 
             state.DepVersions[0] <- value.Version
-
-    interface IAdaptiveNode with
-        member this.MarkDirty() =
-            GraphContext.Default.MarkFrom(state.Edges)
-
-        member _.SetDepSlot(depIndex: int, parentIndex: int) =
-            if depIndex = -1 then
-                edgeInValue <- parentIndex
-
-        member _.OnFirstParent() = ()
-        member _.OnLastParent() = ()
 
     interface IAdaptiveSet<'T> with
         member this.GetValue() =
@@ -469,11 +433,6 @@ type OfAvalSetNode<'T, 'S when 'T: equality and 'S :> seq<'T>>(value: IAdaptiveV
         member this.Dispose() =
             if not disposed then
                 disposed <- true
-
-                match value with
-                | :? IEdgeTarget as t -> t.RemoveEdgeAt(edgeInValue)
-                | _ -> ()
-
                 Collections.clearSinks &state.Sinks
 
     interface ISetSinkRegistry with
@@ -481,11 +440,6 @@ type OfAvalSetNode<'T, 'S when 'T: equality and 'S :> seq<'T>>(value: IAdaptiveV
 
         member this.RemoveSetSink(sink) =
             Collections.removeSink &state.Sinks sink
-
-    interface IEdgeTarget with
-        member _.EdgeCount = state.Edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
 
 /// <summary>
 /// An adaptive set over an external reader function. The reader is called on
@@ -505,7 +459,7 @@ type ReaderSetNode<'T when 'T: equality>([<InlineIfLambda>] reader: unit -> Hash
 
             if Collections.rebuildSetDiff next &state then
                 state.Version <- state.Version + 1L
-                Collections.pushAndMarkSet GraphContext.Current state.Out &state.Sinks state.Edges
+                Collections.pushAndBumpSet GraphContext.Current state.Out &state.Sinks
                 state.Out.Clear()
 
     interface IAdaptiveSet<'T> with
@@ -538,11 +492,6 @@ type ReaderSetNode<'T when 'T: equality>([<InlineIfLambda>] reader: unit -> Hash
 
         member this.RemoveSetSink(sink) =
             Collections.removeSink &state.Sinks sink
-
-    interface IEdgeTarget with
-        member _.EdgeCount = state.Edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
 
 /// <summary>
 /// An adaptive set whose content is driven by a compute function. The compute
@@ -601,7 +550,7 @@ type CustomSetNode<'T when 'T: equality>([<InlineIfLambda>] compute: IReadOnlySe
 
                 if not writer.IsEmpty then
                     state.Version <- state.Version + 1L
-                    Collections.pushAndMarkSet GraphContext.Current (writer.Snapshot()) &state.Sinks state.Edges
+                    Collections.pushAndBumpSet GraphContext.Current (writer.Snapshot()) &state.Sinks
 
                 writer.Clear()
 
@@ -635,11 +584,6 @@ type CustomSetNode<'T when 'T: equality>([<InlineIfLambda>] compute: IReadOnlySe
 
         member this.RemoveSetSink(sink) =
             Collections.removeSink &state.Sinks sink
-
-    interface IEdgeTarget with
-        member _.EdgeCount = state.Edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
 
 /// <summary>
 /// An adaptive set that unions one inner adaptive set per source element
@@ -702,14 +646,14 @@ type CollectSetNode<'T, 'U when 'T: equality and 'U: equality>
                     Collections.journalAppendSet &entry.Journal adds addCnt rems remCnt
                     state.Inner[key] <- entry
                     state.Version <- state.Version + 1L
-                    GraphContext.Default.MarkFrom(state.Edges)
+                    GraphContext.Default.BumpWriteGeneration()
 
     interface ISetDeltaSink<'T> with
         member this.OnDeltas(adds: 'T[], addCnt: int, rems: 'T[], remCnt: int) =
             if not disposed then
                 Collections.journalAppendSet &state.Journal adds addCnt rems remCnt
                 state.Version <- state.Version + 1L
-                GraphContext.Default.MarkFrom(state.Edges)
+                GraphContext.Default.BumpWriteGeneration()
 
     interface IAdaptiveSet<'U> with
         member this.GetValue() =
@@ -790,11 +734,6 @@ type CollectSetNode<'T, 'U when 'T: equality and 'U: equality>
         member this.RemoveSetSink(sink) =
             Collections.removeSink &state.Sinks sink
 
-    interface IEdgeTarget with
-        member _.EdgeCount = state.Edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
-
 /// <summary>
 /// An adaptive set bound to a scalar value (<c>ASet.bind</c>, PLAN.md Section
 /// 7.4): <c>mapping value</c> selects the inner set; when the value changes, the
@@ -809,7 +748,6 @@ type BindSetNode<'T, 'U when 'U: equality>
     let mutable inner: IAdaptiveSet<'U> = Unchecked.defaultof<IAdaptiveSet<'U>>
     let mutable hasInner = false
     let mutable innerVersion = 0L
-    let mutable edgeInValue = -1
     let mutable current: 'T = Unchecked.defaultof<'T>
     let mutable initialized = false
     let mutable disposed = false
@@ -850,33 +788,18 @@ type BindSetNode<'T, 'U when 'U: equality>
 
     member private this.EnsureInitialized() =
         if not initialized then
-            match value with
-            | :? IEdgeTarget as t -> edgeInValue <- t.AddEdge(this :> IAdaptiveNode, -1)
-            | _ -> ()
-
             current <- value.GetValue()
             inner <- mapping current
             this.LoadInner()
             state.DepVersions[0] <- value.Version
             initialized <- true
 
-    interface IAdaptiveNode with
-        member this.MarkDirty() =
-            GraphContext.Default.MarkFrom(state.Edges)
-
-        member _.SetDepSlot(depIndex: int, parentIndex: int) =
-            if depIndex = -1 then
-                edgeInValue <- parentIndex
-
-        member _.OnFirstParent() = ()
-        member _.OnLastParent() = ()
-
     interface ISetDeltaSink<'U> with
         member this.OnDeltas(adds: 'U[], addCnt: int, rems: 'U[], remCnt: int) =
             if not disposed then
                 Collections.journalAppendSet &state.Journal adds addCnt rems remCnt
                 state.Version <- state.Version + 1L
-                GraphContext.Default.MarkFrom(state.Edges)
+                GraphContext.Default.BumpWriteGeneration()
 
     interface IAdaptiveSet<'U> with
         member this.GetValue() =
@@ -915,11 +838,6 @@ type BindSetNode<'T, 'U when 'U: equality>
             if not disposed then
                 disposed <- true
                 this.UnregisterInner()
-
-                match value with
-                | :? IEdgeTarget as t -> t.RemoveEdgeAt(edgeInValue)
-                | _ -> ()
-
                 Collections.clearSinks &state.Sinks
 
     interface ISetSinkRegistry with
@@ -927,11 +845,6 @@ type BindSetNode<'T, 'U when 'U: equality>
 
         member this.RemoveSetSink(sink) =
             Collections.removeSink &state.Sinks sink
-
-    interface IEdgeTarget with
-        member _.EdgeCount = state.Edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
 
 /// <summary>
 /// Maps every element, disposing the mapped value when its last source
@@ -1018,7 +931,7 @@ type MapUseSetNode<'A, 'B when 'A: equality and 'B: equality and 'B :> IDisposab
 
         state.Journal.Clear()
         state.Version <- state.Version + 1L
-        Collections.pushAndMarkSet GraphContext.Current state.Out &state.Sinks state.Edges
+        Collections.pushAndBumpSet GraphContext.Current state.Out &state.Sinks
         state.Out.Clear()
 
     interface ISetDeltaSink<'A> with
@@ -1026,7 +939,7 @@ type MapUseSetNode<'A, 'B when 'A: equality and 'B: equality and 'B :> IDisposab
             if not disposed then
                 Collections.journalAppendSet &state.Journal adds addCnt rems remCnt
                 state.Version <- state.Version + 1L
-                GraphContext.Default.MarkFrom(state.Edges)
+                GraphContext.Default.BumpWriteGeneration()
 
     interface IAdaptiveSet<'B> with
         member this.GetValue() =
@@ -1072,8 +985,3 @@ type MapUseSetNode<'A, 'B when 'A: equality and 'B: equality and 'B :> IDisposab
 
         member this.RemoveSetSink(sink) =
             Collections.removeSink &state.Sinks sink
-
-    interface IEdgeTarget with
-        member _.EdgeCount = state.Edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)

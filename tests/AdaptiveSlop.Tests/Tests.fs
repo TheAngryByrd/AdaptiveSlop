@@ -306,44 +306,6 @@ let ``ASet mapA counts duplicate mapped values`` () =
     Assert.Equal<Set<int>>(Set.empty, ASet.toSet result)
 
 [<Fact>]
-let ``ASet mapA delivers targeted deltas to observers`` () =
-    let s = CSet.ofSeq [ 1; 2; 3 ]
-    let even = CVal.create 1
-    let odd = CVal.create 0
-
-    let result =
-        s
-        |> ASet.mapA (fun v -> if v % 2 = 0 then even :> aval<int> else odd :> aval<int>)
-
-    let mutable lastAdds = Set.empty<int>
-    let mutable lastRems = Set.empty<int>
-
-    use _obs =
-        ASet.observe
-            (fun _ (d: SetDelta<int>) ->
-                lastAdds <- d.Added.ToArray() |> Set.ofArray
-                lastRems <- d.Removed.ToArray() |> Set.ofArray)
-            result
-
-    ASet.force result |> ignore
-
-    CVal.set 2 even // element 2: 1 -> 2
-    Assert.Equal<Set<int>>(Set.ofList [ 2 ], lastAdds)
-    Assert.Equal<Set<int>>(Set.ofList [ 1 ], lastRems)
-
-    CVal.set 5 even // element 2: 2 -> 5
-    Assert.Equal<Set<int>>(Set.ofList [ 5 ], lastAdds)
-    Assert.Equal<Set<int>>(Set.ofList [ 2 ], lastRems)
-
-    s.Remove 2 // the only 5 leaves
-    Assert.Equal<Set<int>>(Set.empty, lastAdds)
-    Assert.Equal<Set<int>>(Set.ofList [ 5 ], lastRems)
-
-    s.Add 4 // (4,5)
-    Assert.Equal<Set<int>>(Set.ofList [ 5 ], lastAdds)
-    Assert.Equal<Set<int>>(Set.empty, lastRems)
-
-[<Fact>]
 let ``ASet mapA: a mapping that writes to the source during load is applied`` () =
     let s = CSet.ofSeq [ 1 ]
     let mutable reenter = true
@@ -368,9 +330,8 @@ let ``ASet mapA steady-state element writes allocate zero bytes`` () =
     let s = CSet.ofSeq (List.init 1000 id)
     let v = CVal.create 0
     let result = s |> ASet.mapA (fun _ -> v :> aval<int>)
-    use _obs = ASet.observe (fun _ _ -> ()) result
     ASet.getValue result |> ignore
-    // Warm up: the first write grows the shared mark stack and notification queue.
+    // Warm up: the first reads grow the internal buffers.
     CVal.set 1 v
     ASet.getValue result |> ignore
 
@@ -382,25 +343,6 @@ let ``ASet mapA steady-state element writes allocate zero bytes`` () =
 
     let allocated = GC.GetAllocatedBytesForCurrentThread() - before
     Assert.Equal(0L, allocated)
-
-[<Fact>]
-let ``ASet mapA disposal unregisters every element aval edge`` () =
-    let s = CSet.ofSeq [ 1; 2; 3 ]
-    let v1 = CVal.create 1
-    let v2 = CVal.create 2
-
-    let result =
-        s |> ASet.mapA (fun x -> if x % 2 = 0 then v1 :> aval<int> else v2 :> aval<int>)
-
-    use _obs = ASet.observe (fun _ _ -> ()) result
-    ASet.force result |> ignore
-    let aval1 = v1 :> IEdgeTarget
-    let aval2 = v2 :> IEdgeTarget
-    Assert.Equal(1, aval1.EdgeCount)
-    Assert.Equal(2, aval2.EdgeCount)
-    (result :> IDisposable).Dispose()
-    Assert.Equal(0, aval1.EdgeCount)
-    Assert.Equal(0, aval2.EdgeCount)
 
 [<Fact>]
 let ``ASet countByA counts predicate-aval matches`` () =
@@ -570,43 +512,6 @@ let ``AMap filterA flips with predicate avals`` () =
     Assert.Equal<Map<string, int>>(Map.ofList [ "A", 1; "B", 2; "C", 3; "D", 4 ], AMap.toMap filtered)
 
 [<Fact>]
-let ``AMap mapA delivers targeted deltas to observers`` () =
-    let m = CMap.ofSeq [ "A", 1; "B", 2 ]
-    let flag = CVal.create true
-
-    let res =
-        m
-        |> AMap.mapA (fun _ v ->
-            flag
-            |> AVal.map (function
-                | true -> v
-                | false -> -1))
-
-    let mutable lastSets = Map.empty<string, int>
-    let mutable lastRems = Set.empty<string>
-
-    use _obs =
-        AMap.observe
-            (fun _ (d: MapDelta<string, int>) ->
-                lastSets <- d.SetEntries.ToArray() |> Array.map (fun struct (k, v) -> k, v) |> Map.ofArray
-                lastRems <- d.RemovedKeys.ToArray() |> Set.ofArray)
-            res
-
-    AMap.force res |> ignore
-
-    CVal.set false flag // every entry: v -> -1
-    Assert.Equal<Map<string, int>>(Map.ofList [ "A", -1; "B", -1 ], lastSets)
-    Assert.Equal<Set<string>>(Set.empty, lastRems)
-
-    CMap.remove "A" m
-    Assert.Equal<Map<string, int>>(Map.empty, lastSets)
-    Assert.Equal<Set<string>>(Set.ofList [ "A" ], lastRems)
-
-    CMap.addOrUpdate "C" 3 m // (C,-1)
-    Assert.Equal<Map<string, int>>(Map.ofList [ "C", -1 ], lastSets)
-    Assert.Equal<Set<string>>(Set.empty, lastRems)
-
-[<Fact>]
 let ``AMap mapA steady-state entry writes allocate zero bytes`` () =
     let m = CMap.ofSeq (List.init 1000 (fun i -> i, i))
     let flag = CVal.create true
@@ -619,9 +524,8 @@ let ``AMap mapA steady-state entry writes allocate zero bytes`` () =
                 | true -> v
                 | false -> -1))
 
-    use _obs = AMap.observe (fun _ _ -> ()) res
     AMap.getValue res |> ignore
-    // Warm up: the first write grows the shared mark stack and notification queue.
+    // Warm up: the first reads grow the internal buffers.
     CVal.set false flag
     AMap.getValue res |> ignore
 
@@ -633,26 +537,6 @@ let ``AMap mapA steady-state entry writes allocate zero bytes`` () =
 
     let allocated = GC.GetAllocatedBytesForCurrentThread() - before
     Assert.Equal(0L, allocated)
-
-[<Fact>]
-let ``AMap mapA disposal unregisters every entry aval edge`` () =
-    let m = CMap.ofSeq [ "A", 1; "B", 2 ]
-    let v1 = CVal.create 1
-    let v2 = CVal.create 2
-
-    let res =
-        m
-        |> AMap.mapA (fun _ v -> if v % 2 = 0 then v1 :> aval<int> else v2 :> aval<int>)
-
-    use _obs = AMap.observe (fun _ _ -> ()) res
-    AMap.force res |> ignore
-    let aval1 = v1 :> IEdgeTarget
-    let aval2 = v2 :> IEdgeTarget
-    Assert.Equal(1, aval1.EdgeCount)
-    Assert.Equal(1, aval2.EdgeCount)
-    (res :> IDisposable).Dispose()
-    Assert.Equal(0, aval1.EdgeCount)
-    Assert.Equal(0, aval2.EdgeCount)
 
 [<Fact>]
 let ``Transaction defers ChangeableValue updates`` () =
@@ -1608,46 +1492,13 @@ let ``Union delta sequences preserve duplicate semantics`` () =
 
 
 // =============================================================================
-// Phase 3/4 — Push-marking and observation
+// Phase 3/4 — Dependency tracking and transactions
 // =============================================================================
-
-[<Fact>]
-let ``Observed chain updates after source write`` () =
-    let a = CVal.create 1
-    let m1 = AVal.map (fun v -> v + 1) (CVal.value a)
-    let m2 = AVal.map (fun v -> v * 2) m1
-    let joined = AVal.map2 (+) m2 (CVal.value a)
-    let mutable seen = []
-    use _obs = AVal.observe (fun v -> seen <- v :: seen) joined
-
-    a.Set(2)
-    Assert.Equal<int list>([ 8 ], seen) // (2+1)*2 + 2
-
-    a.Set(3)
-    Assert.Equal<int list>([ 11; 8 ], seen)
-
-[<Fact>]
-let ``Observed mixed chain of generic and wide nodes updates after source write`` () =
-    let a = CVal.create 1
-    let b = CVal.create 2
-    let c = CVal.create 3
-    let sum = AVal.sum [| CVal.value a; CVal.value b; CVal.value c |]
-
-    let wide =
-        AVal.mapN (fun values -> values |> Array.fold (*) 1) [| CVal.value a; CVal.value c |]
-
-    let joined = AVal.map2 (+) sum wide
-    let mutable seen = []
-    use _obs = AVal.observe (fun v -> seen <- v :: seen) joined
-
-    a.Set(10)
-    Assert.Equal<int list>([ 45 ], seen) // (10+2+3) + (10*3)
 
 [<Fact>]
 let ``Several writes between reads produce the last value`` () =
     let a = CVal.create 0
     let m = AVal.map (fun v -> v + 1) (CVal.value a)
-    use _obs = AVal.observe ignore m
 
     a.Set(1)
     a.Set(2)
@@ -1655,37 +1506,11 @@ let ``Several writes between reads produce the last value`` () =
     Assert.Equal(4, AVal.getValue m)
 
 [<Fact>]
-let ``Writes inside one transaction produce one notification after the batch`` () =
-    let a = CVal.create 0
-    let m = AVal.map (fun v -> v + 1) (CVal.value a)
-    let mutable count = 0
-    let mutable last = 0
-
-    use _obs =
-        AVal.observe
-            (fun v ->
-                count <- count + 1
-                last <- v)
-            m
-
-    Transaction.run (fun () ->
-        a.Set(1)
-        a.Set(2)
-        a.Set(3)
-        // No notification during the batch.
-        Assert.Equal(0, count))
-    |> ignore
-
-    Assert.Equal(1, count)
-    Assert.Equal(4, last)
-
-[<Fact>]
-let ``Arbitrary interleaving stays correct under observation`` () =
+let ``Arbitrary interleaving stays correct`` () =
     let a = CVal.create 0
     let b = CVal.create 0
     let sum = AVal.map2 (+) (CVal.value a) (CVal.value b)
     let doubled = AVal.map (fun v -> v * 2) sum
-    use _obs = AVal.observe ignore doubled
     let rng = Random(43)
 
     for _ in 1..200 do
@@ -1699,69 +1524,15 @@ let ``Arbitrary interleaving stays correct under observation`` () =
         Assert.Equal(expected, AVal.getValue doubled)
 
 [<Fact>]
-let ``Disposed observation stops notifications and reads fall back to version checks`` () =
-    let a = CVal.create 1
-    let m = AVal.map (fun v -> v + 1) (CVal.value a)
-    let mutable count = 0
-    let obs = AVal.observe (fun _ -> count <- count + 1) m
-
-    a.Set(2)
-    Assert.Equal(1, count)
-
-    obs.Dispose()
-    Assert.False(obs.IsActive)
-
-    a.Set(3)
-    Assert.Equal(1, count)
-    // Reads still work through the version-check fallback.
-    Assert.Equal(4, AVal.getValue m)
-
-[<Fact>]
-let ``Bind switch under observation tracks the live branch`` () =
-    let selector = CVal.create true
-    let left = CVal.create 1
-    let right = CVal.create 10
-
-    let bound =
-        AVal.bind (fun useLeft -> if useLeft then CVal.value left else CVal.value right) (CVal.value selector)
-
-    let mutable count = 0
-    let mutable last = 0
-
-    use _obs =
-        AVal.observe
-            (fun v ->
-                count <- count + 1
-                last <- v)
-            bound
-
-    left.Set(2)
-    Assert.Equal(2, last)
-
-    selector.Set(false)
-    Assert.Equal(10, last)
-    let countAfterSwitch = count
-
-    // The dropped branch must not notify.
-    left.Set(99)
-    Assert.Equal(countAfterSwitch, count)
-
-    // The live branch notifies.
-    right.Set(20)
-    Assert.Equal(20, last)
-
-[<Fact>]
-let ``Writing an equal value does not mark and does not notify`` () =
+let ``Writing an equal value does not mark`` () =
     let a = CVal.create 5
     let m = AVal.map (fun v -> v + 1) (CVal.value a)
-    let mutable count = 0
-    use _obs = AVal.observe (fun _ -> count <- count + 1) m
+    let _ = AVal.getValue m
 
     let versionBefore = (CVal.value a :> IAdaptiveObject).Version
     a.Set(5)
 
     Assert.Equal(versionBefore, (CVal.value a :> IAdaptiveObject).Version)
-    Assert.Equal(0, count)
 
 [<Fact>]
 let ``Transaction rollback resets collection journals`` () =
@@ -1778,32 +1549,6 @@ let ``Transaction rollback resets collection journals`` () =
     // The journal must be clean: the next write applies normally.
     s.Add(3)
     Assert.Equal<Set<int>>(Set.ofList [ 1; 3 ], ASet.toSet (CSet.value s))
-
-[<Fact>]
-let ``Steady-state observed operations allocate zero bytes`` () =
-    let a = CVal.create 1
-    let m = AVal.map (fun v -> v + 1) (CVal.value a)
-    use _obs = AVal.observe ignore m
-    let _ = AVal.getValue m
-
-    let beforeRead = GC.GetAllocatedBytesForCurrentThread()
-
-    for _ in 1..1000 do
-        AVal.getValue m |> ignore
-
-    let readAllocated = GC.GetAllocatedBytesForCurrentThread() - beforeRead
-
-    Assert.Equal(0L, readAllocated)
-
-    let beforeWrite = GC.GetAllocatedBytesForCurrentThread()
-
-    for i in 1..1000 do
-        a.Set(i)
-
-    let writeAllocated = GC.GetAllocatedBytesForCurrentThread() - beforeWrite
-
-    Assert.Equal(0L, writeAllocated)
-
 
 [<Fact>]
 let ``Transaction run returns the function result`` () =
@@ -1878,8 +1623,6 @@ let ``Posted values apply at the next graph operation without pump`` () =
 [<Fact>]
 let ``Posts from a foreign thread apply at the next graph operation`` () =
     let a = CVal.create 0
-    let mutable seen: int list = []
-    use _obs = AVal.observe (fun v -> seen <- v :: seen) (CVal.value a)
 
     let producer =
         Task.Run(fun () ->
@@ -1892,7 +1635,7 @@ let ``Posts from a foreign thread apply at the next graph operation`` () =
 
     // The first owner read drains: one application of the last posted value.
     Assert.Equal(100, AVal.getValue (CVal.value a))
-    Assert.Equal<int list>([ 100 ], seen)
+    Assert.Equal(1L, (CVal.value a :> IAdaptiveObject).Version)
 
 [<Fact>]
 let ``Posts from several threads collapse to one application per batch`` () =
@@ -1927,12 +1670,12 @@ let ``Posts from several threads collapse to one application per batch`` () =
 [<Fact>]
 let ``Posting an equal value does not mark`` () =
     let a = CVal.create 5
-    let mutable count = 0
-    use _obs = AVal.observe (fun _ -> count <- count + 1) (CVal.value a)
+    let versionBefore = (CVal.value a :> IAdaptiveObject).Version
 
     a.Post(5)
     Posting.pump ()
-    Assert.Equal(0, count)
+
+    Assert.Equal(versionBefore, (CVal.value a :> IAdaptiveObject).Version)
 
 [<Fact>]
 let ``Post and pump allocate zero bytes`` () =
@@ -2056,25 +1799,6 @@ let ``derived collections register lazily and dispose cleanly`` () =
     Assert.Equal(0, cs.SinkCount)
 
 [<Fact>]
-let ``scalar dependency on a derived collection stays fresh`` () =
-    // A notification callback reads a derived collection: the chain
-    // (source -> map node -> scalar read in the callback) must deliver the
-    // updated state through the receipt marking and the drain.
-    let source = CSet.ofSeq [ 1; 2; 3 ]
-    let mapped = ASet.map (fun v -> v * 2) (CSet.value source)
-    let trigger = CVal.create 0
-    let mutable seen: int list = []
-
-    use _obs =
-        AVal.observe (fun _ -> seen <- (Set.count (ASet.toSet mapped)) :: seen) trigger
-
-    CSet.add 4 source
-    CSet.remove 1 source
-    trigger.Set(1) // fires the callback, which reads the derived collection
-    Assert.Equal(3, Set.count (ASet.toSet mapped)) // {4, 6, 8}
-    Assert.Equal(3, List.head seen)
-
-[<Fact>]
 let ``add and remove of one element in a transaction collapse to no delta`` () =
     let source = CSet.ofSeq [ 1; 2 ]
     let mutable processed = 0
@@ -2164,220 +1888,11 @@ let ``derived chain processes nothing when never read`` () =
     let _ = ASet.toSet mapped
     Assert.Equal(100, processed)
 
-// =============================================================================
-// Phase 7 — Collection observation
-// =============================================================================
-
-[<Fact>]
-let ``ASet observe delivers net deltas with the current view`` () =
-    let source = CSet.empty<int>
-    let views = ResizeArray<Set<int>>()
-    let adds = ResizeArray<Set<int>>()
-    let rems = ResizeArray<Set<int>>()
-
-    use obs =
-        ASet.observe
-            (fun view delta ->
-                views.Add(Set.ofSeq view)
-                adds.Add(Set.ofArray (delta.Added.ToArray()))
-                rems.Add(Set.ofArray (delta.Removed.ToArray())))
-            (CSet.value source)
-
-    CSet.add 1 source
-    CSet.add 2 source
-    CSet.remove 1 source
-    CSet.add 3 source
-
-    Assert.Equal<Set<int>>(
-        [ Set.ofList [ 1 ]; Set.ofList [ 1; 2 ]; Set.ofList [ 2 ]; Set.ofList [ 2; 3 ] ],
-        List.ofSeq views
-    )
-
-    Assert.Equal<Set<int>>([ Set.ofList [ 1 ]; Set.ofList [ 2 ]; Set.empty; Set.ofList [ 3 ] ], List.ofSeq adds)
-
-    Assert.Equal<Set<int>>([ Set.empty; Set.empty; Set.ofList [ 1 ]; Set.empty ], List.ofSeq rems)
-
-[<Fact>]
-let ``AMap observe delivers set entries and removed keys`` () =
-    let source = CMap.empty<string, int>
-    let seen = ResizeArray<Set<string * int> * Set<string> * int>()
-
-    use obs =
-        AMap.observe
-            (fun view delta ->
-                let sets =
-                    delta.SetEntries.ToArray()
-                    |> Array.map (fun struct (k, v) -> k, v)
-                    |> Set.ofArray
-
-                let rems = delta.RemovedKeys.ToArray() |> Set.ofArray
-                seen.Add(sets, rems, view.Count))
-            (CMap.value source)
-
-    CMap.addOrUpdate "a" 1 source
-    CMap.addOrUpdate "a" 2 source
-    CMap.remove "a" source
-    CMap.addOrUpdate "b" 7 source
-
-    Assert.Equal<Set<string * int> * Set<string> * int>(
-        [ Set.ofList [ "a", 1 ], Set.empty, 1
-          Set.ofList [ "a", 2 ], Set.empty, 1
-          Set.empty, Set.ofList [ "a" ], 0
-          Set.ofList [ "b", 7 ], Set.empty, 1 ],
-        List.ofSeq seen
-    )
-
-[<Fact>]
-let ``collection observe ignores no-op writes`` () =
-    let mapSource = CMap.empty<string, int>
-    let mutable mapCount = 0
-
-    use obsMap =
-        AMap.observe (fun _ _ -> mapCount <- mapCount + 1) (CMap.value mapSource)
-
-    CMap.addOrUpdate "a" 1 mapSource
-    CMap.addOrUpdate "a" 1 mapSource // same value: elided at the source
-    CMap.remove "b" mapSource // absent: elided at the source
-    Assert.Equal(1, mapCount)
-
-    let setSource = CSet.empty<int>
-    let mutable setCount = 0
-
-    use obsSet =
-        ASet.observe (fun _ _ -> setCount <- setCount + 1) (CSet.value setSource)
-
-    CSet.add 1 setSource
-    CSet.add 1 setSource // already present: elided
-    CSet.remove 2 setSource // absent: elided
-    Assert.Equal(1, setCount)
-
-[<Fact>]
-let ``collection observe skips a transaction that nets to nothing`` () =
-    let source = CSet.empty<int>
-    let mutable count = 0
-
-    use obs = ASet.observe (fun _ _ -> count <- count + 1) (CSet.value source)
-
-    Transaction.run (fun () ->
-        CSet.add 1 source
-        CSet.remove 1 source)
-
-    Assert.Equal(0, count)
-
-    Transaction.run (fun () -> CSet.add 1 source)
-    Assert.Equal(1, count)
-
-[<Fact>]
-let ``collection observe works on derived nodes`` () =
-    let source = CMap.empty<int, int>
-    let mapped = AMap.map (fun k v -> v * 10) (CMap.value source)
-    let seen = ResizeArray<Set<int * int> * Set<int> * int>()
-
-    use obs =
-        AMap.observe
-            (fun view delta ->
-                let sets =
-                    delta.SetEntries.ToArray()
-                    |> Array.map (fun struct (k, v) -> k, v)
-                    |> Set.ofArray
-
-                let rems = delta.RemovedKeys.ToArray() |> Set.ofArray
-                seen.Add(sets, rems, view.Count))
-            mapped
-
-    // Nothing else reads the derived node: the observation's own delivery
-    // drains it.
-    CMap.addOrUpdate 1 5 source
-    CMap.addOrUpdate 2 6 source
-    CMap.remove 1 source
-
-    Assert.Equal<Set<int * int> * Set<int> * int>(
-        [ Set.ofList [ 1, 50 ], Set.empty, 1
-          Set.ofList [ 2, 60 ], Set.empty, 2
-          Set.empty, Set.ofList [ 1 ], 1 ],
-        List.ofSeq seen
-    )
-
-[<Fact>]
-let ``collection observe stays silent when a derived filter drops the change`` () =
-    let source = CMap.empty<int, int>
-    let filtered = AMap.filter (fun _ v -> v > 10) (CMap.value source)
-    let mutable count = 0
-
-    use obs = AMap.observe (fun _ _ -> count <- count + 1) filtered
-
-    CMap.addOrUpdate 1 5 source // filtered out: no output delta
-    CMap.addOrUpdate 2 20 source
-    Assert.Equal(1, count)
-
-[<Fact>]
-let ``collection observe does not fire on attach`` () =
-    let source = CSet.ofSeq [ 1; 2; 3 ]
-    let mutable count = 0
-
-    use obs = ASet.observe (fun _ _ -> count <- count + 1) (CSet.value source)
-
-    Assert.Equal(0, count)
-    CSet.add 4 source
-    Assert.Equal(1, count)
-
-[<Fact>]
-let ``collection observe supports reentrant writes and disposes cleanly`` () =
-    let source = CSet.empty<int>
-    let mutable count = 0
-    let mutable reentrant = false
-
-    use obs =
-        ASet.observe
-            (fun view _ ->
-                count <- count + 1
-
-                if not reentrant && view.Count = 1 then
-                    reentrant <- true
-                    CSet.add 2 source)
-            (CSet.value source)
-
-    CSet.add 1 source
-    Assert.Equal(2, count) // the reentrant write was delivered too
-
-    obs.Dispose()
-    CSet.add 3 source
-    Assert.Equal(2, count) // no delivery after dispose
-    Assert.False(obs.IsActive)
-
-[<Fact>]
-let ``collection observe delivers steady-state with zero allocation`` () =
-    let source = CSet.empty<int>
-    let mutable count = 0
-
-    use obs = ASet.observe (fun _ _ -> count <- count + 1) (CSet.value source)
-
-    // Warm-up: grow the source, its flush buffer, and the observer scratch to
-    // steady-state sizes, and run one delivery per write.
-    for i in 1..50 do
-        CSet.add i source
-
-    for i in 1..50 do
-        CSet.remove i source
-
-    // Steady state: 150 effective writes (adds for keys 1..50, then remove+add
-    // pairs that hit present keys). The set stays at 50 elements: no growth.
-    let before = GC.GetAllocatedBytesForCurrentThread()
-
-    for i in 1..100 do
-        let k = (i % 50) + 1
-        CSet.remove k source
-        CSet.add k source
-
-    let allocated = GC.GetAllocatedBytesForCurrentThread() - before
-    Assert.Equal(250, count)
-    Assert.Equal(0L, allocated)
-
 [<Fact>]
 let ``sequential transactions each apply their collection writes`` () =
     // Regression: CommitJournal never reset flushEnqueued, so the flush of a
     // second sequential transaction was never re-enqueued and its writes were
-    // silently lost (exposed by the observation tests).
+    // silently lost.
     let setSource = CSet.empty<int>
     Transaction.run (fun () -> CSet.add 1 setSource)
     Transaction.run (fun () -> CSet.add 2 setSource)
@@ -2635,19 +2150,6 @@ let ``single builds constant singletons`` () =
 
     let mapValue = AMap.single "k" 7
     Assert.Equal(7, (AMap.force mapValue)["k"])
-
-[<Fact>]
-let ``reductions compose with observation`` () =
-    let source = CSet.empty<int>
-    let count = ASet.count (CSet.value source)
-    let seen = ResizeArray<int>()
-
-    use obs = AVal.observe (fun v -> seen.Add v) count
-
-    CSet.add 1 source
-    CSet.add 2 source
-    CSet.remove 1 source
-    Assert.Equal<int list>([ 1; 2; 1 ], List.ofSeq seen)
 
 [<Fact>]
 let ``reduction over a derived set receives deltas`` () =
@@ -3081,65 +2583,6 @@ let ``AMap custom drives content from a compute`` () =
     d.Set("x", 1)
     pending.Add d
     Assert.Equal<Map<_, _>>(Map.ofList [ "x", 1 ], Map.ofSeq (seq { for KeyValue(k, v) in AMap.force m -> k, v }))
-
-[<Fact>]
-let ``observation through two-source nodes delivers correct deltas`` () =
-    let left = CSet.empty<int>
-    let right = CSet.empty<int>
-    let inter = ASet.intersect (CSet.value left) (CSet.value right)
-    let mutable events = ResizeArray<Set<int>>()
-
-    use obs =
-        ASet.observe
-            (fun view delta ->
-                let mutable s = Set.ofSeq view
-
-                for r in delta.Removed.ToArray() do
-                    s <- s.Remove r
-
-                for a in delta.Added.ToArray() do
-                    s <- s.Add a
-
-                events.Add s)
-            inter
-
-    CSet.add 1 left
-    CSet.add 1 right
-    CSet.add 2 left
-    CSet.add 3 right
-    CSet.remove 1 right
-    CSet.remove 1 left
-
-    // The events reconstruct the view state after each batch.
-    // add 1 left: not in the intersection yet -> no event.
-    // add 1 right: 1 joins the intersection -> [1].
-    // add 2 left / add 3 right: no intersection change -> no event.
-    // remove 1 right: the intersection empties -> [].
-    // remove 1 left: no intersection change -> no event.
-    Assert.Equal<Set<int> list>([ Set.ofList [ 1 ]; Set.empty ], List.ofSeq events)
-
-    // Two-source map node through an observer.
-    let a = CMap.empty<string, int>
-    let b = CMap.empty<string, int>
-    let iw = AMap.intersectWith (fun _ l r -> l + r) (CMap.value a) (CMap.value b)
-    let mutable last = Map.empty
-
-    use obs2 =
-        AMap.observe
-            (fun view delta ->
-                let mutable s = Map.empty
-
-                for KeyValue(k, v) in view do
-                    s <- Map.add k v s
-
-                last <- s)
-            iw
-
-    CMap.addOrUpdate "x" 1 a
-    CMap.addOrUpdate "x" 2 b
-    Assert.Equal<Map<_, _>>(Map.ofList [ "x", 3 ], last)
-    CMap.addOrUpdate "x" 5 a
-    Assert.Equal<Map<_, _>>(Map.ofList [ "x", 7 ], last)
 
 [<Fact>]
 let ``dirty derived source at first read does not double-apply`` () =
@@ -3652,11 +3095,13 @@ let ``cval Value property and UpdateTo`` () =
 [<Fact>]
 let ``cval Value set inside a transaction defers`` () =
     let c = CVal.create 1
-    let mutable delivered = 0
-    use obs = AVal.observe (fun _ -> delivered <- delivered + 1) (CVal.value c)
 
-    Transaction.run (fun () -> c.Value <- 2)
-    Assert.Equal(1, delivered) // one notification for the batch
+    Transaction.run (fun () ->
+        c.Value <- 2
+        // Reads inside the transaction see the pre-transaction value.
+        Assert.Equal(1, AVal.getValue (CVal.value c)))
+    |> ignore
+
     Assert.Equal(2, AVal.getValue (CVal.value c))
 
 [<Fact>]
@@ -3805,50 +3250,12 @@ let ``AList filterA flips with predicate avals`` () =
     Assert.Equal<int list>([ 0; 1; 2; 3; 4 ], AList.toList filtered)
 
 [<Fact>]
-let ``AList mapA delivers targeted deltas to observers`` () =
-    let l = CList.ofList [ 1; 2; 3 ]
-    let even = CVal.create 1
-    let odd = CVal.create 0
-
-    let result =
-        l
-        |> AList.mapA (fun v -> if v % 2 = 0 then even :> aval<int> else odd :> aval<int>)
-
-    let mutable lastOps = []
-
-    use _obs =
-        AList.observe
-            (fun _ (d: ListDelta<int>) ->
-                lastOps <-
-                    d.Operations.ToArray()
-                    |> Array.map (fun op ->
-                        match op.Kind with
-                        | ListOpKind.Insert -> sprintf "I%d:%d" op.Position op.Value
-                        | ListOpKind.Remove -> sprintf "R%d" op.Position
-                        | ListOpKind.Update -> sprintf "U%d:%d" op.Position op.Value
-                        | _ -> "?")
-                    |> List.ofArray)
-            result
-
-    AList.force result |> ignore
-
-    CVal.set 2 odd // elements 0 and 2: 0 -> 2
-    Assert.Equal<string list>([ "U0:2"; "U2:2" ], lastOps)
-
-    CVal.set 5 even // element at position 1: 1 -> 5
-    Assert.Equal<string list>([ "U1:5" ], lastOps)
-
-    CList.append 4 l // (4,5)
-    Assert.Equal<string list>([ "I3:5" ], lastOps)
-
-[<Fact>]
 let ``AList mapA steady-state element writes allocate zero bytes`` () =
     let l = CList.ofList (List.init 1000 id)
     let v = CVal.create 0
     let result = l |> AList.mapA (fun _ -> v :> aval<int>)
-    use _obs = AList.observe (fun _ _ -> ()) result
     AList.getValue result |> ignore
-    // Warm up: the first write grows the shared mark stack and notification queue.
+    // Warm up: the first reads grow the internal buffers.
     CVal.set 1 v
     AList.getValue result |> ignore
 
@@ -3860,26 +3267,6 @@ let ``AList mapA steady-state element writes allocate zero bytes`` () =
 
     let allocated = GC.GetAllocatedBytesForCurrentThread() - before
     Assert.Equal(0L, allocated)
-
-[<Fact>]
-let ``AList mapA disposal unregisters every element aval edge`` () =
-    let l = CList.ofList [ 1; 2; 3 ]
-    let v1 = CVal.create 1
-    let v2 = CVal.create 2
-
-    let result =
-        l
-        |> AList.mapA (fun x -> if x % 2 = 0 then v1 :> aval<int> else v2 :> aval<int>)
-
-    use _obs = AList.observe (fun _ _ -> ()) result
-    AList.force result |> ignore
-    let aval1 = v1 :> IEdgeTarget
-    let aval2 = v2 :> IEdgeTarget
-    Assert.Equal(1, aval1.EdgeCount)
-    Assert.Equal(2, aval2.EdgeCount)
-    (result :> IDisposable).Dispose()
-    Assert.Equal(0, aval1.EdgeCount)
-    Assert.Equal(0, aval2.EdgeCount)
 
 [<Fact>]
 let ``AList mapiA passes the position at mapping time`` () =
@@ -4015,15 +3402,13 @@ let ``AList append concatenates with cross-source ordering`` () =
 [<Fact>]
 let ``ChangeableList transactions replay in order`` () =
     let src = CList.ofList [ 1; 2; 3 ]
-    let mutable deliveries = 0
-    use obs = AList.observe (fun _ _ -> deliveries <- deliveries + 1) (CList.value src)
 
     Transaction.run (fun () ->
         CList.append 4 src
         CList.removeAt 0 src)
+    |> ignore
 
     Assert.Equal<int list>([ 2; 3; 4 ], AList.toList (CList.value src))
-    Assert.Equal(1, deliveries) // one batch, one notification
 
 [<Fact>]
 let ``ChangeableList Set and Clear inside transactions`` () =
@@ -4060,38 +3445,12 @@ let ``ChangeableList Set and Clear inside transactions`` () =
 [<Fact>]
 let ``ChangeableList no-op writes do not mark`` () =
     let src = CList.ofList [ 1; 2 ]
-    let mutable deliveries = 0
-    use obs = AList.observe (fun _ _ -> deliveries <- deliveries + 1) (CList.value src)
+    let versionBefore = (CList.value src :> IAdaptiveObject).Version
     CList.updateAt 0 1 src // equal value
     CList.remove 99 src // absent
-    Assert.Equal(0, deliveries)
+    Assert.Equal(versionBefore, (CList.value src :> IAdaptiveObject).Version)
     CList.updateAt 0 2 src
-    Assert.Equal(1, deliveries)
-
-[<Fact>]
-let ``AList observe receives ordered deltas`` () =
-    let src = CList.ofList [ 1; 2; 3 ]
-    let mutable ops: struct (ListOpKind * int * int) list = []
-
-    use obs =
-        AList.observe
-            (fun _ delta ->
-                ops <-
-                    delta.Operations.ToArray()
-                    |> Array.map (fun op -> struct (op.Kind, op.Position, op.Value))
-                    |> Array.toList)
-            (CList.value src)
-
-    Assert.Equal<struct (ListOpKind * int * int) list>([], ops) // no callback on attach
-
-    Transaction.run (fun () ->
-        CList.append 4 src
-        CList.removeAt 0 src)
-
-    Assert.Equal<struct (ListOpKind * int * int) list>(
-        [ struct (ListOpKind.Insert, 3, 4); struct (ListOpKind.Remove, 0, 0) ],
-        ops
-    )
+    Assert.Equal(versionBefore + 1L, (CList.value src :> IAdaptiveObject).Version)
 
 [<Fact>]
 let ``AList count and isEmpty`` () =
@@ -4162,25 +3521,20 @@ let ``AList drains allocate zero in steady state`` () =
     // Permanent allocation test (ALIST-DESIGN.md §7): an N-op batch
     // (write + drain + delivery) allocates 0 bytes after warmup.
     //
-    // Chain-depth semantics match the set world: the version check in a node
-    // read reaches its direct source only (depth 2 works; deeper unobserved
-    // chains are not drained by a single read). The read here targets
-    // `filtered` (depth 2), which drains the chain; the observe on `appended`
-    // then receives the deltas through that read.
+    // Chain-depth semantics: the version check in a node read reaches its
+    // direct source only (depth 2 works; deeper unobserved chains are not
+    // drained by a single read). The read here targets `filtered` (depth 2),
+    // which drains the chain.
     //
     // The filter predicate passes every value (mapped = x*2 is always even),
     // so every write produces an output delta. The read each iteration drains
-    // both writes as one batch: one delivery per iteration (100).
+    // both writes as one batch.
     let src = CList.ofList [ for i in 1..100 -> i ]
     let mapped = AList.map (fun x -> x * 2) (CList.value src)
     let filtered = AList.filter (fun x -> x % 2 = 0) mapped
-    let right = CList.ofList [ -1; -2 ]
-    let appended = AList.append filtered (CList.value right)
-    let mutable delivered = 0
-    use obs = AList.observe (fun _ _ -> delivered <- delivered + 1) appended
 
     // Warm up: read once (registers the chain and grows every buffer).
-    AList.toList appended |> ignore
+    AList.toList filtered |> ignore
 
     let step () =
         for i in 1..100 do
@@ -4189,12 +3543,10 @@ let ``AList drains allocate zero in steady state`` () =
             AList.getValue filtered |> ignore
 
     step ()
-    delivered <- 0
     let before = GC.GetAllocatedBytesForCurrentThread()
     step ()
     let allocated = GC.GetAllocatedBytesForCurrentThread() - before
     Assert.Equal(0L, allocated)
-    Assert.Equal(100, delivered)
 
 [<Fact>]
 let ``transaction appends land in write order`` () =
@@ -4325,30 +3677,6 @@ let ``AList filter keeps positions after an update that changes survival`` () =
     Assert.Empty(AList.toList evens)
 
 [<Fact>]
-let ``AMap observe delivers the net of a set-then-rem batch`` () =
-    // KIMI 4: the reduceJournal counted +1/-1 per key and lost a key that was
-    // set and removed in one delivery (no callback, or a KeyNotFound).
-    let l = CMap.ofSeq [ "k", 1 ]
-    let r = CMap.empty<string, int>
-    let u = AMap.unionWith (fun _ a b -> a + b) (CMap.value l) (CMap.value r)
-    let delivered = ResizeArray<MapDelta<string, int>>()
-    use obs = AMap.observe (fun _ d -> delivered.Add d) u
-
-    Transaction.run (fun () ->
-        CMap.remove "k" l
-        CMap.addOrUpdate "k" 2 r)
-
-    // Net: the key is present with 2 -> exactly one delivery, a Set.
-    Assert.Single(delivered) |> ignore
-    let d = delivered[0]
-    let entries = d.SetEntries.ToArray()
-    Assert.Single(entries) |> ignore
-    Assert.Empty(d.RemovedKeys.ToArray())
-    let struct (k, v) = entries[0]
-    Assert.Equal("k", k)
-    Assert.Equal(2, v)
-
-[<Fact>]
 let ``ChangeableList transaction update equality checks the replay state`` () =
     // KIMI 5: an update that restores the committed value of a position
     // touched earlier in the batch must still journal.
@@ -4362,38 +3690,35 @@ let ``ChangeableList transaction update equality checks the replay state`` () =
 
 [<Fact>]
 let ``ReduceNode recomputes when a write lands mid-reduce`` () =
-    // GLM 1 / KIMI 6: ReduceNode.Recompute ignored checkedGen, so a write from
-    // user code inside the reduce callback was overwritten by Clean and the
-    // stale value was served as fresh. Observed node, so the flag is the only
-    // signal (the version walk is skipped for Clean nodes).
+    // GLM 1 / KIMI 6: a write from user code inside the reduce callback moves
+    // the write generation; the node caches its verdict at the start
+    // generation, so the next read version-checks and sees the moved
+    // dependency version instead of serving the stale value.
     let a = CVal.create 1
     let b = CVal.create 100
     let mutable n = 0
-    // Writes to b on the first and third compute (b is read before the write,
-    // so the third compute's value is stale). The third write changes the
-    // value: an equal write would not move the generation.
+    // Compute 2 writes a while processing it (a was already read): the
+    // computed value is stale for a.
     let r =
         AVal.reduce
             0
             (fun acc x ->
                 n <- n + 1
 
-                if n = 1 then
-                    CVal.set 200 b
-                elif n = 3 then
-                    CVal.set 300 b
+                if n = 3 then
+                    CVal.set 10 a
 
                 acc + x)
             [| CVal.value a; CVal.value b |]
 
-    use obs = AVal.observe (fun _ -> ()) r
-    // Compute 1 wrote b mid-compute (stale value 101); the next read must
-    // recompute: 201.
+    // Compute 1: 1 + 100.
+    Assert.Equal(101, AVal.getValue r)
+    // A write to b forces a recompute; compute 2 writes a mid-compute (after
+    // a was read), so the result (1 + 200) is stale for a ...
+    CVal.set 200 b
     Assert.Equal(201, AVal.getValue r)
-    // Compute 3 writes b mid-compute again (stale value 210); the node must
-    // stay Dirty and recompute on the next read: 310.
-    CVal.set 10 a
-    Assert.Equal(310, AVal.getValue r)
+    // ... and the next read must recompute and see a = 10: 10 + 200.
+    Assert.Equal(210, AVal.getValue r)
 
 [<Fact>]
 let ``node initialization retries after a throwing mapping`` () =
@@ -4503,51 +3828,24 @@ let ``dropped derived collection nodes are collected`` () =
     Assert.Equal<Set<_>>(Set.ofList [ 2; 4; 6 ], Set.ofSeq (ASet.force m2))
 
 [<Fact>]
-let ``disposing an observation eventually releases the derived chain`` () =
-    // Disposing the observation removes the parent edge; with weak sinks the
-    // (then unreachable) derived node is collected and its sink entry dies.
-    // Created in a separate function so the JIT cannot extend lifetimes.
+let ``a dropped derived node is collected and its sink entry dies`` () =
+    // Weak sinks: a derived node the user dropped (and never reads) is
+    // collected, and delivery skips its dead entry. Created in a separate
+    // function so the JIT cannot extend lifetimes.
     let src = CSet.ofSeq [ 1 ]
 
     let makeWeak () =
         let mapped = ASet.map (fun x -> x * 10) (CSet.value src)
-        let obs = ASet.observe (fun _ _ -> ()) mapped
-        let w = struct (WeakReference(mapped), WeakReference(obs))
-        obs.Dispose()
-        w
+        ASet.force mapped |> ignore // first read: registers the sink
+        WeakReference(mapped)
 
-    let struct (mappedWeak, obsWeak) = makeWeak ()
+    let mappedWeak = makeWeak ()
     GC.Collect()
     GC.WaitForPendingFinalizers()
     GC.Collect()
     Assert.False(mappedWeak.IsAlive)
-    Assert.False(obsWeak.IsAlive)
-
-[<Fact>]
-let ``sinks registered during delivery do not receive the current batch`` () =
-    // A sink registered reentrantly (user code inside a nested delivery) must
-    // not receive the batch in progress: its init snapshot already reflects
-    // the change, and delivering would double-apply (refcount corruption:
-    // the element would never leave).
-    let src = CSet.empty<int>
-    let a = ASet.map (fun x -> x + 1) (CSet.value src)
-    let mutable b: aset<int> = Unchecked.defaultof<_>
-    let mutable count = 0
-
-    use obs =
-        ASet.observe
-            (fun _ _ ->
-                count <- count + 1
-
-                if count = 1 then
-                    b <- ASet.map (fun x -> x * 10) (CSet.value src)
-                    ASet.force b |> ignore)
-            a
-
-    CSet.add 1 src
-    Assert.Equal<Set<_>>(Set.ofList [ 10 ], Set.ofSeq (ASet.force b))
-    CSet.remove 1 src
-    Assert.Equal<Set<int>>(Set.empty, Set.ofSeq (ASet.force b))
+    CSet.add 2 src // the delivery compacts the dead entry
+    Assert.Equal(0, src.SinkCount)
 
 // =============================================================================
 // Extension points (MAPA-DESIGN §1): ofExternal ×4, AList.custom.
@@ -4591,21 +3889,6 @@ let ``AVal ofExternal: derived values recompute after invalidate`` () =
     current <- 5
     invalidate ()
     Assert.Equal(10, AVal.getValue doubled)
-
-[<Fact>]
-let ``AVal ofExternal: observe fires only when the re-read changed the value`` () =
-    let mutable current = 1
-    let value, invalidate = AVal.ofExternal (fun () -> current)
-    let mutable callbacks = 0
-
-    use _obs = AVal.observe (fun _ -> callbacks <- callbacks + 1) value
-
-    invalidate () // same value: no callback
-    Assert.Equal(0, callbacks)
-
-    current <- 2
-    invalidate ()
-    Assert.Equal(1, callbacks)
 
 [<Fact>]
 let ``AVal ofExternal: foreign-thread invalidate applies at the next read`` () =
@@ -4660,25 +3943,6 @@ let ``ASet ofExternal: reads without invalidate do not re-run the snapshot`` () 
     Assert.Equal(1, calls)
 
 [<Fact>]
-let ``ASet ofExternal: observes receive the net delta after invalidate`` () =
-    let mutable current = HashSet<int>([ 1; 2; 3 ])
-    let s, invalidate = ASet.ofExternal (fun () -> current :> IReadOnlySet<int>)
-    let mutable lastAdds = Set.empty<int>
-    let mutable lastRems = Set.empty<int>
-
-    use _obs =
-        ASet.observe
-            (fun _ (d: SetDelta<int>) ->
-                lastAdds <- d.Added.ToArray() |> Set.ofArray
-                lastRems <- d.Removed.ToArray() |> Set.ofArray)
-            s
-
-    current <- HashSet<int>([ 3; 4 ])
-    invalidate ()
-    Assert.Equal<Set<int>>(Set.ofList [ 4 ], lastAdds)
-    Assert.Equal<Set<int>>(Set.ofList [ 1; 2 ], lastRems)
-
-[<Fact>]
 let ``AMap ofExternal: materializes on first read and diffs on invalidate`` () =
     let mutable current = Dictionary<int, string>()
     current[1] <- "a"
@@ -4731,20 +3995,6 @@ let ``AList ofExternal: reads without invalidate do not re-run the snapshot`` ()
     Assert.Equal(1, calls)
 
 [<Fact>]
-let ``AList ofExternal: observes receive the ordered delta after invalidate`` () =
-    let mutable current = ResizeArray [ 1; 2; 3 ]
-    let l, invalidate = AList.ofExternal (fun () -> current :> IReadOnlyList<int>)
-    let mutable opCount = 0
-
-    use _obs =
-        AList.observe (fun _ (d: ListDelta<int>) -> opCount <- opCount + d.Operations.Length) l
-
-    current.Insert(0, 0) // [ 0; 1; 2; 3 ]
-    invalidate ()
-    Assert.Equal(1, opCount)
-    Assert.Equal<int[]>([| 0; 1; 2; 3 |], AList.toArray l)
-
-[<Fact>]
 let ``AList custom: the compute drains an event queue into the list`` () =
     let events = ResizeArray<int>()
 
@@ -4763,28 +4013,6 @@ let ``AList custom: the compute drains an event queue into the list`` () =
 
     events.Add 3
     Assert.Equal<int[]>([| 1; 2; 3 |], AList.toArray list)
-
-[<Fact>]
-let ``AList custom: observes receive the computed ops`` () =
-    let events = ResizeArray<int>()
-
-    let list =
-        AList.custom (fun view (delta: ListDeltaBuilder<int>) ->
-            for i in 0 .. events.Count - 1 do
-                delta.Insert(view.Count + i, events[i])
-
-            events.Clear())
-
-    let mutable opCount = 0
-
-    use _obs =
-        AList.observe (fun _ (d: ListDelta<int>) -> opCount <- opCount + d.Operations.Length) list
-
-    events.Add 5
-    events.Add 6
-    AList.force list |> ignore // the read polls; the delta wakes the observer
-    Assert.Equal(2, opCount)
-    Assert.Equal<int[]>([| 5; 6 |], AList.toArray list)
 
 [<Fact>]
 let ``ofExternal: reads without invalidate allocate nothing`` () =
@@ -5531,13 +4759,11 @@ let ``CSet updateTo and perform`` () =
 [<Fact>]
 let ``CSet unionWith exceptWith intersectWith are atomic batches`` () =
     let s = CSet.ofSeq [ 1; 2; 3 ]
-    let mutable deliveries = 0
-
-    use _obs = ASet.observe (fun _ _ -> deliveries <- deliveries + 1) (CSet.value s)
+    let versionBefore = (CSet.value s :> IAdaptiveObject).Version
 
     CSet.unionWith (seq [ 3; 4 ]) s
     Assert.Equal<Set<int>>(Set.ofList [ 1; 2; 3; 4 ], CSet.toSet s)
-    Assert.Equal(1, deliveries) // one batch, one delivery
+    Assert.Equal(versionBefore + 1L, (CSet.value s :> IAdaptiveObject).Version) // one batch, one flush
 
     CSet.exceptWith (seq [ 1; 5 ]) s
     Assert.Equal<Set<int>>(Set.ofList [ 2; 3; 4 ], CSet.toSet s)
@@ -5744,18 +4970,7 @@ let ``CSet posts apply on the next read`` () =
 [<Fact>]
 let ``posted set batch delivers one net delta`` () =
     let items = CSet.empty<int>
-    let mutable callbacks = 0
-    let mutable lastAdds = Set.empty<int>
-    let mutable lastRems = Set.empty<int>
-
-    use _obs =
-        ASet.observe
-            (fun _ (d: SetDelta<int>) ->
-                callbacks <- callbacks + 1
-                lastAdds <- d.Added.ToArray() |> Set.ofArray
-                lastRems <- d.Removed.ToArray() |> Set.ofArray)
-            items
-
+    let versionBefore = (CSet.value items :> IAdaptiveObject).Version
     let doneSignal = new ManualResetEventSlim(false)
 
     let worker =
@@ -5769,18 +4984,14 @@ let ``posted set batch delivers one net delta`` () =
     worker.Wait()
     Posting.pump ()
 
-    Assert.Equal(1, callbacks)
-    Assert.Equal<Set<int>>(Set.ofList [ 2 ], lastAdds)
-    Assert.Equal<Set<int>>(Set.empty, lastRems)
+    // One net flush: the version advances once.
+    Assert.Equal(versionBefore + 1L, (CSet.value items :> IAdaptiveObject).Version)
     Assert.Equal<Set<int>>(Set.ofList [ 2 ], ASet.toSet items)
 
 [<Fact>]
 let ``posted set batch with no net change marks nothing`` () =
     let items = CSet.empty<int>
-    let mutable callbacks = 0
-
-    use _obs = ASet.observe (fun _ _ -> callbacks <- callbacks + 1) items
-
+    let versionBefore = (CSet.value items :> IAdaptiveObject).Version
     let doneSignal = new ManualResetEventSlim(false)
 
     let worker =
@@ -5793,7 +5004,7 @@ let ``posted set batch with no net change marks nothing`` () =
     worker.Wait()
     Posting.pump ()
 
-    Assert.Equal(0, callbacks)
+    Assert.Equal(versionBefore, (CSet.value items :> IAdaptiveObject).Version)
     Assert.Equal<Set<int>>(Set.empty, ASet.toSet items)
 
 [<Fact>]
@@ -5816,16 +5027,7 @@ let ``posted replace supersedes the other ops of the batch`` () =
 [<Fact>]
 let ``CMap posts apply as one net delta`` () =
     let mapValue = CMap.empty<int, string>
-    let mutable callbacks = 0
-    let mutable lastSets = Map.empty<int, string>
-
-    use _obs =
-        AMap.observe
-            (fun _ (d: MapDelta<int, string>) ->
-                callbacks <- callbacks + 1
-                lastSets <- Map.ofSeq [ for struct (k, v) in d.SetEntries.ToArray() -> k, v ])
-            mapValue
-
+    let versionBefore = (CMap.value mapValue :> IAdaptiveObject).Version
     let doneSignal = new ManualResetEventSlim(false)
 
     let worker =
@@ -5839,8 +5041,8 @@ let ``CMap posts apply as one net delta`` () =
     worker.Wait()
     Posting.pump ()
 
-    Assert.Equal(1, callbacks)
-    Assert.Equal<Map<int, string>>(Map.ofList [ 2, "b" ], lastSets)
+    // One net flush: the version advances once.
+    Assert.Equal(versionBefore + 1L, (CMap.value mapValue :> IAdaptiveObject).Version)
     Assert.Equal<Map<int, string>>(Map.ofList [ 2, "b" ], AMap.toMap mapValue)
 
 [<Fact>]

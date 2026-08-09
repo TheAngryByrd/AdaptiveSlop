@@ -16,7 +16,6 @@
     <Compile Include="Collections/Changeable.fs" />
     <Compile Include="Collections/SetNodes.fs" />
     <Compile Include="Collections/MapNodes.fs" />
-    <Compile Include="Collections/ObserveNodes.fs" />
     <Compile Include="Collections/ListNodes.fs" />
     <Compile Include="Collections/Reductions.fs" />
     <Compile Include="Collections/ElementSetNode.fs" />

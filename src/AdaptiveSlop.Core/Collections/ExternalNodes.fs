@@ -15,14 +15,14 @@ open System.Threading
 // no diff, no allocation.
 //
 // The invalidate handle is O(1) at call time and deferred (invariant 3: no
-// evaluation during marking). Thread-safe via the post ring (the cval.Post
-// pattern): an owner-thread call marks directly; a foreign-thread call
-// enqueues, and the mark happens at the next graph operation on the owner
-// thread.
+// evaluation during the write). Thread-safe via the post ring (the cval.Post
+// pattern): an owner-thread call bumps the write generation directly; a
+// foreign-thread call enqueues, and the bump happens at the next graph
+// operation on the owner thread.
 //
-// The user never marks: the handle is the user-facing form of the same mark
-// path the *A nodes use internally (MarkFrom bumps the write generation, so
-// *A gates re-scan, and marks observers, so observations deliver).
+// The user never marks: the handle is the user-facing form of the same
+// write-notification path the *A nodes use internally (it bumps the write
+// generation, so the *A gates re-scan and the dirty caches invalidate).
 // =============================================================================
 
 /// <summary>
@@ -50,7 +50,7 @@ type ExternalSetNode<'T when 'T: equality>([<InlineIfLambda>] snapshot: unit -> 
     member this.Invalidate() =
         if Environment.CurrentManagedThreadId = ownerThread then
             dirty <- true
-            ctx.MarkFrom state.Edges
+            ctx.BumpWriteGeneration()
         else if Interlocked.CompareExchange(&posted, 1, 0) = 0 then
             ctx.PostRing.Enqueue(this :> obj)
 
@@ -64,7 +64,7 @@ type ExternalSetNode<'T when 'T: equality>([<InlineIfLambda>] snapshot: unit -> 
 
             if Collections.rebuildSetDiff scratch &state then
                 state.Version <- state.Version + 1L
-                Collections.pushAndMarkSet ctx state.Out &state.Sinks state.Edges
+                Collections.pushAndBumpSet ctx state.Out &state.Sinks
                 state.Out.Clear()
 
     interface IPostSource with
@@ -104,11 +104,6 @@ type ExternalSetNode<'T when 'T: equality>([<InlineIfLambda>] snapshot: unit -> 
         member this.RemoveSetSink(sink) =
             Collections.removeSink &state.Sinks sink
 
-    interface IEdgeTarget with
-        member _.EdgeCount = state.Edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
-
 /// <summary>
 /// An adaptive map whose content is supplied by an external snapshot function,
 /// re-read only when invalidated via the handle returned by
@@ -132,7 +127,7 @@ type ExternalMapNode<'K, 'V when 'K: equality>([<InlineIfLambda>] snapshot: unit
     member this.Invalidate() =
         if Environment.CurrentManagedThreadId = ownerThread then
             dirty <- true
-            ctx.MarkFrom state.Edges
+            ctx.BumpWriteGeneration()
         else if Interlocked.CompareExchange(&posted, 1, 0) = 0 then
             ctx.PostRing.Enqueue(this :> obj)
 
@@ -146,7 +141,7 @@ type ExternalMapNode<'K, 'V when 'K: equality>([<InlineIfLambda>] snapshot: unit
 
             if Collections.rebuildMapDiff scratch &state then
                 state.Version <- state.Version + 1L
-                Collections.pushAndMarkMap ctx state.Out &state.Sinks state.Edges
+                Collections.pushAndBumpMap ctx state.Out &state.Sinks
                 state.Out.Clear()
 
     interface IPostSource with
@@ -184,11 +179,6 @@ type ExternalMapNode<'K, 'V when 'K: equality>([<InlineIfLambda>] snapshot: unit
         member this.RemoveMapSink(sink) =
             Collections.removeSink &state.Sinks sink
 
-    interface IEdgeTarget with
-        member _.EdgeCount = state.Edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = state.Edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = state.Edges.RemoveAt(index)
-
 /// <summary>
 /// An adaptive list whose content is supplied by an external snapshot function,
 /// re-read only when invalidated via the handle returned by
@@ -208,14 +198,13 @@ type ExternalListNode<'T when 'T: equality>([<InlineIfLambda>] snapshot: unit ->
     let mutable sinks = SinkList.Create()
     let mutable dirty = true
     let mutable posted = 0
-    let edges = ParentEdges()
     let ownerThread = Environment.CurrentManagedThreadId
     let mutable disposed = false
 
     member this.Invalidate() =
         if Environment.CurrentManagedThreadId = ownerThread then
             dirty <- true
-            ctx.MarkFrom edges
+            ctx.BumpWriteGeneration()
         else if Interlocked.CompareExchange(&posted, 1, 0) = 0 then
             ctx.PostRing.Enqueue(this :> obj)
 
@@ -226,7 +215,7 @@ type ExternalListNode<'T when 'T: equality>([<InlineIfLambda>] snapshot: unit ->
 
             if Collections.rebuildListDiff next data &out then
                 version <- version + 1L
-                Collections.pushAndMarkList ctx out &sinks edges
+                Collections.pushAndBumpList ctx out &sinks
                 out.Clear()
 
     interface IPostSource with
@@ -262,8 +251,3 @@ type ExternalListNode<'T when 'T: equality>([<InlineIfLambda>] snapshot: unit ->
         member this.AddListSink(sink) = Collections.addSink &sinks sink
 
         member this.RemoveListSink(sink) = Collections.removeSink &sinks sink
-
-    interface IEdgeTarget with
-        member _.EdgeCount = edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)

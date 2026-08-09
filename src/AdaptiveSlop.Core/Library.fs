@@ -8,27 +8,6 @@ open System.Threading
 open System.Threading.Tasks
 
 /// <summary>
-/// Represents the dirty state of an adaptive node. Writes mark; reads recompute.
-/// </summary>
-/// <remarks>
-/// <para>
-/// AdaptiveSlop uses a push-mark, pull-evaluate model:
-/// <list type="bullet">
-/// <item><description><c>Clean</c>: Observed node is up-to-date; the next read is one flag check</description></item>
-/// <item><description><c>Dirty</c>: Node was marked by a dependency change; the next read recomputes</description></item>
-/// <item><description><c>MaybeDirty</c>: Node is unobserved or its links can be stale; the next read version-checks</description></item>
-/// </list>
-/// </para>
-/// </remarks>
-type DirtyState =
-    /// Node is up-to-date; value can be returned without recomputation
-    | Clean = 0
-    /// Node was invalidated by a dependency change; needs recomputation on next read
-    | Dirty = 1
-    /// Parent links are incomplete; fall back to version checking
-    | MaybeDirty = 2
-
-/// <summary>
 /// Base interface for all adaptive objects. Provides version tracking for change detection.
 /// </summary>
 /// <remarks>
@@ -69,26 +48,6 @@ type IAdaptiveValue<'T> =
 type aval<'T> = IAdaptiveValue<'T>
 
 /// <summary>
-/// Handle for an active observation of an adaptive value.
-/// Disposing removes parent links and stops dirty propagation for the observed subtree.
-/// </summary>
-/// <remarks>
-/// <para>
-/// Observations enable push-based invalidation by establishing parent links from
-/// source values to dependent nodes. When not observed, nodes fall back to
-/// pull-based version checking.
-/// </para>
-/// <para>
-/// <strong>Memory management:</strong> Always dispose observations when no longer needed
-/// to prevent memory leaks from parent link retention.
-/// </para>
-/// </remarks>
-type IObservation =
-    inherit IDisposable
-    /// <summary>Gets whether this observation is still active (not disposed).</summary>
-    abstract member IsActive: bool
-
-/// <summary>
 /// A unit of deferred work applied at transaction commit.
 /// </summary>
 type ICommit =
@@ -96,13 +55,6 @@ type ICommit =
     abstract member Commit: unit -> unit
     /// <summary>Discards the deferred work after a transaction rollback.</summary>
     abstract member Abort: unit -> unit
-
-/// <summary>
-/// Internal. An observation sink that receives its callback after a batch or a write.
-/// </summary>
-type internal INotifiable =
-    /// <summary>Delivers the pending notification.</summary>
-    abstract member Deliver: unit -> unit
 
 /// <summary>
 /// Internal. Reusable buffer of commit actions for one graph context.
@@ -227,89 +179,6 @@ type internal DependencyCollector() =
         struct (depBuffer, versionBuffer, start, count - start)
 
 /// <summary>
-/// Internal. A node that depends on other adaptive objects. It can be stored
-/// as a parent in the edge list of its dependencies.
-/// </summary>
-type internal IAdaptiveNode =
-    /// Marks this node dirty. Called by a dependency when the dependency changes.
-    abstract member MarkDirty: unit -> unit
-    /// Writes the position of this node in the parents array of the dependency
-    /// at <paramref name="depIndex"/>. Called when edges are added and when a
-    /// swap-pop removal moves this node. A <paramref name="depIndex"/> of -1
-    /// means the parent has no dependency list (an observation sink).
-    abstract member SetDepSlot: depIndex: int * parentIndex: int -> unit
-    /// Called when this node gains its first parent.
-    abstract member OnFirstParent: unit -> unit
-    /// Called when this node loses its last parent.
-    abstract member OnLastParent: unit -> unit
-
-/// <summary>
-/// Internal. An object that can hold parents: the target of an edge.
-/// </summary>
-type internal IEdgeTarget =
-    /// The number of parents currently stored.
-    abstract member EdgeCount: int
-    /// Appends <paramref name="parent"/> and returns its index in the parents
-    /// array. <paramref name="depIndex"/> is the position of this object in the
-    /// dependency list of the parent (-1 for observation sinks).
-    abstract member AddEdge: parent: IAdaptiveNode * depIndex: int -> int
-    /// Removes the edge at <paramref name="index"/> with swap-pop. O(1).
-    abstract member RemoveEdgeAt: index: int -> unit
-
-/// <summary>
-/// Internal. Edge storage of one object: the parents that depend on it, and for
-/// each parent the position of this object in the dependency list of that parent.
-/// Removal is swap-pop with slot fixup on the moved parent. O(1), no allocation
-/// except array growth.
-/// </summary>
-type internal ParentEdges() =
-    let mutable parents: IAdaptiveNode[] = Array.empty
-    let mutable slots: int[] = Array.empty
-    let mutable count = 0
-
-    member _.Count = count
-
-    member _.Item
-        with get (index: int) = parents[index]
-
-    member _.Add(parent: IAdaptiveNode, depIndex: int) : int =
-        if count = parents.Length then
-            let newLength = if parents.Length = 0 then 4 else parents.Length * 2
-            let nextParents = Array.zeroCreate newLength
-            let nextSlots = Array.zeroCreate newLength
-            Array.Copy(parents, nextParents, parents.Length)
-            Array.Copy(slots, nextSlots, slots.Length)
-            parents <- nextParents
-            slots <- nextSlots
-
-        parents[count] <- parent
-        slots[count] <- depIndex
-        count <- count + 1
-        count - 1
-
-    member _.RemoveAt(index: int) =
-        count <- count - 1
-
-        if index < count then
-            // Move the last entry into the removed position and fix its slot.
-            let moved = parents[count]
-            let movedSlot = slots[count]
-            parents[index] <- moved
-            slots[index] <- movedSlot
-            parents[count] <- Unchecked.defaultof<IAdaptiveNode>
-            slots[count] <- 0
-            moved.SetDepSlot(movedSlot, index)
-        else
-            parents[count] <- Unchecked.defaultof<IAdaptiveNode>
-            slots[count] <- 0
-
-    member _.Clear() =
-        if count > 0 then
-            Array.Clear(parents, 0, count)
-            Array.Clear(slots, 0, count)
-            count <- 0
-
-/// <summary>
 /// Internal. Source of a posted change: applies the pending posted value.
 /// </summary>
 type internal IPostSource =
@@ -430,12 +299,6 @@ type internal GraphContext() =
     let mutable debugClaimDepth = 0
     // Operation nesting depth. The automatic drain fires on the outermost claim only.
     let mutable operationDepth = 0
-    // Pooled marking stack for iterative dirty propagation.
-    let mutable markStack: IAdaptiveNode[] = Array.zeroCreate 64
-    let mutable markCount = 0
-    // Pooled notification queue. Delivered after a batch or a non-batched write.
-    let mutable notifications: INotifiable[] = Array.zeroCreate 16
-    let mutable notifyCount = 0
 
     // The ambient graph of the calling thread. A thread-local pointer only:
     // all mutable state lives on the context object. Created lazily on first
@@ -474,8 +337,8 @@ type internal GraphContext() =
     /// the calling thread is not the thread that created this graph, or when
     /// another thread is inside a graph operation. Pair every call with
     /// ReleaseOwner. On the outermost claim, pending posts are drained
-    /// automatically (auto-pump): they apply as one batch with one
-    /// notification delivery, before the operation runs.
+    /// automatically (auto-pump): they apply as one batch before the
+    /// operation runs.
     member internal this.ClaimOwner() =
 #if DEBUG
         let tid = Environment.CurrentManagedThreadId
@@ -537,52 +400,17 @@ type internal GraphContext() =
         with get () = txActive
         and set value = txActive <- value
 
-    /// Push one node onto the marking stack. Amortized O(1), array growth only.
-    member internal _.PushDirty(node: IAdaptiveNode) =
-        if markCount = markStack.Length then
-            let next = Array.zeroCreate (markStack.Length * 2)
-            Array.Copy(markStack, next, markStack.Length)
-            markStack <- next
-
-        markStack[markCount] <- node
-        markCount <- markCount + 1
-
-    /// Drain the marking stack. Iterative: no recursion.
-    member internal this.PropagateDirty() =
-        while markCount > 0 do
-            markCount <- markCount - 1
-            let node = markStack[markCount]
-            markStack[markCount] <- Unchecked.defaultof<IAdaptiveNode>
-            node.MarkDirty()
-
-    /// Mark every parent in the edge list and propagate. Delivers queued
-    /// notifications when no transaction is running.
-    member internal this.MarkFrom(edges: ParentEdges) =
-        writeGeneration <- writeGeneration + 1L
-
-        for i in 0 .. edges.Count - 1 do
-            this.PushDirty(edges[i])
-
-        this.PropagateDirty()
-
-        if not txActive then
-            this.DeliverNotifications()
-
-    /// Queue one notification sink for delivery.
-    member internal _.EnqueueNotification(sink: INotifiable) =
-        if notifyCount = notifications.Length then
-            let next = Array.zeroCreate (notifications.Length * 2)
-            Array.Copy(notifications, next, notifications.Length)
-            notifications <- next
-
-        notifications[notifyCount] <- sink
-        notifyCount <- notifyCount + 1
+    /// Record one applied write: advances the write generation, which
+    /// invalidates every write-generation-keyed dirty cache in this graph.
+    /// Called by every write path (scalar writes, collection source writes,
+    /// and write-time journal appends of the collection sink machinery).
+    member internal _.BumpWriteGeneration() = writeGeneration <- writeGeneration + 1L
 
     member internal _.PostRing = postRing
 
-    /// Apply all pending posts as one batch with one notification delivery.
-    /// Called automatically on the outermost claim of any graph operation, and
-    /// from Pump. No-op when the ring is empty.
+    /// Apply all pending posts as one batch. Called automatically on the
+    /// outermost claim of any graph operation, and from Pump. No-op when the
+    /// ring is empty.
     member private this.DrainIfPending() =
         if not postRing.IsEmpty then
             let wasActive = this.TxActive
@@ -592,9 +420,6 @@ type internal GraphContext() =
                 this.DrainPosts()
             finally
                 this.TxActive <- wasActive
-
-            if not wasActive then
-                this.DeliverNotifications()
 
     /// Drain the ring, applying each pending posted value. Owner thread only.
     member private this.DrainPosts() =
@@ -614,36 +439,6 @@ type internal GraphContext() =
             this.DrainIfPending()
         finally
             this.ReleaseOwner()
-
-    /// Deliver every queued notification. Notifications queued during delivery
-    /// are delivered in the same drain. A throwing callback is isolated: the
-    /// rest of the queue still drains, and the first exception is rethrown
-    /// after the drain. A callback that enqueues without bound (a write in a
-    /// callback that observes the written value) is cut off by a depth limit
-    /// (policy: callbacks must not write the values they observe).
-    member internal this.DeliverNotifications() =
-        let mutable delivered = 0
-        let mutable firstEx: exn option = None
-
-        while notifyCount > 0 do
-            if delivered >= 10000 then
-                failwith
-                    "AdaptiveSlop: notification delivery exceeded 10000 rounds. A callback keeps writing an observed value (infinite notification loop)."
-
-            delivered <- delivered + 1
-            notifyCount <- notifyCount - 1
-            let sink = notifications[notifyCount]
-            notifications[notifyCount] <- Unchecked.defaultof<INotifiable>
-
-            try
-                sink.Deliver()
-            with e ->
-                if firstEx.IsNone then
-                    firstEx <- Some e
-
-        match firstEx with
-        | Some e -> raise e
-        | None -> ()
 
 module internal AdaptiveRuntime =
     // The runtime functions take the graph context explicitly: node methods
@@ -730,7 +525,6 @@ module Transaction =
     /// Runs a function as a transaction. Writes inside the transaction are deferred
     /// and applied at commit. Nested calls join the running transaction.
     /// Reads inside a transaction see the pre-transaction values.
-    /// Notifications are delivered after the outermost transaction commits.
     /// </summary>
     /// <example>
     /// <code>
@@ -762,21 +556,13 @@ module Transaction =
                             ctx.TxBuffer.Abort()
 
                         ctx.TxActive <- false
-                // The transaction is closed: notifications see a consistent graph,
-                // and callbacks that write apply directly.
-                ctx.DeliverNotifications()
+
                 result
         finally
             ctx.ReleaseOwner()
 
 
 type ConstantValue<'T>(value: 'T) =
-    // An edge target with a real edge list: AdaptiveNode promotes to the
-    // flag-based dirty check only when every dependency link is complete
-    // (depSlot >= 0). Constants must therefore be edge targets; their version
-    // never changes, so no mark ever fires and the edges are never used.
-    let edges = ParentEdges()
-
     interface IAdaptiveValue<'T> with
         member this.GetValue() =
             AdaptiveRuntime.addDependency (this :> IAdaptiveObject) 0L
@@ -784,16 +570,9 @@ type ConstantValue<'T>(value: 'T) =
 
         member _.Version = 0L
 
-    interface IEdgeTarget with
-        member _.EdgeCount = edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
-
 type LazyConstantValue<'T>([<InlineIfLambda>] create: unit -> 'T) =
     let mutable computed = false
     let mutable value = Unchecked.defaultof<'T>
-    // See ConstantValue: an edge target so dependents can promote to Clean.
-    let edges = ParentEdges()
 
     interface IAdaptiveValue<'T> with
         member this.GetValue() =
@@ -809,11 +588,6 @@ type LazyConstantValue<'T>([<InlineIfLambda>] create: unit -> 'T) =
 
         member _.Version = 0L
 
-    interface IEdgeTarget with
-        member _.EdgeCount = edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
-
 type AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
     // The graph this node belongs to, captured at creation (the ambient graph
     // of the creating thread).
@@ -823,11 +597,7 @@ type AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
     let mutable value = Unchecked.defaultof<'T>
     let mutable deps: IAdaptiveObject[] = Array.empty
     let mutable depVersions: int64[] = Array.empty
-    // Position of this node in the parents array of each dependency. -1 = no edge.
-    let mutable depSlots: int[] = Array.empty
     let mutable depCount = 0
-    let edges = ParentEdges()
-    let mutable dirtyState = DirtyState.MaybeDirty
     // Write-generation-keyed dirty cache: the verdict of the last version check
     // (or recompute) stays valid until the next applied write moves the global
     // generation. Repeated reads at the same generation are O(1) per node.
@@ -835,9 +605,9 @@ type AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
     let mutable dirtyCache = true
 
     /// Check if dirty, using a write-generation-keyed cache: the verdict of the
-    /// last check at this generation is still valid, because any write that could
-    /// affect this node moves the generation (scalar writes via MarkFrom,
-    /// collection writes via sink delivery + MarkFrom).
+    /// last check at this generation is still valid, because any applied write
+    /// moves the generation (scalar writes, and collection writes via the sink
+    /// machinery).
     member private this.IsDirty() =
         let writeGen = AdaptiveRuntime.getWriteGeneration ctx
 
@@ -845,104 +615,31 @@ type AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
             // Already checked at this write generation: return cached result
             dirtyCache
         else
-            // Compute dirty status and cache it
-            let dirty =
-                if not hasValue then
-                    true
-                elif dirtyState = DirtyState.Dirty then
-                    // Marked by a dependency change.
-                    true
-                elif dirtyState = DirtyState.Clean && edges.Count > 0 then
-                    // Observed and not marked: one flag check, no version reads.
-                    false
-                else
-                    // Unobserved, or links can be stale: version check.
-                    let mutable d = false
-                    let mutable i = 0
+            // Version check: a dependency whose version moved makes this node dirty.
+            let mutable dirty = not hasValue
+            let mutable i = 0
 
-                    while not d && i < depCount do
-                        if deps[i].Version <> depVersions[i] then
-                            d <- true
+            while not dirty && i < depCount do
+                if deps[i].Version <> depVersions[i] then
+                    dirty <- true
 
-                        i <- i + 1
-
-                    // Verified clean: promote to the flag-based check so later
-                    // reads do not re-walk the dependency closure. A registered
-                    // node that never recomputes would otherwise stay MaybeDirty
-                    // forever, making every read O(subtree) via the .Version
-                    // getters (measured: 16k walks per write on a 32k-node tree).
-                    // Promote only when every link is complete: a torn-down link
-                    // (depSlot = -1) means marks may not arrive, and the flag
-                    // would go stale.
-                    if not d && edges.Count > 0 then
-                        let mutable complete = true
-                        let mutable j = 0
-
-                        while complete && j < depCount do
-                            if depSlots[j] < 0 then
-                                complete <- false
-
-                            j <- j + 1
-
-                        if complete then
-                            dirtyState <- DirtyState.Clean
-
-                    d
+                i <- i + 1
 
             lastCheckedWriteGen <- writeGen
             dirtyCache <- dirty
             dirty
 
-    /// Remove every edge from the stored dependencies to this node. O(depCount).
-    member private this.TearDownEdges() =
-        for j in 0 .. depCount - 1 do
-            if depSlots[j] >= 0 then
-                (deps[j] :?> IEdgeTarget).RemoveEdgeAt(depSlots[j])
-                depSlots[j] <- -1
-
-    /// Add an edge from every stored dependency to this node. O(depCount).
-    member private this.BuildEdges() =
-        for j in 0 .. depCount - 1 do
-            depSlots[j] <-
-                match deps[j] with
-                | :? IEdgeTarget as target -> target.AddEdge(this, j)
-                | _ -> -1
-
-    /// Registration cascade: this node gained its first parent.
-    member private this.RegisterWithDeps() =
-        this.BuildEdges()
-        // Links can be stale; the next read must version-check.
-        dirtyState <- DirtyState.MaybeDirty
-
-    /// Unregistration cascade: this node lost its last parent.
-    member private this.UnregisterFromDeps() =
-        this.TearDownEdges()
-        dirtyState <- DirtyState.MaybeDirty
-
     member private this.Recompute() =
-        let observed = edges.Count > 0
-        // Generation at which the recompute starts. A write from user code in the
-        // middle of the compute moves the generation; the computed value would be
-        // stale, so the node stays Dirty and recomputes on the next read.
+        // Generation at which the recompute starts. A write from user code in
+        // the middle of the compute moves the generation; the cache is keyed
+        // at the start generation, so the next read version-checks and sees
+        // the moved dependency version.
         let checkedGen = AdaptiveRuntime.getWriteGeneration ctx
 
         let struct (newValue, newDeps, newVersions, newStart, newLen) =
             AdaptiveRuntime.collect ctx compute
 
         value <- newValue
-
-        // Compare the new dependency set with the stored set (same order, by reference).
-        let mutable sameSet = newLen = depCount
-        let mutable i = 0
-
-        while sameSet && i < newLen do
-            if not (obj.ReferenceEquals(newDeps[newStart + i], deps[i])) then
-                sameSet <- false
-
-            i <- i + 1
-
-        if observed && not sameSet then
-            this.TearDownEdges()
 
         // Store the new dependency set and the version snapshots. Plain
         // arrays, not ArrayPool: a rented array is only returned when the node
@@ -952,7 +649,6 @@ type AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
         if deps.Length < newLen then
             deps <- Array.zeroCreate newLen
             depVersions <- Array.zeroCreate<int64> newLen
-            depSlots <- Array.create newLen -1
 
         Array.Copy(newDeps, newStart, deps, 0, newLen)
         Array.Copy(newVersions, newStart, depVersions, 0, newLen)
@@ -961,21 +657,8 @@ type AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
             Array.Clear(deps, newLen, depCount - newLen)
 
         depCount <- newLen
-
-        if observed && not sameSet then
-            this.BuildEdges()
-
         hasValue <- true
         version <- version + 1L
-
-        dirtyState <-
-            if AdaptiveRuntime.getWriteGeneration ctx <> checkedGen then
-                // A write landed mid-compute: the value may be stale, keep Dirty.
-                DirtyState.Dirty
-            elif observed then
-                DirtyState.Clean
-            else
-                DirtyState.MaybeDirty
 
         // The recompute is valid as of checkedGen: key the cache there so later
         // reads at the same generation skip the version check.
@@ -1003,47 +686,12 @@ type AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
             finally
                 AdaptiveRuntime.exitEvaluation ctx
 
-    interface IAdaptiveNode with
-        member this.MarkDirty() =
-            if dirtyState <> DirtyState.Dirty then
-                dirtyState <- DirtyState.Dirty
-                // Invalidate the dirty cache: a mark can arrive in the middle of an
-                // evaluation (a write from user code inside a compute). The mark is
-                // precise; the cache would otherwise hide it.
-                lastCheckedWriteGen <- -1L
-
-                for i in 0 .. edges.Count - 1 do
-                    ctx.PushDirty(edges[i])
-
-        member _.SetDepSlot(depIndex: int, parentIndex: int) = depSlots[depIndex] <- parentIndex
-
-        member this.OnFirstParent() = this.RegisterWithDeps()
-        member this.OnLastParent() = this.UnregisterFromDeps()
-
-    interface IEdgeTarget with
-        member _.EdgeCount = edges.Count
-
-        member this.AddEdge(parent: IAdaptiveNode, depIndex: int) =
-            let index = edges.Add(parent, depIndex)
-
-            if edges.Count = 1 then
-                this.RegisterWithDeps()
-
-            index
-
-        member this.RemoveEdgeAt(index: int) =
-            edges.RemoveAt(index)
-
-            if edges.Count = 0 then
-                this.UnregisterFromDeps()
-
 type ChangeableValue<'T>(initial: 'T) =
     // The graph this node belongs to, captured at creation (the ambient graph
     // of the creating thread).
     let ctx = GraphContext.Current
     let mutable value = initial
     let mutable version = 0L
-    let edges = ParentEdges()
     // Pending slot for writes inside a transaction. Last write wins.
     let mutable hasPending = false
     let mutable pendingValue = Unchecked.defaultof<'T>
@@ -1060,7 +708,7 @@ type ChangeableValue<'T>(initial: 'T) =
             if not (EqualityComparer<'T>.Default.Equals(value, newValue)) then
                 value <- newValue
                 version <- version + 1L
-                ctx.MarkFrom(edges)
+                ctx.BumpWriteGeneration()
         finally
             ctx.ReleaseOwner()
 
@@ -1166,11 +814,6 @@ type ChangeableValue<'T>(initial: 'T) =
 
         member _.Version = version
 
-    interface IEdgeTarget with
-        member _.EdgeCount = edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
-
     interface ICommit with
         member this.Commit() = this.ApplyPending()
         member this.Abort() = this.AbortPending()
@@ -1188,10 +831,6 @@ type MapNNode<'T, 'U>(deps: IAdaptiveValue<'T>[], [<InlineIfLambda>] compute: 'T
     // Node-owned buffer, reused across recomputes. The compute function must not retain it.
     let values = Array.zeroCreate deps.Length
     let depVersions = Array.zeroCreate<int64> deps.Length
-    // Position of this node in the parents array of each dependency. -1 = no edge.
-    let depSlots = Array.create deps.Length -1
-    let edges = ParentEdges()
-    let mutable dirtyState = DirtyState.MaybeDirty
     // Write-generation-keyed dirty cache: the last verdict stays valid until the
     // next applied write moves the global generation.
     let mutable lastCheckedWriteGen = -1L
@@ -1202,19 +841,9 @@ type MapNNode<'T, 'U>(deps: IAdaptiveValue<'T>[], [<InlineIfLambda>] compute: 'T
 
         if lastCheckedWriteGen = writeGen then
             dirtyCache
-        elif not hasValue then
-            true
-        elif dirtyState = DirtyState.Dirty then
-            // Marked by a dependency change.
-            true
-        elif dirtyState = DirtyState.Clean && edges.Count > 0 then
-            // Observed and not marked: one flag check, no version reads.
-            dirtyCache <- false
-            lastCheckedWriteGen <- writeGen
-            false
         else
-            // Unobserved, or links can be stale: version check.
-            let mutable dirty = false
+            // Version check: a dependency whose version moved makes this node dirty.
+            let mutable dirty = not hasValue
             let mutable i = 0
 
             while not dirty && i < deps.Length do
@@ -1223,29 +852,14 @@ type MapNNode<'T, 'U>(deps: IAdaptiveValue<'T>[], [<InlineIfLambda>] compute: 'T
 
                 i <- i + 1
 
-            // Verified clean: promote to the flag-based check (as AdaptiveNode
-            // does) so later reads do not re-walk the dependency closure. The
-            // links are complete once every dep has a slot, so marks arrive.
-            if not dirty && edges.Count > 0 then
-                let mutable complete = true
-                let mutable j = 0
-
-                while complete && j < deps.Length do
-                    if depSlots[j] < 0 then
-                        complete <- false
-
-                    j <- j + 1
-
-                if complete then
-                    dirtyState <- DirtyState.Clean
-
             lastCheckedWriteGen <- writeGen
             dirtyCache <- dirty
             dirty
 
     member private this.Recompute() =
-        // Generation at which the recompute starts; a write mid-compute would make
-        // the computed value stale, so the node stays Dirty.
+        // Generation at which the recompute starts; a write mid-compute moves
+        // the generation, so the next read version-checks (the cache is keyed
+        // at the start generation).
         let checkedGen = AdaptiveRuntime.getWriteGeneration ctx
 
         for i in 0 .. deps.Length - 1 do
@@ -1255,36 +869,8 @@ type MapNNode<'T, 'U>(deps: IAdaptiveValue<'T>[], [<InlineIfLambda>] compute: 'T
         value <- compute values
         hasValue <- true
         version <- version + 1L
-
-        dirtyState <-
-            if AdaptiveRuntime.getWriteGeneration ctx <> checkedGen then
-                DirtyState.Dirty
-            elif edges.Count > 0 then
-                DirtyState.Clean
-            else
-                DirtyState.MaybeDirty
-
         lastCheckedWriteGen <- checkedGen
         dirtyCache <- false
-
-    /// Registration cascade: this node gained its first parent.
-    member private this.RegisterWithDeps() =
-        for j in 0 .. deps.Length - 1 do
-            depSlots[j] <-
-                match deps[j] with
-                | :? IEdgeTarget as target -> target.AddEdge(this, j)
-                | _ -> -1
-
-        dirtyState <- DirtyState.MaybeDirty
-
-    /// Unregistration cascade: this node lost its last parent.
-    member private this.UnregisterFromDeps() =
-        for j in 0 .. deps.Length - 1 do
-            if depSlots[j] >= 0 then
-                (deps[j] :?> IEdgeTarget).RemoveEdgeAt(depSlots[j])
-                depSlots[j] <- -1
-
-        dirtyState <- DirtyState.MaybeDirty
 
     interface IAdaptiveValue<'U> with
         member this.GetValue() =
@@ -1306,36 +892,6 @@ type MapNNode<'T, 'U>(deps: IAdaptiveValue<'T>[], [<InlineIfLambda>] compute: 'T
                 if this.IsDirty() then version + 1L else version
             finally
                 AdaptiveRuntime.exitEvaluation ctx
-
-    interface IAdaptiveNode with
-        member this.MarkDirty() =
-            if dirtyState <> DirtyState.Dirty then
-                dirtyState <- DirtyState.Dirty
-
-                for i in 0 .. edges.Count - 1 do
-                    ctx.PushDirty(edges[i])
-
-        member _.SetDepSlot(depIndex: int, parentIndex: int) = depSlots[depIndex] <- parentIndex
-
-        member this.OnFirstParent() = this.RegisterWithDeps()
-        member this.OnLastParent() = this.UnregisterFromDeps()
-
-    interface IEdgeTarget with
-        member _.EdgeCount = edges.Count
-
-        member this.AddEdge(parent: IAdaptiveNode, depIndex: int) =
-            let index = edges.Add(parent, depIndex)
-
-            if edges.Count = 1 then
-                this.RegisterWithDeps()
-
-            index
-
-        member this.RemoveEdgeAt(index: int) =
-            edges.RemoveAt(index)
-
-            if edges.Count = 0 then
-                this.UnregisterFromDeps()
 
 /// <summary>
 /// Specialized adaptive node that reduces N dependencies using a binary operation.
@@ -1372,10 +928,6 @@ type ReduceNode<'T>(deps: IAdaptiveValue<'T>[], init: 'T, [<InlineIfLambda>] red
     let mutable hasValue = false
     let mutable value = Unchecked.defaultof<'T>
     let depVersions = Array.zeroCreate<int64> deps.Length
-    // Position of this node in the parents array of each dependency. -1 = no edge.
-    let depSlots = Array.create deps.Length -1
-    let edges = ParentEdges()
-    let mutable dirtyState = DirtyState.MaybeDirty
     // Write-generation-keyed dirty cache: the last verdict stays valid until the
     // next applied write moves the global generation.
     let mutable lastCheckedWriteGen = -1L
@@ -1386,19 +938,9 @@ type ReduceNode<'T>(deps: IAdaptiveValue<'T>[], init: 'T, [<InlineIfLambda>] red
 
         if lastCheckedWriteGen = writeGen then
             dirtyCache
-        elif not hasValue then
-            true
-        elif dirtyState = DirtyState.Dirty then
-            // Marked by a dependency change.
-            true
-        elif dirtyState = DirtyState.Clean && edges.Count > 0 then
-            // Observed and not marked: one flag check, no version reads.
-            dirtyCache <- false
-            lastCheckedWriteGen <- writeGen
-            false
         else
-            // Unobserved, or links can be stale: version check.
-            let mutable dirty = false
+            // Version check: a dependency whose version moved makes this node dirty.
+            let mutable dirty = not hasValue
             let mutable i = 0
 
             while not dirty && i < deps.Length do
@@ -1407,28 +949,15 @@ type ReduceNode<'T>(deps: IAdaptiveValue<'T>[], init: 'T, [<InlineIfLambda>] red
 
                 i <- i + 1
 
-            // Verified clean: promote to the flag-based check (as AdaptiveNode
-            // does) so later reads do not re-walk the dependency closure.
-            if not dirty && edges.Count > 0 then
-                let mutable complete = true
-                let mutable j = 0
-
-                while complete && j < deps.Length do
-                    if depSlots[j] < 0 then
-                        complete <- false
-
-                    j <- j + 1
-
-                if complete then
-                    dirtyState <- DirtyState.Clean
-
             lastCheckedWriteGen <- writeGen
             dirtyCache <- dirty
             dirty
 
     member private this.Recompute() =
-        // Generation at which the recompute starts; a write mid-compute would make
-        // the computed value stale, so the node stays Dirty.
+        // Generation at which the recompute starts; a write from user code in
+        // the middle of the reduce callback moves the generation; the cache is
+        // keyed at the start generation, so the next read version-checks and
+        // sees the moved dependency version.
         let checkedGen = AdaptiveRuntime.getWriteGeneration ctx
 
         let mutable acc = init
@@ -1442,39 +971,10 @@ type ReduceNode<'T>(deps: IAdaptiveValue<'T>[], init: 'T, [<InlineIfLambda>] red
         hasValue <- true
         version <- version + 1L
 
-        dirtyState <-
-            if AdaptiveRuntime.getWriteGeneration ctx <> checkedGen then
-                // A write from user code inside the reduce callback: the value
-                // may be stale, keep Dirty so the next read recomputes.
-                DirtyState.Dirty
-            elif edges.Count > 0 then
-                DirtyState.Clean
-            else
-                DirtyState.MaybeDirty
-
         // The recompute is valid as of checkedGen: key the cache there so
         // later reads at the same generation skip the version check.
         lastCheckedWriteGen <- checkedGen
         dirtyCache <- false
-
-    /// Registration cascade: this node gained its first parent.
-    member private this.RegisterWithDeps() =
-        for j in 0 .. deps.Length - 1 do
-            depSlots[j] <-
-                match deps[j] with
-                | :? IEdgeTarget as target -> target.AddEdge(this, j)
-                | _ -> -1
-
-        dirtyState <- DirtyState.MaybeDirty
-
-    /// Unregistration cascade: this node lost its last parent.
-    member private this.UnregisterFromDeps() =
-        for j in 0 .. deps.Length - 1 do
-            if depSlots[j] >= 0 then
-                (deps[j] :?> IEdgeTarget).RemoveEdgeAt(depSlots[j])
-                depSlots[j] <- -1
-
-        dirtyState <- DirtyState.MaybeDirty
 
     interface IAdaptiveValue<'T> with
         member this.GetValue() =
@@ -1497,102 +997,8 @@ type ReduceNode<'T>(deps: IAdaptiveValue<'T>[], init: 'T, [<InlineIfLambda>] red
             finally
                 AdaptiveRuntime.exitEvaluation ctx
 
-    interface IAdaptiveNode with
-        member this.MarkDirty() =
-            if dirtyState <> DirtyState.Dirty then
-                dirtyState <- DirtyState.Dirty
-
-                for i in 0 .. edges.Count - 1 do
-                    ctx.PushDirty(edges[i])
-
-        member _.SetDepSlot(depIndex: int, parentIndex: int) = depSlots[depIndex] <- parentIndex
-
-        member this.OnFirstParent() = this.RegisterWithDeps()
-        member this.OnLastParent() = this.UnregisterFromDeps()
-
-    interface IEdgeTarget with
-        member _.EdgeCount = edges.Count
-
-        member this.AddEdge(parent: IAdaptiveNode, depIndex: int) =
-            let index = edges.Add(parent, depIndex)
-
-            if edges.Count = 1 then
-                this.RegisterWithDeps()
-
-            index
-
-        member this.RemoveEdgeAt(index: int) =
-            edges.RemoveAt(index)
-
-            if edges.Count = 0 then
-                this.UnregisterFromDeps()
-
 /// <summary>An abbreviation for <see cref="ChangeableValue&lt;'T&gt;"/> (FDA <c>cval&lt;'T&gt;</c> parity).</summary>
 type cval<'T> = ChangeableValue<'T>
-
-/// <summary>
-/// An active observation of an adaptive value. Registered as a parent
-/// of the observed object. Marking enqueues it once per batch; delivery pulls the
-/// current value and invokes the callback when the version changed.
-/// </summary>
-type Observation<'T>(target: IAdaptiveValue<'T>, [<InlineIfLambda>] callback: 'T -> unit) as this =
-    // The graph this observation belongs to, captured at creation (the ambient
-    // graph of the creating thread).
-    let ctx = GraphContext.Current
-    let mutable active = true
-    let mutable enqueued = false
-    let mutable indexInTarget = -1
-    let mutable lastVersion = -1L
-
-    /// Force the initial read and register this observation as a parent.
-    member _.Attach() =
-        // Materialize the dependency subgraph before the cascade registers it.
-        let _ = target.GetValue()
-
-        match target with
-        | :? IEdgeTarget as edgeTarget ->
-            lastVersion <- (target :> IAdaptiveObject).Version
-            indexInTarget <- edgeTarget.AddEdge(this :> IAdaptiveNode, -1)
-        | _ -> ()
-
-    interface IAdaptiveNode with
-        member this.MarkDirty() =
-            if active && not enqueued then
-                enqueued <- true
-                ctx.EnqueueNotification(this :> INotifiable)
-
-        member _.SetDepSlot(depIndex: int, parentIndex: int) =
-            if depIndex = -1 then
-                indexInTarget <- parentIndex
-
-        member _.OnFirstParent() = ()
-        member _.OnLastParent() = ()
-
-    interface INotifiable with
-        member this.Deliver() =
-            enqueued <- false
-
-            if active then
-                // The version is consumed only after the callback succeeds: a
-                // throwing callback keeps the observation's lastVersion stale,
-                // so the next delivery re-reads and re-delivers the change.
-                let newValue = target.GetValue()
-                let newVersion = (target :> IAdaptiveObject).Version
-
-                if newVersion <> lastVersion then
-                    callback newValue
-                    lastVersion <- newVersion
-
-    interface IObservation with
-        member _.IsActive = active
-
-        member this.Dispose() =
-            if active then
-                active <- false
-
-                match target with
-                | :? IEdgeTarget as edgeTarget -> edgeTarget.RemoveEdgeAt(indexInTarget)
-                | _ -> ()
 
 /// <summary>
 /// Core operations for creating and transforming adaptive values.
@@ -1600,10 +1006,11 @@ type Observation<'T>(target: IAdaptiveValue<'T>, [<InlineIfLambda>] callback: 'T
 /// </summary>
 /// <remarks>
 /// <para>
-/// AdaptiveSlop provides incremental computation with a push-mark, pull-evaluate model.
-/// Writes mark the dependents of a source dirty. Reads recompute marked nodes and
-/// return cached values for the rest. Observed subgraphs (see <c>AVal.observe</c>)
-/// get O(1) dirty checks; unobserved subgraphs fall back to version checks.
+/// AdaptiveSlop provides incremental computation with a pull-evaluate model.
+/// A write bumps the version of its source and the write generation of its
+/// graph. A read version-checks its dependencies and recomputes only when one
+/// moved; the write-generation cache keeps repeated reads at the same
+/// generation O(1) per node.
 /// </para>
 /// <para>
 /// <strong>Performance Guidance:</strong>
@@ -1646,7 +1053,6 @@ module AVal =
         // Foreign-thread invalidation goes through the post ring (the
         // cval.Post pattern): a queued flag, applied on the owner thread.
         let mutable posted = 0
-        let edges = ParentEdges()
         let ownerThread = Environment.CurrentManagedThreadId
 
         /// <summary>
@@ -1656,10 +1062,10 @@ module AVal =
         /// </summary>
         member this.Invalidate() =
             if Environment.CurrentManagedThreadId = ownerThread then
-                // Owner thread: mark directly. MarkFrom bumps the write
-                // generation (the *A gate) and marks observers.
+                // Owner thread: invalidate directly. The generation bump opens
+                // the *A gates and invalidates the dirty caches.
                 dirty <- true
-                ctx.MarkFrom edges
+                ctx.BumpWriteGeneration()
             else if Interlocked.CompareExchange(&posted, 1, 0) = 0 then
                 ctx.PostRing.Enqueue(this :> obj)
 
@@ -1696,11 +1102,6 @@ module AVal =
                 // re-read, so version-checking consumers recompute exactly
                 // once; the re-read at GetValue decides the real version.
                 if dirty then version + 1L else version
-
-        interface IEdgeTarget with
-            member _.EdgeCount = edges.Count
-            member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
-            member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
 
     /// <summary>
     /// Creates an adaptive value from an external snapshot function and an
@@ -2035,34 +1436,6 @@ module AVal =
 
     /// <summary>Evaluates the given adaptive value and returns its current value (FDA <c>AVal.force</c> parity; the same as <c>getValue</c>).</summary>
     let inline force (value: aval<'T>) = value.GetValue()
-
-    /// <summary>
-    /// Observes an adaptive value. Forces an initial read and registers the callback
-    /// as a parent of the value. The callback runs after a batch or a write that
-    /// changed the value, and it receives the new value.
-    /// </summary>
-    /// <remarks>
-    /// <para>
-    /// The callback does not run for the initial read. It runs only for later changes.
-    /// Several writes inside one transaction produce one callback.
-    /// </para>
-    /// <para>
-    /// <strong>Memory management:</strong> Edges are strong references. Always dispose
-    /// the returned observation when it is no longer needed. Otherwise the observed
-    /// subgraph stays registered and keeps receiving marks.
-    /// </para>
-    /// </remarks>
-    /// <example>
-    /// <code>
-    /// let count = CVal.create 0
-    /// use observation = AVal.observe (fun v -> printfn "count: %d" v) (CVal.value count)
-    /// count.Set(1)  // prints "count: 1"
-    /// </code>
-    /// </example>
-    let inline observe ([<InlineIfLambda>] callback: 'T -> unit) (value: aval<'T>) : IObservation =
-        let observation = new Observation<_>(value, callback)
-        observation.Attach()
-        observation
 
     let inline getValueTask (value: aval<'T>) = Task.FromResult(value.GetValue())
 

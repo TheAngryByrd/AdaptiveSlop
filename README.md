@@ -17,15 +17,15 @@ Or do the inverse, read as many times as you want between writes, they're "free"
 
 ## Design
 
-- **Pull-lazy evaluation.** Writes mark. Reads compute, per dirty node, once per change.
-  Ten writes before one read cost one recompute. A read at a settled state is O(1).
+- **Pull-lazy evaluation.** Writes bump versions. Reads compute, per dirty node, once
+  per change. Ten writes before one read cost one recompute. A read at a settled state
+  is O(1).
 - **Zero allocation on steady state.** Delta buffers are reused. Steady-state reads and
   writes allocate nothing.
-- **Coarse scans instead of per-entry bookkeeping.** Unobserved mapA nodes re-check every
-  entry's version on read. The trade is flat overhead in exchange for a scan after each
-  write.
-- **Transactions.** Writes inside `Transaction.run` apply at commit, with one notification
-  delivery.
+- **Coarse scans instead of per-entry bookkeeping.** mapA nodes re-check every entry's
+  version on read after a write. The trade is flat overhead in exchange for a scan
+  after each write.
+- **Transactions.** Writes inside `Transaction.run` apply at commit.
 
 ## When to use FSharp.Data.Adaptive instead
 
@@ -231,7 +231,7 @@ let statuses =
 ## API surface
 
 - **AVal** — `constant`, `delay`, `init`, `ofExternal`, `map`, `map2`, `map3`, `map4`,
-  `mapN`, `reduce`, `sum`, `bind`, `bind2`, `bind3`, `observe`, `getValue`, `force`
+  `mapN`, `reduce`, `sum`, `bind`, `bind2`, `bind3`, `getValue`, `force`
   (+ `Task`/`ValueTask` variants)
 - **CVal** — `create`, `value`, `set`, `post`
 - **CSet** — `empty`, `ofSeq`, `add`, `remove`, `set`, `updateTo`, `perform`, `unionWith`,
@@ -242,19 +242,18 @@ let statuses =
   `updateTo`, `perform`, `value`, `force`, `toArray`
 - **ASet** — `map`, `filter`, `choose`, `union`, `intersect`, `mapA`, `filterA`,
   `chooseA`, `collect`, `collect'`, `bind`, `bind2`, `bind3`, `range`, `mapUse`, `count`,
-  `countBy`, `sum`, `average`, `sort`, `custom`, `getValue`, `force`, `toSet`, `ofSeq`,
-  `observe`
+  `countBy`, `sum`, `average`, `sort`, `custom`, `getValue`, `force`, `toSet`, `ofSeq`
 - **AMap** — `map`, `mapV`, `filter`, `filterV`, `choose`, `chooseV`, `choose2V`,
   `unionWith`, `intersect`, `intersectV`, `mapA`, `filterA`, `chooseA`, `mapUse`, `bind`,
   `bind2`, `bind3`, `keys`, `toASet`, `fold`, `foldGroup`, `foldHalfGroup`, `sumBy`,
-  `averageBy`, `tryFind`, `find`, `getValue`, `force`, `toMap`, `ofSeq`, `observe`
+  `averageBy`, `tryFind`, `find`, `getValue`, `force`, `toMap`, `ofSeq`
 - **AList** — `map`, `mapi`, `filter`, `choose`, `indexed`, `mapA`, `mapiA`, `filterA`,
   `chooseA`, `append`, `concat`, `bind`, `bind2`, `bind3`, `ofAVal`, `ofSeq`, `ofArray`,
   `range`, `init`, `toAVal`, `tryAt`, `tryGet`, `tryFirst`, `tryLast`, `rev`, `sort`,
   `pairwise`, `take`, `takeA`, `skip`, `skipA`, `sub`, `subA`, `reduce`, `reduceBy`,
   `fold`, `foldGroup`, `foldHalfGroup`, `exists`, `forall`, `countBy`, `tryMin`,
   `tryMax`, `sum`, `sumBy`, `average`, `averageBy`, `mapUse`, `custom`, `getValue`,
-  `force`, `toArray`, `observe`
+  `force`, `toArray`
 - **Transaction** — `run`
 - **Posting** — `pump`
 
@@ -271,22 +270,19 @@ Guidance: `map`/`map2` for 1–2 deps, `map3`/`map4` for 3–4, `mapN`/`reduce`/
 
 ## Architecture
 
-- **Push-mark, pull-evaluate.** Writes mark observed subgraphs dirty; reads recompute a
-  dirty node exactly once per change and return cached values otherwise. Unobserved
-  nodes fall back to dependency version checks.
-- **Lazy edges.** Dependencies are re-discovered on every recompute, so dynamic graphs
-  (`bind`) stay correct. Edge sets mutate only when they really change.
+- **Pull-only, version-checked.** A write bumps the source's version and the graph's
+  write generation. A read compares the recorded dependency versions against the
+  current ones and recomputes only when one moved; the write-generation cache keeps
+  repeated reads at a settled state O(1) per node.
+- **Dependencies re-read on every recompute.** Dependency sets are re-discovered on
+  every recompute, so dynamic graphs (`bind`) stay correct.
 - **Collections push deltas.** Changeable collections journal added/removed/updated
   elements and push them to derived nodes, which update per-element (with ref-counting
   for shared outputs).
-- **Observation.** `AVal.observe`/`ASet.observe`/`AMap.observe`/`AList.observe` register
-  a strong parent edge and deliver the callback after a batch or a write. Dispose the
-  observation to stop; edges are strong, so an undropped observation keeps the subgraph
-  alive.
 
 ## Limitations
 
-- **mapA scan.** Unobserved mapA/filterA/chooseA nodes re-check every entry's version on
+- **mapA scan.** mapA/filterA/chooseA nodes re-check every entry's version on
   each read after a write — O(N) per change, deliberate in exchange for zero per-entry
   bookkeeping.
 - **Wide fan-out.** Very wide dependency graphs re-validate each level on a write and
