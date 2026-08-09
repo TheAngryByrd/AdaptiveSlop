@@ -1735,15 +1735,23 @@ type ScalarEscapeBenchmarks() =
 
     [<Benchmark>]
     member this.SlopCountAddWrite() =
+        // Add then remove the same fresh key: both are real writes (absent at
+        // the add, present at the remove), the count never moves, and the map
+        // stays bounded — the per-key gate must keep the branch at write cost.
         for i in 1 .. this.Iterations do
             slopMap.AddOrUpdate (1000 + i) i
+            slopMap.Remove(1000 + i)
             let _ = AdaptiveSlop.Core.AVal.getValue slopCountBranch
             ()
 
     [<Benchmark>]
     member this.SlopContainsUnrelatedWrite() =
         for i in 1 .. this.Iterations do
+            // Add and remove the same unrelated element: both are real writes
+            // (the element is absent at the add, present at the remove), the
+            // watched element never moves, and the set stays bounded.
             slopSet.Add(2000 + i) |> ignore
+            slopSet.Remove(2000 + i) |> ignore
             let _ = AdaptiveSlop.Core.AVal.getValue slopContainsBranch
             ()
 
