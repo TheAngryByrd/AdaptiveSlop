@@ -237,6 +237,9 @@ type SetReduceNode<'a, 'b, 's, 'v when 'a: equality>
         let addStart = journal.Adds.Count
         let mutable i = 0
         let mutable rebuilt = false
+        // Suspend the append-time cross-kind cancellation while the journal
+        // is replayed (see journalAppendSet): the mapping is user code.
+        journal.InDrain[0] <- 1
         // Consumed counts: applied entries must never be applied again; the
         // entry that threw survives for the next drain.
         let mutable remsDone = 0
@@ -266,6 +269,7 @@ type SetReduceNode<'a, 'b, 's, 'v when 'a: equality>
                 i <- i + 1
                 addsDone <- i
         finally
+            journal.InDrain[0] <- 0
             // Compact in the finally: a throwing mapping must not make the next
             // drain re-apply consumed entries (double subtract corrupts the
             // reduction).
@@ -572,6 +576,9 @@ type MapReduceNode<'k, 'a, 'b, 's, 'v when 'k: equality>
         let setStart = journal.Sets.Count
         let mutable i = 0
         let mutable rebuilt = false
+        // Suspend the append-time cross-kind cancellation while the journal
+        // is replayed (see journalAppendMap): the mapping is user code.
+        journal.InDrain[0] <- 1
         // Consumed counts: see the set reduction drain.
         let mutable remsDone = 0
         let mutable setsDone = 0
@@ -629,6 +636,7 @@ type MapReduceNode<'k, 'a, 'b, 's, 'v when 'k: equality>
                 i <- i + 1
                 setsDone <- i
         finally
+            journal.InDrain[0] <- 0
             // Compact in the finally: a throwing mapping must not make the next
             // drain re-apply consumed entries (double subtract corrupts the
             // reduction).

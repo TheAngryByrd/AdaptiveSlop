@@ -83,6 +83,10 @@ type ElementSetNode<'T, 'U when 'T: equality and 'U: equality>
         let remStart = rems.Count
         let addStart = adds.Count
         let mutable i = 0
+        // Suspend the append-time cross-kind cancellation while the journal
+        // is replayed: a removal could shift entries under the captured
+        // indexes and double-process them (see journalAppendSet).
+        state.Journal.InDrain[0] <- 1
         // Consumed counts: entries before these positions were applied and
         // must never be applied again; the throwing entry (and reentrant
         // entries appended live, beyond the start bounds) survive.
@@ -132,6 +136,7 @@ type ElementSetNode<'T, 'U when 'T: equality and 'U: equality>
                 i <- i + 1
                 addsDone <- i
         finally
+            state.Journal.InDrain[0] <- 0
             // Compact against the LIVE journal counts: reentrant writes during
             // the mapping append to the live journal (a stale copy would drop
             // them). Consumed entries are dropped; the throwing entry survives.
