@@ -5791,6 +5791,169 @@ let ``a thread with its own graph posts into the owner's ring`` () =
     // The owner's next graph operation drains and applies the post.
     Assert.Equal(7, AVal.getValue value)
 
+// =============================================================================
+// Tail-only reads of 2+ level chains (the Defli stale-count report). A write
+// journals the first transform level at write time; a transform pushes
+// downstream only at its own read. The transform versions must therefore
+// indicate upstream dirt (the dirty-indicator Version), or a gated tail read
+// (count, tryFind, contains, tryLast, fold, a scalar consumer) of a chain with
+// two or more transform levels serves the stale value forever.
+// =============================================================================
+
+[<Fact>]
+let ``map: tail-only count over chooseA + filter settles`` () =
+    // The reported repro, verbatim.
+    let src = CMap.empty<int, int>
+    let chosen = src |> AMap.chooseA (fun _ v -> AVal.constant (Some v))
+    let filtered = chosen |> AMap.filter (fun _ v -> v > 10)
+    let cnt = filtered |> AMap.count
+
+    Assert.Equal(0, AVal.getValue cnt)
+    CMap.addOrUpdate 1 42 src
+    Assert.Equal(1, AVal.getValue cnt)
+
+[<Fact>]
+let ``map: tail-only count over map + filter settles after batched writes`` () =
+    let src = CMap.empty<int, int>
+    let mapped = src |> AMap.map (fun _ v -> v * 2)
+    let filtered = mapped |> AMap.filter (fun _ v -> v > 10)
+    let cnt = filtered |> AMap.count
+
+    Assert.Equal(0, AVal.getValue cnt)
+    // Three writes with no intermediate reads anywhere in the chain.
+    CMap.addOrUpdate 1 42 src
+    CMap.addOrUpdate 2 100 src
+    CMap.remove 1 src |> ignore
+    Assert.Equal(1, AVal.getValue cnt)
+
+[<Fact>]
+let ``map: tail-only tryFind over map + filter settles`` () =
+    let src = CMap.empty<int, int>
+    let mapped = src |> AMap.map (fun _ v -> v + 1)
+    let filtered = mapped |> AMap.filter (fun _ v -> v > 0)
+    let lookup = filtered |> AMap.tryFind 7
+
+    Assert.Equal(ValueNone, AVal.getValue lookup)
+    CMap.addOrUpdate 7 41 src
+    Assert.Equal(ValueSome 42, AVal.getValue lookup)
+
+[<Fact>]
+let ``map: tail-only isEmpty over map + filter settles`` () =
+    let src = CMap.empty<int, int>
+    let mapped = src |> AMap.map (fun _ v -> v)
+    let filtered = mapped |> AMap.filter (fun _ v -> v > 10)
+    let empty = filtered |> AMap.isEmpty
+
+    Assert.True(AVal.getValue empty)
+    CMap.addOrUpdate 1 42 src
+    Assert.False(AVal.getValue empty)
+    CMap.remove 1 src |> ignore
+    Assert.True(AVal.getValue empty)
+
+[<Fact>]
+let ``map: tail-only fold over map + filter settles`` () =
+    let src = CMap.empty<int, int>
+    let mapped = src |> AMap.map (fun _ v -> v)
+    let filtered = mapped |> AMap.filter (fun _ v -> v > 10)
+    let sum = filtered |> AMap.fold (fun acc _ v -> acc + v) 0
+
+    Assert.Equal(0, AVal.getValue sum)
+    CMap.addOrUpdate 1 42 src
+    Assert.Equal(42, AVal.getValue sum)
+    CMap.addOrUpdate 2 8 src
+    // 8 does not pass the v > 10 filter: the sum must stay 42.
+    Assert.Equal(42, AVal.getValue sum)
+
+[<Fact>]
+let ``map: tail-only count over three transform levels settles`` () =
+    let src = CMap.empty<int, int>
+    let a = src |> AMap.map (fun _ v -> v)
+    let b = a |> AMap.filter (fun _ v -> v > 10)
+    let c = b |> AMap.choose (fun _ v -> Some v)
+    let cnt = c |> AMap.count
+
+    Assert.Equal(0, AVal.getValue cnt)
+    CMap.addOrUpdate 1 42 src
+    Assert.Equal(1, AVal.getValue cnt)
+
+[<Fact>]
+let ``map: tail-only read of a 3-level chain's last transform settles`` () =
+    let src = CMap.empty<int, int>
+    let a = src |> AMap.map (fun _ v -> v * 2)
+    let b = a |> AMap.filter (fun _ v -> v > 10)
+    let c = b |> AMap.map (fun _ v -> v + 1)
+
+    AMap.getValue c |> ignore
+    CMap.addOrUpdate 1 42 src
+    Assert.Equal(85, (AMap.getValue c)[1])
+
+[<Fact>]
+let ``map: scalar consumer over map + filter settles`` () =
+    let src = CMap.empty<int, int>
+    let mapped = src |> AMap.map (fun _ v -> v)
+    let filtered = mapped |> AMap.filter (fun _ v -> v > 10)
+    let scalar = filtered |> AMap.toAVal |> AVal.map (fun d -> d.Count)
+
+    Assert.Equal(0, AVal.getValue scalar)
+    CMap.addOrUpdate 1 42 src
+    Assert.Equal(1, AVal.getValue scalar)
+
+[<Fact>]
+let ``map: bind over a 2-level inner chain settles`` () =
+    let src = CMap.empty<int, int>
+    let mapped = src |> AMap.map (fun _ v -> v)
+    let filtered = mapped |> AMap.filter (fun _ v -> v > 10)
+    let pick = CVal.create true
+    let bound = AMap.bind (fun _ -> filtered) pick
+    let cnt = bound |> AMap.count
+
+    Assert.Equal(0, AVal.getValue cnt)
+    CMap.addOrUpdate 1 42 src
+    Assert.Equal(1, AVal.getValue cnt)
+
+[<Fact>]
+let ``set: tail-only count and contains over map + filter settle`` () =
+    let src = CSet.empty<int>
+    let mapped = src |> ASet.map (fun v -> v * 2)
+    let filtered = mapped |> ASet.filter (fun v -> v > 10)
+    let cnt = filtered |> ASet.count
+    let has = filtered |> ASet.contains 84
+
+    Assert.Equal(0, AVal.getValue cnt)
+    Assert.False(AVal.getValue has)
+    CSet.add 42 src |> ignore
+    Assert.Equal(1, AVal.getValue cnt)
+    Assert.True(AVal.getValue has)
+
+[<Fact>]
+let ``set: union with a 2-level side settles`` () =
+    let left = CSet.empty<int>
+    let right = CSet.empty<int>
+    let mapped = left |> ASet.map (fun v -> v * 2)
+    let filtered = mapped |> ASet.filter (fun v -> v > 10)
+    let union = ASet.union filtered (right :> aset<int>)
+    let cnt = union |> ASet.count
+
+    Assert.Equal(0, AVal.getValue cnt)
+    CSet.add 42 left |> ignore
+    Assert.Equal(1, AVal.getValue cnt)
+    CSet.add 7 right |> ignore
+    Assert.Equal(2, AVal.getValue cnt)
+
+[<Fact>]
+let ``list: tail-only count and tryLast over map + filter settle`` () =
+    let src = CList.empty<int>
+    let mapped = src |> AList.map (fun v -> v * 2)
+    let filtered = mapped |> AList.filter (fun v -> v > 10)
+    let cnt = filtered |> AList.count
+    let last = filtered |> AList.tryLast
+
+    Assert.Equal(0, AVal.getValue cnt)
+    Assert.Equal(ValueNone, AVal.getValue last)
+    CList.append 42 src |> ignore
+    Assert.Equal(1, AVal.getValue cnt)
+    Assert.Equal(ValueSome 84, AVal.getValue last)
+
 #if DEBUG
 [<Fact>]
 let ``direct access to another thread's node throws in debug`` () =

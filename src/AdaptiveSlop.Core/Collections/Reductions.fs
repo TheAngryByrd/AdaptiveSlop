@@ -339,7 +339,12 @@ type SetReduceNode<'a, 'b, 's, 'v when 'a: equality>
             finally
                 ctx.ReleaseOwner()
 
-        member _.Version = version
+        member _.Version =
+            // Dirty indicator (see ListReduceNode.Version).
+            if source.Version <> depVersions[0] then
+                version + 1L
+            else
+                version
 
     interface IDisposable with
         member this.Dispose() =
@@ -512,7 +517,15 @@ type ListReduceNode<'a, 'b, 's, 'v>
             finally
                 ctx.ReleaseOwner()
 
-        member _.Version = version
+        member _.Version =
+            // Dirty indicator (see MapMapNode.Version in MapNodes.fs): while
+            // the source has unprocessed changes, report version + 1 so
+            // version-checking consumers re-read; the re-read drains the
+            // journal and settles the chain recursively.
+            if source.Version <> depVersion then
+                version + 1L
+            else
+                version
 
     interface IDisposable with
         member this.Dispose() =
@@ -709,7 +722,12 @@ type MapReduceNode<'k, 'a, 'b, 's, 'v when 'k: equality>
             finally
                 ctx.ReleaseOwner()
 
-        member _.Version = version
+        member _.Version =
+            // Dirty indicator (see ListReduceNode.Version).
+            if source.Version <> depVersions[0] then
+                version + 1L
+            else
+                version
 
     interface IDisposable with
         member this.Dispose() =
