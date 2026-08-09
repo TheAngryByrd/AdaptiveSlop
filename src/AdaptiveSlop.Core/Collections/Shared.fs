@@ -112,9 +112,9 @@ type internal DeltaBuffer<'T> =
     member this.IsEmpty = this.Count = 0
 
 /// <summary>
-/// A set delta: elements added and removed since the previous delivery.
-/// Passed to <see cref="ASet.observe"/> callbacks. The buffers are transient:
-/// valid only during the callback that received the delta.
+/// A set delta: elements added and removed since the previous delivery. The
+/// buffers are transient: valid only during the delivery that received the
+/// delta.
 /// </summary>
 [<Struct>]
 type SetDelta<'T> =
@@ -206,9 +206,9 @@ type SetDeltaBuilder<'T>() =
     member internal this.Snapshot() = SetDelta(adds, rems)
 
 /// <summary>
-/// A map delta: upserted entries and removed keys since the previous delivery.
-/// Passed to <see cref="AMap.observe"/> callbacks. The buffers are transient:
-/// valid only during the callback that received the delta.
+/// A map delta: upserted entries and removed keys since the previous
+/// delivery. The buffers are transient: valid only during the delivery that
+/// received the delta.
 /// </summary>
 [<Struct>]
 type MapDelta<'K, 'V> =
@@ -334,10 +334,10 @@ type ListOp<'T> =
           Source = source }
 
 /// <summary>
-/// A list delta: ordered operations since the previous delivery. Passed to
-/// <see cref="AList.observe"/> callbacks. The buffer is transient: valid only
-/// during the callback that received the delta. Order is the semantics: apply
-/// the operations sequentially (docs/ALIST-DESIGN.md §3.2).
+/// A list delta: ordered operations since the previous delivery. The buffer
+/// is transient: valid only during the delivery that received the delta.
+/// Order is the semantics: apply the operations sequentially
+/// (docs/ALIST-DESIGN.md §3.2).
 /// </summary>
 [<Struct>]
 type ListDelta<'T> =
@@ -463,7 +463,6 @@ type internal RefCountedSet<'T when 'T: equality> =
 [<Struct>]
 type internal SetNodeState<'T, 'U when 'U: equality> =
     val mutable Version: int64
-    val mutable Edges: ParentEdges
     val mutable Sinks: SinkList
     val mutable DepVersions: int64[]
     val mutable Set: RefCountedSet<'U>
@@ -473,7 +472,6 @@ type internal SetNodeState<'T, 'U when 'U: equality> =
     new
         (
             version: int64,
-            edges: ParentEdges,
             sinks: SinkList,
             depVersions: int64[],
             set: RefCountedSet<'U>,
@@ -481,7 +479,6 @@ type internal SetNodeState<'T, 'U when 'U: equality> =
             out: SetDelta<'U>
         ) =
         { Version = version
-          Edges = edges
           Sinks = sinks
           DepVersions = depVersions
           Set = set
@@ -491,7 +488,6 @@ type internal SetNodeState<'T, 'U when 'U: equality> =
     static member Create(depCount: int) =
         SetNodeState(
             0L,
-            ParentEdges(),
             SinkList.Create(),
             Array.zeroCreate depCount,
             RefCountedSet.Create(),
@@ -507,7 +503,6 @@ type internal SetNodeState<'T, 'U when 'U: equality> =
 [<Struct>]
 type internal MapNodeState<'K, 'V, 'U when 'K: equality> =
     val mutable Version: int64
-    val mutable Edges: ParentEdges
     val mutable Sinks: SinkList
     val mutable DepVersions: int64[]
     val mutable Data: Dictionary<'K, 'U>
@@ -517,7 +512,6 @@ type internal MapNodeState<'K, 'V, 'U when 'K: equality> =
     new
         (
             version: int64,
-            edges: ParentEdges,
             sinks: SinkList,
             depVersions: int64[],
             data: Dictionary<'K, 'U>,
@@ -525,7 +519,6 @@ type internal MapNodeState<'K, 'V, 'U when 'K: equality> =
             out: MapDelta<'K, 'U>
         ) =
         { Version = version
-          Edges = edges
           Sinks = sinks
           DepVersions = depVersions
           Data = data
@@ -535,7 +528,6 @@ type internal MapNodeState<'K, 'V, 'U when 'K: equality> =
     static member Create(depCount: int) =
         MapNodeState(
             0L,
-            ParentEdges(),
             SinkList.Create(),
             Array.zeroCreate depCount,
             Dictionary<'K, 'U>(),
@@ -547,25 +539,19 @@ type internal MapNodeState<'K, 'V, 'U when 'K: equality> =
 /// Per-element cache entry of the <c>*A</c> nodes (mapA/chooseA/filterA,
 /// docs/2026-08-05-MAPA-DESIGN.md). Holds the element's aval, its version at
 /// the last force (the version read BEFORE the force: a mid-force write then
-/// leaves the stored version stale, so the next scan re-forces), its last
-/// contribution to the output, and the registration state with the aval's
-/// edge list. <see cref="Id"/> disambiguates <c>SetDepSlot</c> updates when
-/// the aval's edge list is reordered by another dependent.
+/// leaves the stored version stale, so the next scan re-forces), and its last
+/// contribution to the output.
 /// </summary>
 [<Struct>]
 type internal ElementEntry<'U> =
     val mutable Aval: aval<'U voption>
     val mutable Version: int64
     val mutable Last: 'U voption
-    val mutable Id: int
-    val mutable EdgeIndex: int
 
-    new(aval: aval<'U voption>, version: int64, last: 'U voption, id: int, edgeIndex: int) =
+    new(aval: aval<'U voption>, version: int64, last: 'U voption) =
         { Aval = aval
           Version = version
-          Last = last
-          Id = id
-          EdgeIndex = edgeIndex }
+          Last = last }
 
 // =============================================================================
 // Shared operations
@@ -758,66 +744,18 @@ module internal Collections =
 
                 i <- i + 1
 
-    /// Push a delta and mark the scalar parents of a source, with notification
-    /// delivery deferred to the end of the operation (PLAN.md Section 6.5).
-    /// A throwing sink is isolated: the parents are still marked (the state
-    /// already moved and downstream nodes must re-read), and the exception is
-    /// rethrown after marking and delivery.
-    let inline pushAndMarkSet (ctx: GraphContext) (delta: SetDelta<'T>) (sinks: SinkList byref) (edges: ParentEdges) =
-        let wasActive = ctx.TxActive
-        ctx.TxActive <- true
+    /// Push a set delta to every registered sink and record the write: the
+    /// write generation advances, so version-gated readers (the *A gates, the
+    /// scalar dirty caches) re-check on their next read.
+    let inline pushAndBumpSet (ctx: GraphContext) (delta: SetDelta<'T>) (sinks: SinkList byref) =
+        ctx.BumpWriteGeneration()
+        pushSetDelta &sinks delta
 
-        let firstEx =
-            try
-                pushSetDelta &sinks delta
-                None
-            with e ->
-                Some e
-
-        try
-            ctx.MarkFrom(edges)
-        finally
-            ctx.TxActive <- wasActive
-
-        if not wasActive then
-            ctx.DeliverNotifications()
-
-        match firstEx with
-        | Some e -> raise e
-        | None -> ()
-
-    /// Push a delta and mark the scalar parents of a source, with notification
-    /// delivery deferred to the end of the operation (PLAN.md Section 6.5).
-    /// A throwing sink is isolated: the parents are still marked (the state
-    /// already moved and downstream nodes must re-read), and the exception is
-    /// rethrown after marking and delivery.
-    let inline pushAndMarkMap
-        (ctx: GraphContext)
-        (delta: MapDelta<'K, 'V>)
-        (sinks: SinkList byref)
-        (edges: ParentEdges)
-        =
-        let wasActive = ctx.TxActive
-        ctx.TxActive <- true
-
-        let firstEx =
-            try
-                pushMapDelta &sinks delta
-                None
-            with e ->
-                Some e
-
-        try
-            ctx.MarkFrom(edges)
-        finally
-            ctx.TxActive <- wasActive
-
-        if not wasActive then
-            ctx.DeliverNotifications()
-
-        match firstEx with
-        | Some e -> raise e
-        | None -> ()
+    /// Push a map delta to every registered sink and record the write (see
+    /// <see cref="pushAndBumpSet"/>).
+    let inline pushAndBumpMap (ctx: GraphContext) (delta: MapDelta<'K, 'V>) (sinks: SinkList byref) =
+        ctx.BumpWriteGeneration()
+        pushMapDelta &sinks delta
 
     /// Push a list delta to every registered sink. See <see cref="pushSetDelta"/>
     /// for the dead-entry and reentrancy handling.
@@ -836,33 +774,11 @@ module internal Collections =
 
             i <- i + 1
 
-    /// Push a delta and mark the scalar parents of a source, with notification
-    /// delivery deferred to the end of the operation (PLAN.md Section 6.5).
-    /// A throwing sink is isolated: the parents are still marked (the state
-    /// already moved and downstream nodes must re-read), and the exception is
-    /// rethrown after marking and delivery.
-    let inline pushAndMarkList (ctx: GraphContext) (delta: ListDelta<'T>) (sinks: SinkList byref) (edges: ParentEdges) =
-        let wasActive = ctx.TxActive
-        ctx.TxActive <- true
-
-        let firstEx =
-            try
-                pushListDelta &sinks delta
-                None
-            with e ->
-                Some e
-
-        try
-            ctx.MarkFrom(edges)
-        finally
-            ctx.TxActive <- wasActive
-
-        if not wasActive then
-            ctx.DeliverNotifications()
-
-        match firstEx with
-        | Some e -> raise e
-        | None -> ()
+    /// Push a list delta to every registered sink and record the write (see
+    /// <see cref="pushAndBumpSet"/>).
+    let inline pushAndBumpList (ctx: GraphContext) (delta: ListDelta<'T>) (sinks: SinkList byref) =
+        ctx.BumpWriteGeneration()
+        pushListDelta &sinks delta
 
     /// Drain the journal of a set node with refcounts (map over set, union):
     /// apply each pending delta to the state and collect the reduced output
@@ -1076,9 +992,9 @@ module internal Collections =
 
         struct (s, changed)
 
-    /// Drain a set node and push the reduced output delta to its sinks, with
-    /// notification delivery deferred (PLAN.md Section 6.5). The byref appears
-    /// only at this top-level call site (a class field address: 0 allocation).
+    /// Drain a set node and push the reduced output delta to its sinks. The
+    /// byref appears only at this top-level call site (a class field address:
+    /// 0 allocation).
     let inline drainSetPush ([<InlineIfLambda>] map: 'T -> 'U voption) (state: SetNodeState<'T, 'U> byref) =
         let ctx = GraphContext.Current
         let wasActive = ctx.TxActive
@@ -1093,9 +1009,6 @@ module internal Collections =
                 state.Out.Clear()
         finally
             ctx.TxActive <- wasActive
-
-        if not wasActive then
-            ctx.DeliverNotifications()
 
     /// Drain a plain set node (filter) and push the reduced output delta.
     let inline drainPlainSetPush ([<InlineIfLambda>] map: 'T -> 'T voption) (state: SetNodeState<'T, 'T> byref) =
@@ -1113,11 +1026,7 @@ module internal Collections =
         finally
             ctx.TxActive <- wasActive
 
-        if not wasActive then
-            ctx.DeliverNotifications()
-
-    /// Drain a map node and push the reduced output delta to its sinks, with
-    /// notification delivery deferred (PLAN.md Section 6.5).
+    /// Drain a map node and push the reduced output delta to its sinks.
     let inline drainMapPush ([<InlineIfLambda>] map: 'K -> 'V -> 'U voption) (state: MapNodeState<'K, 'V, 'U> byref) =
         let ctx = GraphContext.Current
         let wasActive = ctx.TxActive
@@ -1132,9 +1041,6 @@ module internal Collections =
                 state.Out.Clear()
         finally
             ctx.TxActive <- wasActive
-
-        if not wasActive then
-            ctx.DeliverNotifications()
 
     /// Initial load of a refcounted set node: build the internal state from a
     /// snapshot of the source view. The node takes the snapshot and registers
@@ -1216,7 +1122,6 @@ module internal Collections =
     [<Struct>]
     type internal TwoSetState<'T when 'T: equality> =
         val mutable Version: int64
-        val mutable Edges: ParentEdges
         val mutable Sinks: SinkList
         val mutable DepVersions: int64[]
         val mutable Left: RefCountedSet<'T>
@@ -1232,7 +1137,6 @@ module internal Collections =
         new
             (
                 version: int64,
-                edges: ParentEdges,
                 sinks: SinkList,
                 depVersions: int64[],
                 left: RefCountedSet<'T>,
@@ -1244,7 +1148,6 @@ module internal Collections =
                 scratch: HashSet<'T>
             ) =
             { Version = version
-              Edges = edges
               Sinks = sinks
               DepVersions = depVersions
               Left = left
@@ -1258,7 +1161,6 @@ module internal Collections =
         static member Create(depCount: int) =
             TwoSetState(
                 0L,
-                ParentEdges(),
                 SinkList.Create(),
                 Array.zeroCreate depCount,
                 RefCountedSet.Create(),
@@ -1465,9 +1367,9 @@ module internal Collections =
             struct (s2, false)
 
     /// <summary>
-    /// Drain a two-source set node and push the reduced output delta to its sinks,
-    /// with notification delivery deferred (PLAN.md Section 6.5). The byref appears
-    /// only at this top-level call site (a class field address: 0 allocation).
+    /// Drain a two-source set node and push the reduced output delta to its
+    /// sinks. The byref appears only at this top-level call site (a class
+    /// field address: 0 allocation).
     /// </summary>
     let inline drainTwoSetPush (op: TwoSetOp) (state: TwoSetState<'T> byref) =
         let ctx = GraphContext.Current
@@ -1483,9 +1385,6 @@ module internal Collections =
                 state.OutDelta.Clear()
         finally
             ctx.TxActive <- wasActive
-
-        if not wasActive then
-            ctx.DeliverNotifications()
 
     /// <summary>
     /// The concrete HashSet view of a set node when available (the hot path,
@@ -1553,7 +1452,6 @@ module internal Collections =
     [<Struct>]
     type internal Choose2State<'K, 'V1, 'V2, 'V3 when 'K: equality> =
         val mutable Version: int64
-        val mutable Edges: ParentEdges
         val mutable Sinks: SinkList
         val mutable DepVersions: int64[]
         val mutable Sides: Dictionary<'K, struct ('V1 voption * 'V2 voption)>
@@ -1569,7 +1467,6 @@ module internal Collections =
         new
             (
                 version: int64,
-                edges: ParentEdges,
                 sinks: SinkList,
                 depVersions: int64[],
                 sides: Dictionary<'K, struct ('V1 voption * 'V2 voption)>,
@@ -1581,7 +1478,6 @@ module internal Collections =
                 scratch2: HashSet<'K>
             ) =
             { Version = version
-              Edges = edges
               Sinks = sinks
               DepVersions = depVersions
               Sides = sides
@@ -1595,7 +1491,6 @@ module internal Collections =
         static member Create(depCount: int) =
             Choose2State(
                 0L,
-                ParentEdges(),
                 SinkList.Create(),
                 Array.zeroCreate depCount,
                 Dictionary<'K, struct ('V1 voption * 'V2 voption)>(),
@@ -1854,8 +1749,7 @@ module internal Collections =
             struct (s2, false)
 
     /// <summary>
-    /// Drain a choose2 node and push the reduced output delta to its sinks, with
-    /// notification delivery deferred (PLAN.md Section 6.5).
+    /// Drain a choose2 node and push the reduced output delta to its sinks.
     /// </summary>
     let inline drainChoose2Push
         ([<InlineIfLambda>] mapping: 'K -> 'V1 voption -> 'V2 voption -> 'V3 voption)
@@ -1874,9 +1768,6 @@ module internal Collections =
                 state.OutDelta.Clear()
         finally
             ctx.TxActive <- wasActive
-
-        if not wasActive then
-            ctx.DeliverNotifications()
 
     /// <summary>Initial load of a choose2 node: merge both source snapshots through the mapping.</summary>
     let inline loadChoose2
@@ -1973,6 +1864,10 @@ module internal Collections =
             if not (next.ContainsKey k) then
                 state.Out.Rems <- bufferAppend state.Out.Rems k
                 removeCount <- removeCount + 1
+                // Removals are a change too: without this, a removals-only poll
+                // leaves Out uncleared and the stale removals replay on the
+                // next diff, deleting freshly added entries.
+                changed <- true
 
         for i in 0 .. state.Out.Rems.Count - 1 do
             state.Data.Remove state.Out.Rems.Items[i] |> ignore
@@ -2079,7 +1974,6 @@ module internal Collections =
     [<Struct>]
     type internal CollectState<'T, 'U when 'T: equality and 'U: equality> =
         val mutable Version: int64
-        val mutable Edges: ParentEdges
         val mutable Sinks: SinkList
         val mutable DepVersions: int64[]
         val mutable Journal: SetDelta<'T>
@@ -2094,7 +1988,6 @@ module internal Collections =
         new
             (
                 version: int64,
-                edges: ParentEdges,
                 sinks: SinkList,
                 depVersions: int64[],
                 journal: SetDelta<'T>,
@@ -2104,7 +1997,6 @@ module internal Collections =
                 scratch: Dictionary<'U, bool>
             ) =
             { Version = version
-              Edges = edges
               Sinks = sinks
               DepVersions = depVersions
               Journal = journal
@@ -2116,7 +2008,6 @@ module internal Collections =
         static member Create(depCount: int) =
             CollectState(
                 0L,
-                ParentEdges(),
                 SinkList.Create(),
                 Array.zeroCreate depCount,
                 SetDelta<_>.Create(),
@@ -2332,8 +2223,8 @@ module internal Collections =
         struct (s, changed)
 
     /// <summary>
-    /// Drain a collect node and push the reduced output delta to its sinks, with
-    /// notification delivery deferred (PLAN.md Section 6.5). The byref appears
+    /// Drain a collect node and push the reduced output delta to its sinks.
+    /// The byref appears
     /// only at this top-level call site (a class field address: 0 allocation).
     /// </summary>
     let inline drainCollectPush
@@ -2355,9 +2246,6 @@ module internal Collections =
         finally
             ctx.TxActive <- wasActive
 
-        if not wasActive then
-            ctx.DeliverNotifications()
-
     /// <summary>
     /// Internal. State of a bind node over a scalar value (PLAN.md Section 7.4):
     /// one inner set, swapped when the value changes. The content set is the
@@ -2366,7 +2254,6 @@ module internal Collections =
     [<Struct>]
     type internal BindSetState<'U when 'U: equality> =
         val mutable Version: int64
-        val mutable Edges: ParentEdges
         val mutable Sinks: SinkList
         val mutable DepVersions: int64[]
         val mutable Journal: SetDelta<'U>
@@ -2376,7 +2263,6 @@ module internal Collections =
         new
             (
                 version: int64,
-                edges: ParentEdges,
                 sinks: SinkList,
                 depVersions: int64[],
                 journal: SetDelta<'U>,
@@ -2384,7 +2270,6 @@ module internal Collections =
                 outDelta: SetDelta<'U>
             ) =
             { Version = version
-              Edges = edges
               Sinks = sinks
               DepVersions = depVersions
               Journal = journal
@@ -2394,7 +2279,6 @@ module internal Collections =
         static member Create(depCount: int) =
             BindSetState(
                 0L,
-                ParentEdges(),
                 SinkList.Create(),
                 Array.zeroCreate depCount,
                 SetDelta<_>.Create(),
@@ -2455,8 +2339,8 @@ module internal Collections =
         struct (s, changed)
 
     /// <summary>
-    /// Drain a bind set node and push the reduced output delta to its sinks, with
-    /// notification delivery deferred (PLAN.md Section 6.5). The byref appears
+    /// Drain a bind set node and push the reduced output delta to its sinks.
+    /// The byref appears
     /// only at this top-level call site (a class field address: 0 allocation).
     /// </summary>
     let inline drainBindSetPush (state: BindSetState<'U> byref) =
@@ -2474,9 +2358,6 @@ module internal Collections =
         finally
             ctx.TxActive <- wasActive
 
-        if not wasActive then
-            ctx.DeliverNotifications()
-
     /// <summary>
     /// Internal. State of a bind map node over a scalar value (PLAN.md Section
     /// 7.4): one inner map, swapped when the value changes.
@@ -2484,7 +2365,6 @@ module internal Collections =
     [<Struct>]
     type internal BindMapState<'K, 'V when 'K: equality> =
         val mutable Version: int64
-        val mutable Edges: ParentEdges
         val mutable Sinks: SinkList
         val mutable DepVersions: int64[]
         val mutable Journal: MapDelta<'K, 'V>
@@ -2494,7 +2374,6 @@ module internal Collections =
         new
             (
                 version: int64,
-                edges: ParentEdges,
                 sinks: SinkList,
                 depVersions: int64[],
                 journal: MapDelta<'K, 'V>,
@@ -2502,7 +2381,6 @@ module internal Collections =
                 outDelta: MapDelta<'K, 'V>
             ) =
             { Version = version
-              Edges = edges
               Sinks = sinks
               DepVersions = depVersions
               Journal = journal
@@ -2512,7 +2390,6 @@ module internal Collections =
         static member Create(depCount: int) =
             BindMapState(
                 0L,
-                ParentEdges(),
                 SinkList.Create(),
                 Array.zeroCreate depCount,
                 MapDelta<_, _>.Create(),
@@ -2578,8 +2455,8 @@ module internal Collections =
         struct (s, changed)
 
     /// <summary>
-    /// Drain a bind map node and push the reduced output delta to its sinks, with
-    /// notification delivery deferred (PLAN.md Section 6.5). The byref appears
+    /// Drain a bind map node and push the reduced output delta to its sinks.
+    /// The byref appears
     /// only at this top-level call site (a class field address: 0 allocation).
     /// </summary>
     let inline drainBindMapPush (state: BindMapState<'K, 'V> byref) =
@@ -2596,6 +2473,3 @@ module internal Collections =
                 state.OutDelta.Clear()
         finally
             ctx.TxActive <- wasActive
-
-        if not wasActive then
-            ctx.DeliverNotifications()

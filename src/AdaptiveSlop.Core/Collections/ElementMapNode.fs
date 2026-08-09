@@ -8,9 +8,9 @@ open System.Collections.Generic
 //
 // AMap.mapA / chooseA / filterA share one node, the keyed sibling of
 // ElementSetNode: the mapping returns an aval per entry, cached by key. See
-// ElementSetNode.fs for the dirty gate, registration, and scan contracts;
-// this node differs only in the journal shape (map deltas) and the output
-// state (a plain keyed dictionary).
+// ElementSetNode.fs for the dirty gate and scan contracts; this node differs
+// only in the journal shape (map deltas) and the output state (a plain keyed
+// dictionary).
 // =============================================================================
 
 /// <summary>
@@ -21,11 +21,9 @@ type ElementMapNode<'K, 'V, 'U when 'K: equality>
     (source: IAdaptiveMap<'K, 'V>, [<InlineIfLambda>] mapping: 'K -> 'V -> aval<'U voption>) =
     let mutable state = MapNodeState<'K, 'V, 'U>.Create(1)
     let mutable cache = Dictionary<'K, ElementEntry<'U>>()
-    let mutable nextId = 0
     let mutable initialized = false
     let mutable disposed = false
     let mutable elementDirty = false
-    let mutable regComplete = false
     let mutable lastDrainWriteGen = -1L
 
     member private this.Register() =
@@ -38,67 +36,10 @@ type ElementMapNode<'K, 'V, 'U when 'K: equality>
         | :? IMapSinkRegistry as r -> r.RemoveMapSink(box (this :> IMapDeltaSink<'K, 'V>))
         | _ -> ()
 
-    /// Register with the aval: the aval's writes then mark this node. Returns
-    /// the entry with its Id and edge index filled in. Unregistered avals
-    /// (not an IEdgeTarget) leave the entry unregistered and mark the
-    /// registration incomplete.
-    member private this.RegisterEntry(entry: ElementEntry<'U>) : ElementEntry<'U> =
-        match box entry.Aval with
-        | :? IEdgeTarget as t ->
-            let id = nextId
-            nextId <- nextId + 1
-            ElementEntry(entry.Aval, entry.Version, entry.Last, id, t.AddEdge(this :> IAdaptiveNode, id))
-        | _ ->
-            regComplete <- false
-            entry
-
-    /// Drop the edge into the aval (the cache entry is dropped by the caller).
-    member private _.UnregisterEntry(entry: ElementEntry<'U>) =
-        if entry.EdgeIndex >= 0 then
-            match box entry.Aval with
-            | :? IEdgeTarget as t -> t.RemoveEdgeAt(entry.EdgeIndex)
-            | _ -> ()
-
-    /// The node gained its first parent edge: register every cached aval.
-    member private this.RegisterAll() =
-        regComplete <- true
-        let mutable e = cache.GetEnumerator()
-
-        while e.MoveNext() do
-            let kvp = e.Current
-            cache[kvp.Key] <- this.RegisterEntry kvp.Value
-
-    /// The node lost its last parent edge: drop every aval edge.
-    member private this.UnregisterAll() =
-        let mutable e = cache.GetEnumerator()
-
-        while e.MoveNext() do
-            let kvp = e.Current
-            this.UnregisterEntry kvp.Value
-            let entry = kvp.Value
-            cache[kvp.Key] <- ElementEntry(entry.Aval, entry.Version, entry.Last, entry.Id, -1)
-
-    /// We were moved in an aval's edge list (another dependent removed):
-    /// update the entry's edge index (matched by the Id we passed at
-    /// registration).
-    member private this.FixEdgeIndex(id: int, parentIndex: int) =
-        let mutable e = cache.GetEnumerator()
-        let mutable found = false
-
-        while not found && e.MoveNext() do
-            let kvp = e.Current
-
-            if kvp.Value.Id = id then
-                let mutable entry = kvp.Value
-                entry.EdgeIndex <- parentIndex
-                cache[kvp.Key] <- entry
-                found <- true
-
-    /// The dirty gate: a scan is needed when the precise flag is set, or when
-    /// registration is incomplete and a write moved the generation.
+    /// The dirty gate: a scan is needed when the self-healing flag is set, or
+    /// when a write moved the generation since the last scan.
     member private _.NeedsElementScan() =
-        elementDirty
-        || (not regComplete && GraphContext.Default.WriteGeneration <> lastDrainWriteGen)
+        elementDirty || GraphContext.Default.WriteGeneration <> lastDrainWriteGen
 
     member private this.EnsureInitialized() =
         if not initialized then
@@ -112,7 +53,7 @@ type ElementMapNode<'K, 'V, 'U when 'K: equality>
                 // stored version stale, so the next scan re-forces.
                 let preV = aval.Version
                 let newV = aval.GetValue()
-                let entry = ElementEntry(aval, preV, newV, -1, -1)
+                let entry = ElementEntry(aval, preV, newV)
 
                 match newV with
                 | ValueSome u -> state.Data[k] <- u
@@ -141,11 +82,7 @@ type ElementMapNode<'K, 'V, 'U when 'K: equality>
         try
             while i < remStart do
                 let k = rems.Items[i]
-                let mutable entry = Unchecked.defaultof<ElementEntry<'U>>
-
-                if cache.TryGetValue(k, &entry) then
-                    this.UnregisterEntry entry
-                    cache.Remove k |> ignore
+                cache.Remove k |> ignore
 
                 if state.Data.Remove k then
                     state.Out.Rems <- Collections.bufferAppend state.Out.Rems k
@@ -157,19 +94,11 @@ type ElementMapNode<'K, 'V, 'U when 'K: equality>
 
             while i < setStart do
                 let struct (k, v) = sets.Items[i]
-                let mutable entry = Unchecked.defaultof<ElementEntry<'U>>
-
-                if cache.TryGetValue(k, &entry) then
-                    this.UnregisterEntry entry
-
                 let aval = mapping k v
                 // Version read BEFORE the force (see EnsureInitialized).
                 let preV = aval.Version
                 let newV = aval.GetValue()
-                let mutable newEntry = ElementEntry(aval, preV, newV, -1, -1)
-
-                if state.Edges.Count > 0 then
-                    newEntry <- this.RegisterEntry newEntry
+                let newEntry = ElementEntry(aval, preV, newV)
 
                 match newV with
                 | ValueSome u ->
@@ -276,14 +205,11 @@ type ElementMapNode<'K, 'V, 'U when 'K: equality>
         finally
             ctx.TxActive <- wasActive
 
-        if not wasActive then
-            ctx.DeliverNotifications()
-
-        // Capture AFTER the push: the downstream sink's MarkFrom advances the
-        // write generation during the delta delivery. Capturing in the scan
-        // (before the push) left the gate permanently open and the Version
-        // dirty indicator inflated, so a version-gated consumer recorded a
-        // phantom version and missed the next change.
+        // Capture AFTER the push: the downstream sink's write notification
+        // advances the write generation during the delta delivery. Capturing
+        // in the scan (before the push) left the gate permanently open and
+        // the Version dirty indicator inflated, so a version-gated consumer
+        // recorded a phantom version and missed the next change.
         lastDrainWriteGen <- GraphContext.Default.WriteGeneration
 
     interface IMapDeltaSink<'K, 'V> with
@@ -291,7 +217,7 @@ type ElementMapNode<'K, 'V, 'U when 'K: equality>
             if not disposed then
                 Collections.journalAppendMap &state.Journal setEntries setCnt removedKeys remCnt
                 state.Version <- state.Version + 1L
-                GraphContext.Default.MarkFrom(state.Edges)
+                GraphContext.Default.BumpWriteGeneration()
 
     interface IAdaptiveMap<'K, 'U> with
         member this.GetValue() =
@@ -326,7 +252,6 @@ type ElementMapNode<'K, 'V, 'U when 'K: equality>
             if not disposed then
                 disposed <- true
                 this.Unregister()
-                this.UnregisterAll()
                 Collections.clearSinks &state.Sinks
 
     interface IMapSinkRegistry with
@@ -334,34 +259,3 @@ type ElementMapNode<'K, 'V, 'U when 'K: equality>
 
         member this.RemoveMapSink(sink) =
             Collections.removeSink &state.Sinks sink
-
-    interface IEdgeTarget with
-        member _.EdgeCount = state.Edges.Count
-
-        member this.AddEdge(parent: IAdaptiveNode, depIndex: int) =
-            let index = state.Edges.Add(parent, depIndex)
-
-            if state.Edges.Count = 1 then
-                this.RegisterAll()
-
-            index
-
-        member this.RemoveEdgeAt(index: int) =
-            state.Edges.RemoveAt(index)
-
-            if state.Edges.Count = 0 then
-                this.UnregisterAll()
-
-    interface IAdaptiveNode with
-        member this.MarkDirty() =
-            elementDirty <- true
-            let ctx = GraphContext.Default
-
-            for i in 0 .. state.Edges.Count - 1 do
-                ctx.PushDirty(state.Edges[i])
-
-        member this.SetDepSlot(depIndex: int, parentIndex: int) =
-            this.FixEdgeIndex(depIndex, parentIndex)
-
-        member _.OnFirstParent() = ()
-        member _.OnLastParent() = ()

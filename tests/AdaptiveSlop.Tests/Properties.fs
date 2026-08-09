@@ -3042,8 +3042,7 @@ let ``AList mapiA passes the mapping-time position`` () =
     Check.One(scenarioConfig, prop)
 
 // =============================================================================
-// Gap coverage: AVal.ofExternal, the changeables' batch ops, and the observed
-// path (the IObservation delivery).
+// Gap coverage: AVal.ofExternal and the changeables' batch ops.
 // =============================================================================
 
 [<Fact>]
@@ -3203,123 +3202,6 @@ let ``CList addRange appends the items`` () =
         actual = xs
 
     Check.QuickThrowOnFailure prop
-
-[<Fact>]
-let ``ASet observe delivers the model content after every op`` () =
-    let prop (sc: SetScenario) =
-        let source = CSet.empty<int>
-
-        for (e, _) in sc.initial do
-            CSet.add e source
-
-        let mutable observed = Set.ofSeq (ASet.toSet (CSet.value source))
-
-        let obs =
-            ASet.observe (fun view _ -> observed <- Set.ofSeq view) (CSet.value source)
-
-        let model = HashSet<int>(List.map fst sc.initial)
-
-        for op in sc.ops do
-            match op with
-            | Add(e, _) ->
-                CSet.add e source
-                model.Add e |> ignore
-            | SetOp.Remove e ->
-                CSet.remove e source
-                model.Remove e |> ignore
-            | SetOp.SetValue _ -> ()
-
-            // The notification is delivered during the write; the callback
-            // must have recorded the new content.
-            let expected = Set.ofSeq model
-
-            if observed <> expected then
-                failwithf "mismatch after %A: observed=%A expected=%A" op observed expected
-
-        obs.Dispose()
-
-    Check.One(scenarioConfig, prop)
-
-[<Fact>]
-let ``AMap observe delivers the model content after every op`` () =
-    let prop (sc: MapScenario) =
-        let source = CMap.empty<int, int>
-
-        for (k, v) in sc.initial do
-            CMap.addOrUpdate k v source
-
-        let mutable observed = AMap.toMap (CMap.value source)
-
-        let obs =
-            AMap.observe
-                (fun view _ -> observed <- [ for KeyValue(k, v) in view -> k, v ] |> Map.ofList)
-                (CMap.value source)
-
-        let model = Dictionary<int, int>()
-
-        for (k, v) in sc.initial do
-            model[k] <- v
-
-        for op in sc.ops do
-            match op with
-            | Upsert(k, v) ->
-                CMap.addOrUpdate k v source
-                model[k] <- v
-            | MapOp.Remove k ->
-                CMap.remove k source
-                model.Remove k |> ignore
-            | MapOp.SetValue _ -> ()
-
-            let expected = [ for KeyValue(k, v) in model -> k, v ] |> Map.ofList
-
-            if observed <> expected then
-                failwithf "mismatch after %A: observed=%A expected=%A" op observed expected
-
-        obs.Dispose()
-
-    Check.One(scenarioConfig, prop)
-
-[<Fact>]
-let ``AList observe delivers the model content after every op`` () =
-    let prop (sc: ListScenario) =
-        let source = CList.empty<int>
-        let model = ResizeArray<int>()
-
-        for (e, _) in sc.initial do
-            CList.append e source
-            model.Add e
-
-        let mutable observed = source |> CList.value |> AList.toList
-
-        let obs =
-            AList.observe (fun view _ -> observed <- List.ofSeq view) (CList.value source)
-
-        for op in sc.ops do
-            match op with
-            | Insert(e, payload) ->
-                let pos = payload % (model.Count + 1)
-                CList.insertAt pos e source
-                model.Insert(pos, e)
-            | RemoveAt payload ->
-                if model.Count > 0 then
-                    let pos = payload % model.Count
-                    CList.removeAt pos source
-                    model.RemoveAt pos
-            | UpdateAt(e, payload) ->
-                if model.Count > 0 then
-                    let pos = payload % model.Count
-                    CList.updateAt pos e source
-                    model[pos] <- e
-            | SetValue _ -> ()
-
-            let expected = List.ofSeq model
-
-            if observed <> expected then
-                failwithf "mismatch after %A: observed=%A expected=%A" op observed expected
-
-        obs.Dispose()
-
-    Check.One(scenarioConfig, prop)
 
 // =============================================================================
 // Non-int element types: the same reference-model shape with struct, string,

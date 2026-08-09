@@ -235,8 +235,9 @@ module ASet =
     /// <summary>
     /// An adaptive set over an external reader function. The reader is called
     /// on every read (poll); the node diffs the result against its state and
-    /// emits the diff as the delta. Pull-based: nothing marks this node, so
-    /// consumers must re-read it (FDA <c>ASet.ofReader</c> is pull-based too).
+    /// emits the diff as the delta. Pull-based: nothing tells this node when
+    /// the underlying data changes, so consumers must re-read it (FDA
+    /// <c>ASet.ofReader</c> is pull-based too).
     /// </summary>
     let inline ofReader ([<InlineIfLambda>] reader: unit -> HashSet<'T>) : aset<'T> = new ReaderSetNode<'T>(reader)
 
@@ -270,36 +271,6 @@ module ASet =
     let inline ofExternal ([<InlineIfLambda>] snapshot: unit -> IReadOnlySet<'T>) : aset<'T> * (unit -> unit) =
         let node = new ExternalSetNode<'T>(snapshot)
         (node :> aset<'T>, fun () -> node.Invalidate())
-
-    /// <summary>
-    /// Registers a callback that receives the current view and the net delta
-    /// after every batch that changes the set. The callback runs on the owner
-    /// thread after the write, transaction, or pump completes. The view and
-    /// the delta are transient: valid only during the callback. Disposing the
-    /// returned observation stops delivery.
-    /// </summary>
-    /// <remarks>
-    /// Parity: FDA <c>AddCallback(state, delta)</c> on collection readers.
-    /// Deltas are net per element: adding and removing the same element within
-    /// one batch cancels. The callback never fires for writes that do not
-    /// change the set. Works on sources and derived sets alike.
-    /// </remarks>
-    /// <example>
-    /// <code>
-    /// let items = CSet.empty&lt;int&gt;
-    /// use obs = ASet.observe (fun view delta -&gt;
-    ///     printfn "added: %A removed: %A count: %d" delta.Added delta.Removed view.Count)
-    ///     (CSet.value items)
-    /// CSet.add 1 items   // prints "added: [1] removed: [] count: 1"
-    /// </code>
-    /// </example>
-    let inline observe
-        ([<InlineIfLambda>] callback: IReadOnlySet<'T> -> SetDelta<'T> -> unit)
-        (set: aset<'T>)
-        : IObservation =
-        let node = new ObserveSetNode<'T>(set, callback)
-        node.Attach()
-        node
 
     /// <summary>
     /// Adaptively reduces the set with the given <see cref="AdaptiveReduction"/>.
@@ -590,7 +561,7 @@ module CSet =
 
     /// <summary>
     /// Applies a batch of set operations (FDA <c>cset.Perform</c> parity). The
-    /// batch is applied atomically: observers receive one net delta. Adding and
+    /// batch is applied atomically: sinks receive one net delta. Adding and
     /// removing the same element within the batch cancels.
     /// </summary>
     let perform (delta: SetDeltaBuilder<'T>) (set: cset<'T>) : unit =
@@ -1005,37 +976,6 @@ module AMap =
         )
 
     /// <summary>
-    /// Registers a callback that receives the current view and the net delta
-    /// after every batch that changes the map. The callback runs on the owner
-    /// thread after the write, transaction, or pump completes. The view and
-    /// the delta are transient: valid only during the callback. Disposing the
-    /// returned observation stops delivery.
-    /// </summary>
-    /// <remarks>
-    /// Parity: FDA <c>AddCallback(state, delta)</c> on collection readers.
-    /// Deltas are net per key: setting and removing the same key within one
-    /// batch cancels; a key set twice in one batch delivers the last value.
-    /// The callback never fires for writes that do not change the map. Works
-    /// on sources and derived maps alike.
-    /// </remarks>
-    /// <example>
-    /// <code>
-    /// let scores = CMap.empty&lt;string, int&gt;
-    /// use obs = AMap.observe (fun view delta -&gt;
-    ///     printfn "set: %A removed: %A count: %d" delta.SetEntries delta.RemovedKeys view.Count)
-    ///     (CMap.value scores)
-    /// CMap.addOrUpdate "ada" 10 scores   // prints "set: [("ada", 10)] removed: [] count: 1"
-    /// </code>
-    /// </example>
-    let inline observe
-        (callback: IReadOnlyDictionary<'K, 'V> -> MapDelta<'K, 'V> -> unit)
-        (mapValue: amap<'K, 'V>)
-        : IObservation =
-        let node = new ObserveMapNode<'K, 'V>(mapValue, callback)
-        node.Attach()
-        node
-
-    /// <summary>
     /// Adaptively reduces the map with the given <see cref="AdaptiveReduction"/>
     /// over the values. The state is updated incrementally from deltas: a Set
     /// on an existing key subtracts the old value, then adds the new one.
@@ -1305,7 +1245,7 @@ module CMap =
 
     /// <summary>
     /// Applies a batch of map operations (FDA <c>cmap.Perform</c> parity). The
-    /// batch is applied atomically: observers receive one net delta.
+    /// batch is applied atomically: sinks receive one net delta.
     /// </summary>
     let perform (delta: MapDeltaBuilder<'K, 'V>) (mapValue: cmap<'K, 'V>) : unit =
         let d = delta.Snapshot()
@@ -1927,33 +1867,6 @@ module AList =
     let inline custom ([<InlineIfLambda>] compute: IReadOnlyList<'T> -> ListDeltaBuilder<'T> -> unit) : alist<'T> =
         new CustomListNode<'T>(compute)
 
-    /// <summary>
-    /// Registers a callback that receives the current view and the ordered
-    /// delta after every batch that changes the list. The callback runs on the
-    /// owner thread after the write, transaction, or pump completes. The view
-    /// and the delta are transient: valid only during the callback. Disposing
-    /// the returned observation stops delivery.
-    /// </summary>
-    /// <remarks>
-    /// Parity: FDA <c>AddCallback(state, delta)</c> on collection readers.
-    /// The delta operations are positional and applied in order; a batch that
-    /// removes and reinserts at one position delivers remove+insert (no
-    /// netting, docs/ALIST-DESIGN.md §3.1).
-    /// </remarks>
-    /// <example>
-    /// <code>
-    /// let items = CList.empty&lt;int&gt;
-    /// use obs = AList.observe (fun view delta -&gt;
-    ///     printfn "ops: %d count: %d" delta.Operations.Length view.Count)
-    ///     (CList.value items)
-    /// CList.append 1 items   // prints "ops: 1 count: 1"
-    /// </code>
-    /// </example>
-    let inline observe (callback: IReadOnlyList<'T> -> ListDelta<'T> -> unit) (list: alist<'T>) : IObservation =
-        let node = new ObserveListNode<'T>(list, callback)
-        node.Attach()
-        node
-
 /// <summary>Operations on changeable lists.</summary>
 module CList =
     /// <summary>An empty changeable list.</summary>
@@ -2061,7 +1974,7 @@ module CList =
     /// <summary>
     /// Applies a batch of list operations (FDA <c>clist.Perform</c> parity). The
     /// operations are positional and applied in order; the batch is atomic
-    /// (observers receive one delta).
+    /// (sinks receive one delta).
     /// </summary>
     let perform (delta: ListDeltaBuilder<'T>) (list: clist<'T>) : unit =
         let d = delta.Snapshot()

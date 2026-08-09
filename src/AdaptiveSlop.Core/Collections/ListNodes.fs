@@ -52,7 +52,6 @@ type ConstantList<'T>([<InlineIfLambda>] create: unit -> 'T[]) =
 /// </remarks>
 type FilterMapListNode<'T, 'U>(source: IAdaptiveList<'T>, [<InlineIfLambda>] mapping: int -> 'T -> 'U voption) =
     let mutable version = 0L
-    let mutable edges = ParentEdges()
     let mutable sinks = SinkList.Create()
     let mutable depVersion = 0L
     let mutable initialized = false
@@ -213,7 +212,7 @@ type FilterMapListNode<'T, 'U>(source: IAdaptiveList<'T>, [<InlineIfLambda>] map
             if not disposed then
                 Collections.journalAppendList &journal ops opCnt
                 version <- version + 1L
-                GraphContext.Default.MarkFrom(edges)
+                GraphContext.Default.BumpWriteGeneration()
 
     interface IAdaptiveList<'U> with
         member this.GetValue() =
@@ -252,11 +251,6 @@ type FilterMapListNode<'T, 'U>(source: IAdaptiveList<'T>, [<InlineIfLambda>] map
 
         member this.RemoveListSink(sink) = Collections.removeSink &sinks sink
 
-    interface IEdgeTarget with
-        member _.EdgeCount = edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
-
 /// <summary>
 /// The concatenation of two lists. Ops from both sources share one journal in
 /// arrival order with a source tag: cross-source order matters, because a right
@@ -265,7 +259,6 @@ type FilterMapListNode<'T, 'U>(source: IAdaptiveList<'T>, [<InlineIfLambda>] map
 /// </summary>
 type AppendListNode<'T>(left: IAdaptiveList<'T>, right: IAdaptiveList<'T>) =
     let mutable version = 0L
-    let mutable edges = ParentEdges()
     let mutable sinks = SinkList.Create()
     let mutable leftVersion = 0L
     let mutable rightVersion = 0L
@@ -288,7 +281,7 @@ type AppendListNode<'T>(left: IAdaptiveList<'T>, right: IAdaptiveList<'T>) =
                 if not disposed then
                     this.JournalAppend(ops, opCnt, source)
                     version <- version + 1L
-                    GraphContext.Default.MarkFrom(edges) }
+                    GraphContext.Default.BumpWriteGeneration() }
 
     member private this.Register() =
         leftSink <- box (this.CreateSink 0uy)
@@ -386,7 +379,7 @@ type AppendListNode<'T>(left: IAdaptiveList<'T>, right: IAdaptiveList<'T>) =
             if not disposed then
                 this.JournalAppend(ops, opCnt, 1uy)
                 version <- version + 1L
-                GraphContext.Default.MarkFrom(edges)
+                GraphContext.Default.BumpWriteGeneration()
 
     interface IAdaptiveList<'T> with
         member this.GetValue() =
@@ -429,99 +422,6 @@ type AppendListNode<'T>(left: IAdaptiveList<'T>, right: IAdaptiveList<'T>) =
 
         member this.RemoveListSink(sink) = Collections.removeSink &sinks sink
 
-    interface IEdgeTarget with
-        member _.EdgeCount = edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
-
-/// <summary>
-/// A list observation: sink + edge parent on the target. Delivers
-/// (view, ordered delta) callbacks after each batch that changes the list.
-/// The delta is transient: valid only during the callback.
-/// </summary>
-type ObserveListNode<'T>
-    (target: IAdaptiveList<'T>, [<InlineIfLambda>] callback: IReadOnlyList<'T> -> ListDelta<'T> -> unit) =
-    let mutable active = true
-    let mutable enqueued = false
-    let mutable indexInTarget = -1
-    let mutable journal = ListDelta<'T>.Create()
-
-    /// Register this observation on the target: as a parent edge (marks) and
-    /// as a delta sink (deltas). Called once from the observe API. The initial
-    /// read registers lazy derived chains so that later marks reach this
-    /// observation; no callback fires on attach.
-    member this.Attach() =
-        target.GetValue() |> ignore
-
-        match target with
-        | :? IEdgeTarget as edgeTarget -> indexInTarget <- edgeTarget.AddEdge(this :> IAdaptiveNode, -1)
-        | _ -> ()
-
-        match box target with
-        | :? IListSinkRegistry as r -> r.AddListSink(box (this :> IListDeltaSink<'T>))
-        | _ -> ()
-
-    interface IListDeltaSink<'T> with
-        member this.OnDeltas(ops: ListOp<'T>[], opCnt: int) =
-            if active then
-                Collections.journalAppendList &journal ops opCnt
-
-                if not enqueued then
-                    enqueued <- true
-                    GraphContext.Default.EnqueueNotification(this :> INotifiable)
-
-    interface IAdaptiveNode with
-        member this.MarkDirty() =
-            if active && not enqueued then
-                enqueued <- true
-                GraphContext.Default.EnqueueNotification(this :> INotifiable)
-
-        member _.SetDepSlot(depIndex: int, parentIndex: int) =
-            if depIndex = -1 then
-                indexInTarget <- parentIndex
-
-        member _.OnFirstParent() = ()
-        member _.OnLastParent() = ()
-
-    interface INotifiable with
-        member this.Deliver() =
-            enqueued <- false
-
-            if active then
-                // Drain the target first: for derived nodes this pushes their
-                // pending output delta into the journal. Entries appended here
-                // belong to this delivery.
-                let view = target.GetValue()
-
-                if not journal.IsEmpty then
-                    let start = journal.Ops.Count
-                    callback view journal
-
-                    // Keep the entries appended during the callback (reentrant
-                    // writes) for the next delivery.
-                    let live = journal.Ops.Count
-
-                    if live > start then
-                        Array.Copy(journal.Ops.Items, start, journal.Ops.Items, 0, live - start)
-                        journal.Ops.Count <- live - start
-                    else
-                        journal.Ops.Count <- 0
-
-    interface IObservation with
-        member _.IsActive = active
-
-        member this.Dispose() =
-            if active then
-                active <- false
-
-                match target with
-                | :? IEdgeTarget as edgeTarget -> edgeTarget.RemoveEdgeAt(indexInTarget)
-                | _ -> ()
-
-                match box target with
-                | :? IListSinkRegistry as r -> r.RemoveListSink(box (this :> IListDeltaSink<'T>))
-                | _ -> ()
-
 /// <summary>
 /// An adaptive list whose content is driven by a compute function (FDA
 /// <c>AList.custom</c> parity, MAPA-DESIGN §1.3). The compute receives the
@@ -535,7 +435,6 @@ type CustomListNode<'T when 'T: equality>([<InlineIfLambda>] compute: IReadOnlyL
     let builder = ListDeltaBuilder<'T>()
     let mutable version = 0L
     let mutable sinks = SinkList.Create()
-    let edges = ParentEdges()
     let mutable disposed = false
 
     member private this.Poll() =
@@ -560,7 +459,7 @@ type CustomListNode<'T when 'T: equality>([<InlineIfLambda>] compute: IReadOnlyL
                     | _ -> data[op.Position] <- op.Value
 
                 version <- version + 1L
-                Collections.pushAndMarkList GraphContext.Current out &sinks edges
+                Collections.pushAndBumpList GraphContext.Current out &sinks
                 builder.Clear()
 
     interface IAdaptiveList<'T> with
@@ -593,11 +492,6 @@ type CustomListNode<'T when 'T: equality>([<InlineIfLambda>] compute: IReadOnlyL
 
         member this.RemoveListSink(sink) = Collections.removeSink &sinks sink
 
-    interface IEdgeTarget with
-        member _.EdgeCount = edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
-
 /// <summary>
 /// An adaptive set of a list's elements, deduplicated (FDA
 /// <c>AList.toASet</c> parity). The list deltas are converted to set deltas
@@ -606,7 +500,6 @@ type CustomListNode<'T when 'T: equality>([<InlineIfLambda>] compute: IReadOnlyL
 /// </summary>
 type ToSetListNode<'T when 'T: equality>(source: IAdaptiveList<'T>) =
     let mutable version = 0L
-    let mutable edges = ParentEdges()
     let mutable sinks = SinkList.Create()
     let mutable depVersion = 0L
     let mutable initialized = false
@@ -699,14 +592,14 @@ type ToSetListNode<'T when 'T: equality>(source: IAdaptiveList<'T>) =
 
             journal.Ops.Count <- 0
             version <- version + 1L
-            Collections.pushAndMarkSet GraphContext.Current out &sinks edges
+            Collections.pushAndBumpSet GraphContext.Current out &sinks
 
     interface IListDeltaSink<'T> with
         member this.OnDeltas(ops: ListOp<'T>[], opCnt: int) =
             if not disposed then
                 Collections.journalAppendList &journal ops opCnt
                 version <- version + 1L
-                GraphContext.Default.MarkFrom(edges)
+                GraphContext.Default.BumpWriteGeneration()
 
     interface IAdaptiveSet<'T> with
         member this.GetValue() =
@@ -745,11 +638,6 @@ type ToSetListNode<'T when 'T: equality>(source: IAdaptiveList<'T>) =
 
         member this.RemoveSetSink(sink) = Collections.removeSink &sinks sink
 
-    interface IEdgeTarget with
-        member _.EdgeCount = edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
-
 /// <summary>
 /// An adaptive list of a set's elements (FDA <c>AList.ofASet</c> parity, poll
 /// node). The order is the set's iteration order, stable while the set does
@@ -760,7 +648,6 @@ type SetToListNode<'T when 'T: equality>(source: IAdaptiveSet<'T>) =
     let mutable out = ListDelta<'T>.Create()
     let mutable version = 0L
     let mutable sinks = SinkList.Create()
-    let edges = ParentEdges()
     let mutable disposed = false
 
     member private this.Poll() =
@@ -769,7 +656,7 @@ type SetToListNode<'T when 'T: equality>(source: IAdaptiveSet<'T>) =
 
             if Collections.rebuildListDiff next data &out then
                 version <- version + 1L
-                Collections.pushAndMarkList GraphContext.Current out &sinks edges
+                Collections.pushAndBumpList GraphContext.Current out &sinks
 
             out.Clear()
 
@@ -803,11 +690,6 @@ type SetToListNode<'T when 'T: equality>(source: IAdaptiveSet<'T>) =
 
         member this.RemoveListSink(sink) = Collections.removeSink &sinks sink
 
-    interface IEdgeTarget with
-        member _.EdgeCount = edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
-
 /// <summary>
 /// An adaptive list bound to a scalar value (FDA <c>AList.bind</c> parity):
 /// <c>mapping value</c> selects the inner list; when the value or the inner
@@ -820,7 +702,6 @@ type BindListNode<'T, 'U>(value: IAdaptiveValue<'T>, [<InlineIfLambda>] mapping:
     let mutable out = ListDelta<'U>.Create()
     let mutable version = 0L
     let mutable sinks = SinkList.Create()
-    let edges = ParentEdges()
     let mutable hasInner = false
     let mutable current: 'T = Unchecked.defaultof<'T>
     let mutable inner: IAdaptiveList<'U> = Unchecked.defaultof<IAdaptiveList<'U>>
@@ -846,7 +727,7 @@ type BindListNode<'T, 'U>(value: IAdaptiveValue<'T>, [<InlineIfLambda>] mapping:
 
                 if Collections.rebuildListDiff next data &out then
                     version <- version + 1L
-                    Collections.pushAndMarkList GraphContext.Current out &sinks edges
+                    Collections.pushAndBumpList GraphContext.Current out &sinks
 
                 out.Clear()
 
@@ -880,11 +761,6 @@ type BindListNode<'T, 'U>(value: IAdaptiveValue<'T>, [<InlineIfLambda>] mapping:
 
         member this.RemoveListSink(sink) = Collections.removeSink &sinks sink
 
-    interface IEdgeTarget with
-        member _.EdgeCount = edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
-
 /// <summary>
 /// Concatenates a fixed sequence of lists (FDA <c>AList.concat</c> parity,
 /// poll node): every read re-reads all inner lists and emits the positional
@@ -895,7 +771,6 @@ type ConcatListNode<'T>(sources: IAdaptiveList<'T>[]) =
     let mutable out = ListDelta<'T>.Create()
     let mutable version = 0L
     let mutable sinks = SinkList.Create()
-    let edges = ParentEdges()
     let mutable disposed = false
 
     member private this.Poll() =
@@ -910,7 +785,7 @@ type ConcatListNode<'T>(sources: IAdaptiveList<'T>[]) =
 
             if Collections.rebuildListDiff next data &out then
                 version <- version + 1L
-                Collections.pushAndMarkList GraphContext.Current out &sinks edges
+                Collections.pushAndBumpList GraphContext.Current out &sinks
 
             out.Clear()
 
@@ -944,11 +819,6 @@ type ConcatListNode<'T>(sources: IAdaptiveList<'T>[]) =
 
         member this.RemoveListSink(sink) = Collections.removeSink &sinks sink
 
-    interface IEdgeTarget with
-        member _.EdgeCount = edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
-
 /// <summary>
 /// An adaptive list over an adaptive value of a sequence (FDA
 /// <c>AList.ofAVal</c> parity). Every change of the value replaces the whole
@@ -960,7 +830,6 @@ type OfAvalListNode<'T, 'S when 'S :> seq<'T>>(value: IAdaptiveValue<'S>) =
     let mutable out = ListDelta<'T>.Create()
     let mutable version = 0L
     let mutable sinks = SinkList.Create()
-    let edges = ParentEdges()
     let mutable depVersion = -1L
     let mutable disposed = false
 
@@ -974,7 +843,7 @@ type OfAvalListNode<'T, 'S when 'S :> seq<'T>>(value: IAdaptiveValue<'S>) =
 
                 if Collections.rebuildListDiff next data &out then
                     version <- version + 1L
-                    Collections.pushAndMarkList GraphContext.Current out &sinks edges
+                    Collections.pushAndBumpList GraphContext.Current out &sinks
 
                 out.Clear()
 
@@ -1008,11 +877,6 @@ type OfAvalListNode<'T, 'S when 'S :> seq<'T>>(value: IAdaptiveValue<'S>) =
 
         member this.RemoveListSink(sink) = Collections.removeSink &sinks sink
 
-    interface IEdgeTarget with
-        member _.EdgeCount = edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
-
 /// <summary>
 /// A poll node that rebuilds its output from the source on every read and
 /// emits the positional diff (the gap-sheet poll-node strategy for rev, sort,
@@ -1025,7 +889,6 @@ type PollListSourceNode<'T, 'U>
     let mutable out = ListDelta<'U>.Create()
     let mutable version = 0L
     let mutable sinks = SinkList.Create()
-    let edges = ParentEdges()
     let mutable disposed = false
 
     member private this.Poll() =
@@ -1034,7 +897,7 @@ type PollListSourceNode<'T, 'U>
 
             if Collections.rebuildListDiff next data &out then
                 version <- version + 1L
-                Collections.pushAndMarkList GraphContext.Current out &sinks edges
+                Collections.pushAndBumpList GraphContext.Current out &sinks
 
             out.Clear()
 
@@ -1067,11 +930,6 @@ type PollListSourceNode<'T, 'U>
         member this.AddListSink(sink) = Collections.addSink &sinks sink
 
         member this.RemoveListSink(sink) = Collections.removeSink &sinks sink
-
-    interface IEdgeTarget with
-        member _.EdgeCount = edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
 
 /// <summary>
 /// A stable sort node (FDA <c>AList.sortWith</c> parity, poll model). The
@@ -1088,7 +946,6 @@ type SortListNode<'T, 'K>
     let mutable out = ListDelta<'T>.Create()
     let mutable version = 0L
     let mutable sinks = SinkList.Create()
-    let edges = ParentEdges()
     let mutable disposed = false
 
     member private this.Poll() =
@@ -1121,7 +978,7 @@ type SortListNode<'T, 'K>
 
             if Collections.rebuildListDiff rebuilt data &out then
                 version <- version + 1L
-                Collections.pushAndMarkList GraphContext.Current out &sinks edges
+                Collections.pushAndBumpList GraphContext.Current out &sinks
 
             out.Clear()
 
@@ -1155,11 +1012,6 @@ type SortListNode<'T, 'K>
 
         member this.RemoveListSink(sink) = Collections.removeSink &sinks sink
 
-    interface IEdgeTarget with
-        member _.EdgeCount = edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
-
 /// <summary>
 /// Maps every element, disposing the mapped value when the element leaves its
 /// position (FDA <c>AList.mapUsei</c> parity; the index is the <c>int</c>
@@ -1170,7 +1022,6 @@ type SortListNode<'T, 'K>
 type MapUseListNode<'T, 'W when 'W: equality and 'W :> IDisposable>
     (source: IAdaptiveList<'T>, [<InlineIfLambda>] mapping: int -> 'T -> 'W) =
     let mutable version = 0L
-    let mutable edges = ParentEdges()
     let mutable sinks = SinkList.Create()
     let mutable depVersion = 0L
     let mutable initialized = false
@@ -1234,14 +1085,14 @@ type MapUseListNode<'T, 'W when 'W: equality and 'W :> IDisposable>
 
             journal.Ops.Count <- 0
             version <- version + 1L
-            Collections.pushAndMarkList GraphContext.Current out &sinks edges
+            Collections.pushAndBumpList GraphContext.Current out &sinks
 
     interface IListDeltaSink<'T> with
         member this.OnDeltas(ops: ListOp<'T>[], opCnt: int) =
             if not disposed then
                 Collections.journalAppendList &journal ops opCnt
                 version <- version + 1L
-                GraphContext.Default.MarkFrom(edges)
+                GraphContext.Default.BumpWriteGeneration()
 
     interface IAdaptiveList<'W> with
         member this.GetValue() =
@@ -1284,8 +1135,3 @@ type MapUseListNode<'T, 'W when 'W: equality and 'W :> IDisposable>
         member this.AddListSink(sink) = Collections.addSink &sinks sink
 
         member this.RemoveListSink(sink) = Collections.removeSink &sinks sink
-
-    interface IEdgeTarget with
-        member _.EdgeCount = edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)

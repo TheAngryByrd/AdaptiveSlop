@@ -193,12 +193,11 @@ module AdaptiveReduction =
 /// A delta-driven reduction over a set. Registers as a delta sink on
 /// the source; the journal is applied to the reduction state on read (drain),
 /// with a full recompute fallback when <c>sub</c> cannot invert a removal.
-/// Implements the scalar protocol: version, parent edges, dependency snapshot.
+/// Implements the scalar protocol: version and dependency snapshot.
 /// </summary>
 type SetReduceNode<'a, 'b, 's, 'v when 'a: equality>
     (source: IAdaptiveSet<'a>, [<InlineIfLambda>] mapping: 'a -> 'b, reduction: AdaptiveReduction<'b, 's, 'v>) =
     let mutable version = 0L
-    let mutable edges = ParentEdges()
     let mutable depVersions = [| 0L |]
     let mutable journal = SetDelta<'a>.Create()
     let mutable initialized = false
@@ -294,7 +293,7 @@ type SetReduceNode<'a, 'b, 's, 'v when 'a: equality>
             if not disposed then
                 Collections.journalAppendSet &journal adds addCnt rems remCnt
                 version <- version + 1L
-                GraphContext.Default.MarkFrom(edges)
+                GraphContext.Default.BumpWriteGeneration()
 
     interface IAdaptiveValue<'v> with
         member this.GetValue() =
@@ -338,11 +337,6 @@ type SetReduceNode<'a, 'b, 's, 'v when 'a: equality>
 
         member _.Version = version
 
-    interface IEdgeTarget with
-        member _.EdgeCount = edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
-
     interface IDisposable with
         member this.Dispose() =
             if not disposed then
@@ -362,7 +356,6 @@ type SetReduceNode<'a, 'b, 's, 'v when 'a: equality>
 type ListReduceNode<'a, 'b, 's, 'v>
     (source: IAdaptiveList<'a>, [<InlineIfLambda>] mapping: 'a -> 'b, reduction: AdaptiveReduction<'b, 's, 'v>) =
     let mutable version = 0L
-    let mutable edges = ParentEdges()
     let mutable depVersion = 0L
     let mutable journal = ListDelta<'a>.Create()
     // Mirror of the source values plus their mapped values, aligned with the
@@ -490,7 +483,7 @@ type ListReduceNode<'a, 'b, 's, 'v>
             if not disposed then
                 Collections.journalAppendList &journal ops opCnt
                 version <- version + 1L
-                GraphContext.Default.MarkFrom(edges)
+                GraphContext.Default.BumpWriteGeneration()
 
     interface IAdaptiveValue<'v> with
         member this.GetValue() =
@@ -517,11 +510,6 @@ type ListReduceNode<'a, 'b, 's, 'v>
 
         member _.Version = version
 
-    interface IEdgeTarget with
-        member _.EdgeCount = edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
-
     interface IDisposable with
         member this.Dispose() =
             if not disposed then
@@ -537,7 +525,6 @@ type MapReduceNode<'k, 'a, 'b, 's, 'v when 'k: equality>
     (source: IAdaptiveMap<'k, 'a>, [<InlineIfLambda>] mapping: 'k -> 'a -> 'b, reduction: AdaptiveReduction<'b, 's, 'v>)
     =
     let mutable version = 0L
-    let mutable edges = ParentEdges()
     let mutable depVersions = [| 0L |]
     let mutable journal = MapDelta<'k, 'a>.Create()
     // Mirror of source values plus their mapped values: a Set on an existing
@@ -669,7 +656,7 @@ type MapReduceNode<'k, 'a, 'b, 's, 'v when 'k: equality>
             if not disposed then
                 Collections.journalAppendMap &journal sets setCnt rems remCnt
                 version <- version + 1L
-                GraphContext.Default.MarkFrom(edges)
+                GraphContext.Default.BumpWriteGeneration()
 
     interface IAdaptiveValue<'v> with
         member this.GetValue() =
@@ -715,11 +702,6 @@ type MapReduceNode<'k, 'a, 'b, 's, 'v when 'k: equality>
                 ctx.ReleaseOwner()
 
         member _.Version = version
-
-    interface IEdgeTarget with
-        member _.EdgeCount = edges.Count
-        member _.AddEdge(parent: IAdaptiveNode, depIndex: int) = edges.Add(parent, depIndex)
-        member _.RemoveEdgeAt(index: int) = edges.RemoveAt(index)
 
     interface IDisposable with
         member this.Dispose() =

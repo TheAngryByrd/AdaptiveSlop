@@ -29,7 +29,6 @@ open System.Collections.Generic
 /// </remarks>
 type ElementListNode<'T, 'U>(source: IAdaptiveList<'T>, [<InlineIfLambda>] mapping: int -> 'T -> aval<'U voption>) =
     let mutable version = 0L
-    let mutable edges = ParentEdges()
     let mutable sinks = SinkList.Create()
     let mutable depVersion = 0L
     let mutable initialized = false
@@ -44,11 +43,9 @@ type ElementListNode<'T, 'U>(source: IAdaptiveList<'T>, [<InlineIfLambda>] mappi
     // Per-element cache, parallel to the input (cache[p] = the aval of the
     // element at input position p).
     let mutable cache = ResizeArray<ElementEntry<'U>>()
-    let mutable nextId = 0
-    // Precise element-dirty flag: set by the mark chain from registered avals.
+    // Self-healing flag: set when a reentrant write lands mid-scan, so the
+    // next read rescans even when the generation did not move since.
     let mutable elementDirty = false
-    // Registration completeness (see ElementSetNode.fs).
-    let mutable regComplete = false
     // Write generation at the last scan (the generation gate).
     let mutable lastDrainWriteGen = -1L
 
@@ -79,62 +76,10 @@ type ElementListNode<'T, 'U>(source: IAdaptiveList<'T>, [<InlineIfLambda>] mappi
     member private this.Contains(p: int, index: int) =
         index < inputPositions.Count && inputPositions[index] = p
 
-    /// Register with the aval: the aval's writes then mark this node. Returns
-    /// the entry with its Id and edge index filled in. Unregistered avals
-    /// (not an IEdgeTarget) leave the entry unregistered and mark the
-    /// registration incomplete.
-    member private this.RegisterEntry(entry: ElementEntry<'U>) : ElementEntry<'U> =
-        match box entry.Aval with
-        | :? IEdgeTarget as t ->
-            let id = nextId
-            nextId <- nextId + 1
-            ElementEntry(entry.Aval, entry.Version, entry.Last, id, t.AddEdge(this :> IAdaptiveNode, id))
-        | _ ->
-            regComplete <- false
-            entry
-
-    /// Drop the edge into the aval (the cache entry is dropped by the caller).
-    member private _.UnregisterEntry(entry: ElementEntry<'U>) =
-        if entry.EdgeIndex >= 0 then
-            match box entry.Aval with
-            | :? IEdgeTarget as t -> t.RemoveEdgeAt(entry.EdgeIndex)
-            | _ -> ()
-
-    /// The node gained its first parent edge: register every cached aval.
-    member private this.RegisterAll() =
-        regComplete <- true
-
-        for i in 0 .. cache.Count - 1 do
-            cache[i] <- this.RegisterEntry cache[i]
-
-    /// The node lost its last parent edge: drop every aval edge.
-    member private this.UnregisterAll() =
-        for i in 0 .. cache.Count - 1 do
-            let entry = cache[i]
-            this.UnregisterEntry entry
-            cache[i] <- ElementEntry(entry.Aval, entry.Version, entry.Last, entry.Id, -1)
-
-    /// We were moved in an aval's edge list (another dependent removed):
-    /// update the entry's edge index (matched by the Id we passed at
-    /// registration).
-    member private this.FixEdgeIndex(id: int, parentIndex: int) =
-        let mutable i = 0
-        let mutable found = false
-
-        while not found && i < cache.Count do
-            if cache[i].Id = id then
-                let mutable entry = cache[i]
-                entry.EdgeIndex <- parentIndex
-                cache[i] <- entry
-                found <- true
-            else
-                i <- i + 1
-
-    /// The dirty gate: a scan is needed when the precise flag is set, or when
-    /// registration is incomplete and a write moved the generation.
+    /// The dirty gate: a scan is needed when the self-healing flag is set, or
+    /// when a write moved the generation since the last scan.
     member private _.NeedsElementScan() =
-        elementDirty
-        || (not regComplete && GraphContext.Default.WriteGeneration <> lastDrainWriteGen)
+        elementDirty || GraphContext.Default.WriteGeneration <> lastDrainWriteGen
 
     /// Load the cache and the output from a snapshot of the source.
     member private this.Load(snapshot: ResizeArray<'T>) =
@@ -144,7 +89,7 @@ type ElementListNode<'T, 'U>(source: IAdaptiveList<'T>, [<InlineIfLambda>] mappi
             // stored version stale, so the next scan re-forces.
             let preV = aval.Version
             let newV = aval.GetValue()
-            let entry = ElementEntry(aval, preV, newV, -1, -1)
+            let entry = ElementEntry(aval, preV, newV)
 
             match newV with
             | ValueSome u ->
@@ -190,10 +135,7 @@ type ElementListNode<'T, 'U>(source: IAdaptiveList<'T>, [<InlineIfLambda>] mappi
                     // Version read BEFORE the force (see Load).
                     let preV = aval.Version
                     let newV = aval.GetValue()
-                    let mutable entry = ElementEntry(aval, preV, newV, -1, -1)
-
-                    if edges.Count > 0 then
-                        entry <- this.RegisterEntry entry
+                    let entry = ElementEntry(aval, preV, newV)
 
                     match newV with
                     | ValueSome u ->
@@ -215,7 +157,6 @@ type ElementListNode<'T, 'U>(source: IAdaptiveList<'T>, [<InlineIfLambda>] mappi
                     cache.Insert(p, entry)
                     inputCount <- inputCount + 1
                 | ListOpKind.Remove ->
-                    this.UnregisterEntry cache[p]
                     cache.RemoveAt p
 
                     if present then
@@ -234,15 +175,11 @@ type ElementListNode<'T, 'U>(source: IAdaptiveList<'T>, [<InlineIfLambda>] mappi
 
                     inputCount <- inputCount - 1
                 | ListOpKind.Update ->
-                    this.UnregisterEntry cache[p]
                     let aval = mapping p op.Value
                     // Version read BEFORE the force (see Load).
                     let preV = aval.Version
                     let newV = aval.GetValue()
-                    let mutable entry = ElementEntry(aval, preV, newV, -1, -1)
-
-                    if edges.Count > 0 then
-                        entry <- this.RegisterEntry entry
+                    let entry = ElementEntry(aval, preV, newV)
 
                     match newV with
                     | ValueSome u ->
@@ -381,14 +318,11 @@ type ElementListNode<'T, 'U>(source: IAdaptiveList<'T>, [<InlineIfLambda>] mappi
         finally
             ctx.TxActive <- wasActive
 
-        if not wasActive then
-            ctx.DeliverNotifications()
-
-        // Capture AFTER the push: the downstream sink's MarkFrom advances the
-        // write generation during the delta delivery. Capturing in the scan
-        // (before the push) left the gate permanently open and the Version
-        // dirty indicator inflated, so a version-gated consumer recorded a
-        // phantom version and missed the next change.
+        // Capture AFTER the push: the downstream sink's write notification
+        // advances the write generation during the delta delivery. Capturing
+        // in the scan (before the push) left the gate permanently open and
+        // the Version dirty indicator inflated, so a version-gated consumer
+        // recorded a phantom version and missed the next change.
         lastDrainWriteGen <- GraphContext.Default.WriteGeneration
 
     interface IListDeltaSink<'T> with
@@ -396,7 +330,7 @@ type ElementListNode<'T, 'U>(source: IAdaptiveList<'T>, [<InlineIfLambda>] mappi
             if not disposed then
                 Collections.journalAppendList &journal ops opCnt
                 version <- version + 1L
-                GraphContext.Default.MarkFrom(edges)
+                GraphContext.Default.BumpWriteGeneration()
 
     interface IAdaptiveList<'U> with
         member this.GetValue() =
@@ -428,41 +362,9 @@ type ElementListNode<'T, 'U>(source: IAdaptiveList<'T>, [<InlineIfLambda>] mappi
             if not disposed then
                 disposed <- true
                 this.Unregister()
-                this.UnregisterAll()
                 Collections.clearSinks &sinks
 
     interface IListSinkRegistry with
         member this.AddListSink(sink) = Collections.addSink &sinks sink
 
         member this.RemoveListSink(sink) = Collections.removeSink &sinks sink
-
-    interface IEdgeTarget with
-        member _.EdgeCount = edges.Count
-
-        member this.AddEdge(parent: IAdaptiveNode, depIndex: int) =
-            let index = edges.Add(parent, depIndex)
-
-            if edges.Count = 1 then
-                this.RegisterAll()
-
-            index
-
-        member this.RemoveEdgeAt(index: int) =
-            edges.RemoveAt(index)
-
-            if edges.Count = 0 then
-                this.UnregisterAll()
-
-    interface IAdaptiveNode with
-        member this.MarkDirty() =
-            elementDirty <- true
-            let ctx = GraphContext.Default
-
-            for i in 0 .. edges.Count - 1 do
-                ctx.PushDirty(edges[i])
-
-        member this.SetDepSlot(depIndex: int, parentIndex: int) =
-            this.FixEdgeIndex(depIndex, parentIndex)
-
-        member _.OnFirstParent() = ()
-        member _.OnLastParent() = ()

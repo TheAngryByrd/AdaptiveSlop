@@ -3,23 +3,13 @@ namespace AdaptiveSlop.Core
 open System
 open System.Collections.Generic
 
-// =============================================================================
 // Per-element adaptive set node (docs/2026-08-05-MAPA-DESIGN.md)
 //
 // ASet.mapA / chooseA / filterA share one node: the mapping returns an
 // adaptive value per element, cached by input element. Structural source
 // changes go through the journal (existing pattern, cache maintained per op);
-// element-aval changes go through a version scan of the cache (the dirty
-// gate: a precise elementDirty flag when every aval is registered, else the
-// write-generation gate).
-//
-// Element-aval registration (Observation pattern): on cache insert when the
-// node is observed, and for all cached avals when the node gains its first
-// parent edge (RegisterAll). A registered aval marks this node through the
-// aval's own edge chain (cval.Apply -> MarkFrom(cval.edges) -> aval.MarkDirty
-// -> PushDirty(aval.edges) -> this.MarkDirty). Avals that do not implement
-// IEdgeTarget cannot mark: regComplete goes false and the generation gate
-// covers the read path.
+// element-aval changes go through a version scan of the cache, gated on the
+// write generation: a scan runs only when a write landed since the last one.
 // =============================================================================
 
 /// <summary>
@@ -31,17 +21,13 @@ type ElementSetNode<'T, 'U when 'T: equality and 'U: equality>
     (source: IAdaptiveSet<'T>, [<InlineIfLambda>] mapping: 'T -> aval<'U voption>) =
     let mutable state = SetNodeState<'T, 'U>.Create(1)
     let mutable cache = Dictionary<'T, ElementEntry<'U>>()
-    let mutable nextId = 0
     let mutable initialized = false
     let mutable disposed = false
-    // Precise element-dirty flag: set by the mark chain from registered avals.
+    // Self-healing flag: set when a reentrant write lands mid-scan, so the
+    // next read rescans even when the generation did not move since.
     let mutable elementDirty = false
-    // Registration completeness: false when unobserved or any cached aval does
-    // not implement IEdgeTarget (marks can be missed; the generation gate
-    // covers the read path).
-    let mutable regComplete = false
     // Write generation at the last scan. The generation gate fires when it
-    // moved since (unobserved / incomplete registration).
+    // moved since.
     let mutable lastDrainWriteGen = -1L
 
     member private this.Register() =
@@ -54,68 +40,10 @@ type ElementSetNode<'T, 'U when 'T: equality and 'U: equality>
         | :? ISetSinkRegistry as r -> r.RemoveSetSink(box (this :> ISetDeltaSink<'T>))
         | _ -> ()
 
-    /// Register with the aval: the aval's writes then mark this node. Returns
-    /// the entry with its Id and edge index filled in. Unregistered avals
-    /// (not an IEdgeTarget) leave the entry unregistered and mark the
-    /// registration incomplete.
-    member private this.RegisterEntry(entry: ElementEntry<'U>) : ElementEntry<'U> =
-        match box entry.Aval with
-        | :? IEdgeTarget as t ->
-            let id = nextId
-            nextId <- nextId + 1
-            ElementEntry(entry.Aval, entry.Version, entry.Last, id, t.AddEdge(this :> IAdaptiveNode, id))
-        | _ ->
-            regComplete <- false
-            entry
-
-    /// Drop the edge into the aval (the cache entry is dropped by the caller).
-    member private _.UnregisterEntry(entry: ElementEntry<'U>) =
-        if entry.EdgeIndex >= 0 then
-            match box entry.Aval with
-            | :? IEdgeTarget as t -> t.RemoveEdgeAt(entry.EdgeIndex)
-            | _ -> ()
-
-    /// The node gained its first parent edge: register every cached aval so
-    /// their writes mark this node (and through it, the parents).
-    member private this.RegisterAll() =
-        regComplete <- true
-        let mutable e = cache.GetEnumerator()
-
-        while e.MoveNext() do
-            let kvp = e.Current
-            cache[kvp.Key] <- this.RegisterEntry kvp.Value
-
-    /// The node lost its last parent edge: drop every aval edge.
-    member private this.UnregisterAll() =
-        let mutable e = cache.GetEnumerator()
-
-        while e.MoveNext() do
-            let kvp = e.Current
-            this.UnregisterEntry kvp.Value
-            let entry = kvp.Value
-            cache[kvp.Key] <- ElementEntry(entry.Aval, entry.Version, entry.Last, entry.Id, -1)
-
-    /// We were moved in an aval's edge list (another dependent removed):
-    /// update the entry's edge index (matched by the Id we passed at
-    /// registration).
-    member private this.FixEdgeIndex(id: int, parentIndex: int) =
-        let mutable e = cache.GetEnumerator()
-        let mutable found = false
-
-        while not found && e.MoveNext() do
-            let kvp = e.Current
-
-            if kvp.Value.Id = id then
-                let mutable entry = kvp.Value
-                entry.EdgeIndex <- parentIndex
-                cache[kvp.Key] <- entry
-                found <- true
-
-    /// The dirty gate: a scan is needed when the precise flag is set, or when
-    /// registration is incomplete and a write moved the generation.
+    /// The dirty gate: a scan is needed when the self-healing flag is set, or
+    /// when a write moved the generation since the last scan.
     member private _.NeedsElementScan() =
-        elementDirty
-        || (not regComplete && GraphContext.Default.WriteGeneration <> lastDrainWriteGen)
+        elementDirty || GraphContext.Default.WriteGeneration <> lastDrainWriteGen
 
     member private this.EnsureInitialized() =
         if not initialized then
@@ -133,7 +61,7 @@ type ElementSetNode<'T, 'U when 'T: equality and 'U: equality>
                 // stored version stale, so the next scan re-forces.
                 let preV = aval.Version
                 let newV = aval.GetValue()
-                let entry = ElementEntry(aval, preV, newV, -1, -1)
+                let entry = ElementEntry(aval, preV, newV)
 
                 match newV with
                 | ValueSome u ->
@@ -167,7 +95,6 @@ type ElementSetNode<'T, 'U when 'T: equality and 'U: equality>
                 let mutable entry = Unchecked.defaultof<ElementEntry<'U>>
 
                 if cache.TryGetValue(x, &entry) then
-                    this.UnregisterEntry entry
                     cache.Remove x |> ignore
 
                     match entry.Last with
@@ -190,10 +117,7 @@ type ElementSetNode<'T, 'U when 'T: equality and 'U: equality>
                 // Version read BEFORE the force (see EnsureInitialized).
                 let preV = aval.Version
                 let newV = aval.GetValue()
-                let mutable entry = ElementEntry(aval, preV, newV, -1, -1)
-
-                if state.Edges.Count > 0 then
-                    entry <- this.RegisterEntry entry
+                let entry = ElementEntry(aval, preV, newV)
 
                 match newV with
                 | ValueSome u ->
@@ -300,7 +224,7 @@ type ElementSetNode<'T, 'U when 'T: equality and 'U: equality>
             elementDirty <- false
 
     /// Drain the journal, then the element scan, then push the accumulated
-    /// output delta once, with notification delivery deferred.
+    /// output delta once.
     member private this.Process() =
         let ctx = GraphContext.Default
         let wasActive = ctx.TxActive
@@ -320,14 +244,11 @@ type ElementSetNode<'T, 'U when 'T: equality and 'U: equality>
         finally
             ctx.TxActive <- wasActive
 
-        if not wasActive then
-            ctx.DeliverNotifications()
-
-        // Capture AFTER the push: the downstream sink's MarkFrom advances the
-        // write generation during the delta delivery. Capturing in the scan
-        // (before the push) left the gate permanently open and the Version
-        // dirty indicator inflated, so a version-gated consumer recorded a
-        // phantom version and missed the next change.
+        // Capture AFTER the push: the downstream sink's write notification
+        // advances the write generation during the delta delivery. Capturing
+        // in the scan (before the push) left the gate permanently open and
+        // the Version dirty indicator inflated, so a version-gated consumer
+        // recorded a phantom version and missed the next change.
         lastDrainWriteGen <- GraphContext.Default.WriteGeneration
 
     interface ISetDeltaSink<'T> with
@@ -335,7 +256,7 @@ type ElementSetNode<'T, 'U when 'T: equality and 'U: equality>
             if not disposed then
                 Collections.journalAppendSet &state.Journal adds addCnt rems remCnt
                 state.Version <- state.Version + 1L
-                GraphContext.Default.MarkFrom(state.Edges)
+                GraphContext.Default.BumpWriteGeneration()
 
     interface IAdaptiveSet<'U> with
         member this.GetValue() =
@@ -372,7 +293,6 @@ type ElementSetNode<'T, 'U when 'T: equality and 'U: equality>
             if not disposed then
                 disposed <- true
                 this.Unregister()
-                this.UnregisterAll()
                 Collections.clearSinks &state.Sinks
 
     interface ISetSinkRegistry with
@@ -380,34 +300,3 @@ type ElementSetNode<'T, 'U when 'T: equality and 'U: equality>
 
         member this.RemoveSetSink(sink) =
             Collections.removeSink &state.Sinks sink
-
-    interface IEdgeTarget with
-        member _.EdgeCount = state.Edges.Count
-
-        member this.AddEdge(parent: IAdaptiveNode, depIndex: int) =
-            let index = state.Edges.Add(parent, depIndex)
-
-            if state.Edges.Count = 1 then
-                this.RegisterAll()
-
-            index
-
-        member this.RemoveEdgeAt(index: int) =
-            state.Edges.RemoveAt(index)
-
-            if state.Edges.Count = 0 then
-                this.UnregisterAll()
-
-    interface IAdaptiveNode with
-        member this.MarkDirty() =
-            elementDirty <- true
-            let ctx = GraphContext.Default
-
-            for i in 0 .. state.Edges.Count - 1 do
-                ctx.PushDirty(state.Edges[i])
-
-        member this.SetDepSlot(depIndex: int, parentIndex: int) =
-            this.FixEdgeIndex(depIndex, parentIndex)
-
-        member _.OnFirstParent() = ()
-        member _.OnLastParent() = ()
