@@ -1489,35 +1489,37 @@ type MapUseMapNode<'K, 'V, 'W when 'K: equality and 'W: equality and 'W :> IDisp
 // Scalar escape hatches: per-key lookup and incremental count.
 //
 // Unlike the transform nodes above, these nodes produce an aval, not an amap.
-// They register as delta sinks (the MapReduceNode pattern) so that a write to
-// an unrelated key never reaches them: the delta is scanned for the watched
-// key (O(delta)), and the node advances its own version only when its output
-// value actually changed. This is the per-key precision that the plain
+// They register nothing: writes only bump the source version (O(1)) and the
+// node re-syncs at its next read — the delta is never scanned at write time,
+// so a churned node population (fresh node per operation per frame) costs
+// writers nothing. The per-key gate runs at read time: the key's current
+// value is re-read and the node advances its own version only when its
+// output actually changed. This is the per-key precision that the plain
 // AdaptiveNode-over-GetValue pattern cannot express (the whole-map version
 // and the flat dependency carry no key information).
 //
-// Pull-only protocol: no parent edges, no write-time marking. The version
-// bump in OnDeltas is the only notification; consumers version-check the node
-// and recompute only when the watched output moved. Direct changeable
-// sources deliver synchronously, so the gate is exact; pull-lazy derived
-// sources move their version at write time, so the dirty indicator (version
-// + 1) makes the consumer re-read exactly once and the gate runs at the next
-// read (the documented depth-2 rule).
+// Pull-only protocol: no parent edges, no write-time marking, no delivery.
+// The version bump in the read-time re-sync is the only notification;
+// consumers version-check the node and recompute only when the watched
+// output moved. Direct changeable sources make the re-sync O(1) (the map is
+// materialized); pull-lazy derived sources re-read at most once per
+// upstream change (the source drain runs during the re-sync — the
+// documented depth-2 rule), and the dirty indicator (version + 1) makes the
+// consumer re-read exactly once and the gate run at the next read.
 // =============================================================================
 
 /// <summary>
 /// A per-key lookup over an adaptive map (the node behind <c>AMap.tryFind</c>
-/// and <c>AMap.find</c>). Registers as a delta sink on the source; a delta
-/// advances the version only when it touches the watched key, and only when
-/// the value at that key actually changed (net-delta equality gate). Writes
-/// to unrelated keys cost this node and its consumers nothing. The value is
-/// applied from the delta at delivery time (the delta carries it; no source
-/// read); reads are O(1).
+/// and <c>AMap.find</c>). Registers nothing; the key's current value is
+/// re-read at the next read after a write, and the version advances only when
+/// the value at that key actually changed (read-time equality gate). Writes
+/// to unrelated keys cost this node and its consumers nothing — and the
+/// write itself costs nothing either (no sink registration, no delivery).
 /// </summary>
 /// <remarks>
-/// Application order inside one delta matches <c>MapReduceNode.Drain</c>:
-/// removals first, then sets (a set wins for a key that appears in both,
-/// which a net delta never produces).
+/// The re-sync re-reads the source view and applies the key lookup; it
+/// matches <c>MapReduceNode.Drain</c>'s application order trivially (a set
+/// wins for a key that appears in both, which a net delta never produces).
 /// </remarks>
 type MapLookupNode<'K, 'V when 'K: equality>(source: IAdaptiveMap<'K, 'V>, key: 'K) =
     let mutable version = 0L
@@ -1526,49 +1528,22 @@ type MapLookupNode<'K, 'V when 'K: equality>(source: IAdaptiveMap<'K, 'V>, key: 
     let mutable disposed = false
     let mutable value = ValueNone
 
-    member private this.Register() =
-        match box source with
-        | :? IMapSinkRegistry as r -> r.AddMapSink(box (this :> IMapDeltaSink<'K, 'V>))
-        | _ -> ()
+    /// Lazy re-sync: the node registers nothing, so no write ever delivers
+    /// to it. The key's current value is re-read and the per-key gate runs
+    /// here, at read time — a write to an unrelated key costs nobody at all
+    /// (the old write-time delivery iterated every registered sink, so a
+    /// churned node population paid on every write).
+    member private this.Resync() =
+        let before = value
+        let view = source.GetValue()
+        let mutable v = Unchecked.defaultof<'V>
 
-    member private this.Unregister() =
-        match box source with
-        | :? IMapSinkRegistry as r -> r.RemoveMapSink(box (this :> IMapDeltaSink<'K, 'V>))
-        | _ -> ()
+        value <- if view.TryGetValue(key, &v) then ValueSome v else ValueNone
 
-    interface IMapDeltaSink<'K, 'V> with
-        member this.OnDeltas(sets: struct ('K * 'V)[], setCnt: int, rems: 'K[], remCnt: int) =
-            if not disposed then
-                let comparer = EqualityComparer<'K>.Default
-                let mutable next = value
-                let mutable i = 0
+        if not (EqualityComparer<'V voption>.Default.Equals(before, value)) then
+            version <- version + 1L
 
-                while i < remCnt do
-                    if comparer.Equals(rems[i], key) then
-                        next <- ValueNone
-
-                    i <- i + 1
-
-                i <- 0
-
-                while i < setCnt do
-                    let struct (k, v) = sets[i]
-
-                    if comparer.Equals(k, key) then
-                        next <- ValueSome v
-
-                    i <- i + 1
-
-                // Equality gate: a delta that touches the key but leaves the
-                // value unchanged bumps nothing.
-                if not (EqualityComparer<'V voption>.Default.Equals(value, next)) then
-                    value <- next
-                    version <- version + 1L
-
-                // The delivery consumed every change pending at the source:
-                // re-sync so the Version getter does not report a dirty
-                // indicator for changes the gate already filtered out.
-                depVersion <- source.Version
+        depVersion <- source.Version
 
     interface IAdaptiveValue<'V voption> with
         member this.GetValue() =
@@ -1579,8 +1554,8 @@ type MapLookupNode<'K, 'V when 'K: equality>(source: IAdaptiveMap<'K, 'V>, key: 
                 if disposed then
                     invalidOp "This adaptive value has been disposed."
 
-                // Internal source reads (the init snapshot, the drain
-                // forcing below) are machinery of this node, not dependencies
+                // Internal source reads (the init snapshot, the re-sync
+                // below) are machinery of this node, not dependencies
                 // of the consumer: suppress collection so the caller's frame
                 // sees only this node. Without this, the whole-map
                 // dependency leaks into the consumer's frame and defeats the
@@ -1597,22 +1572,12 @@ type MapLookupNode<'K, 'V when 'K: equality>(source: IAdaptiveMap<'K, 'V>, key: 
 
                 try
                     if not initialized then
-                        // Snapshot first, register between (the MapReduceNode
-                        // pattern): a dirty source draining during the snapshot
-                        // read pushes to registered sinks only, so the snapshot
-                        // must be complete before this sink is visible.
-                        let view = source.GetValue()
-                        let mutable v = Unchecked.defaultof<'V>
-                        value <- if view.TryGetValue(key, &v) then ValueSome v else ValueNone
-                        this.Register()
-                        depVersion <- source.Version
+                        // Snapshot first: there is no registration anymore,
+                        // so there is nothing to order against.
+                        this.Resync()
                         initialized <- true
-
-                    if source.Version <> depVersion then
-                        // Force the source drain: it pushes the pending output
-                        // delta, which OnDeltas applies to the cached value.
-                        source.GetValue() |> ignore
-                        depVersion <- source.Version
+                    elif source.Version <> depVersion then
+                        this.Resync()
                 finally
                     if wasCollecting then
                         collector.PopFrame() |> ignore
@@ -1624,10 +1589,9 @@ type MapLookupNode<'K, 'V when 'K: equality>(source: IAdaptiveMap<'K, 'V>, key: 
 
         member this.Version =
             // Dirty indicator (the ExternalValueNode pattern): while the
-            // source has unprocessed changes (a pull-lazy derived source),
-            // report version + 1 so version-checking consumers re-read
-            // exactly once; the drain at GetValue applies the gate and
-            // decides the real version.
+            // source has unprocessed changes, report version + 1 so
+            // version-checking consumers re-read exactly once; the re-sync
+            // at GetValue applies the gate and decides the real version.
             if source.Version <> depVersion then
                 version + 1L
             else
@@ -1637,77 +1601,42 @@ type MapLookupNode<'K, 'V when 'K: equality>(source: IAdaptiveMap<'K, 'V>, key: 
         member this.Dispose() =
             if not disposed then
                 disposed <- true
-                this.Unregister()
 
 /// <summary>
-/// An incremental count over an adaptive map, projected through
-/// <paramref name="view"/> (the node behind <c>AMap.count</c> with
-/// <c>id</c> and <c>AMap.isEmpty</c> with <c>fun c -&gt; c = 0</c>). Registers
-/// as a delta sink and maintains the count per delta (O(delta)); the version
+/// A count over an adaptive map, projected through <paramref name="view"/>
+/// (the node behind <c>AMap.count</c> with <c>id</c> and <c>AMap.isEmpty</c>
+/// with <c>fun c -&gt; c = 0</c>). Registers nothing: the count is re-read at
+/// the next read after a write (O(1) for a materialized source); the version
 /// advances only when the projected output changed, so an update of an
 /// existing key (no count change) or a count change that the projection
 /// collapses (2 -&gt; 3 under isEmpty) costs this node and its consumers
 /// nothing.
 /// </summary>
 /// <remarks>
-/// Keeps a mirror of the present keys: a map delta does not distinguish a Set
-/// on a new key from an update of an existing one, but only the former moves
-/// the count. The view projection runs at delivery time: keep it cheap (the
-/// built-in uses are <c>id</c> and <c>fun c -&gt; c = 0</c>).
+/// No mirror is kept: the source view's <c>Count</c> is exact (it already
+/// distinguishes a Set on a new key from an update of an existing one).
+/// The view projection runs at re-sync time: keep it cheap (the built-in
+/// uses are <c>id</c> and <c>fun c -&gt; c = 0</c>).
 /// </remarks>
 type MapCountNode<'K, 'V, 'Out when 'K: equality>(source: IAdaptiveMap<'K, 'V>, [<InlineIfLambda>] view: int -> 'Out) =
     let mutable version = 0L
     let mutable depVersion = 0L
     let mutable initialized = false
     let mutable disposed = false
-    let mirror = HashSet<'K>()
-    let mutable count = 0
     let mutable out = Unchecked.defaultof<'Out>
 
-    member private this.Register() =
-        match box source with
-        | :? IMapSinkRegistry as r -> r.AddMapSink(box (this :> IMapDeltaSink<'K, 'V>))
-        | _ -> ()
+    /// Lazy re-sync (see MapLookupNode): re-read the count, project, and
+    /// bump only when the projected output moved.
+    member private this.Resync() =
+        let before = out
+        let data = Collections.asDictionary (source.GetValue())
+        let nextOut = view data.Count
 
-    member private this.Unregister() =
-        match box source with
-        | :? IMapSinkRegistry as r -> r.RemoveMapSink(box (this :> IMapDeltaSink<'K, 'V>))
-        | _ -> ()
+        if not (EqualityComparer<'Out>.Default.Equals(before, nextOut)) then
+            out <- nextOut
+            version <- version + 1L
 
-    interface IMapDeltaSink<'K, 'V> with
-        member this.OnDeltas(sets: struct ('K * 'V)[], setCnt: int, rems: 'K[], remCnt: int) =
-            if not disposed then
-                let mutable c = count
-                let mutable i = 0
-
-                while i < setCnt do
-                    let struct (k, _) = sets[i]
-
-                    if mirror.Add k then
-                        c <- c + 1
-
-                    i <- i + 1
-
-                i <- 0
-
-                while i < remCnt do
-                    if mirror.Remove rems[i] then
-                        c <- c - 1
-
-                    i <- i + 1
-
-                if c <> count then
-                    count <- c
-                    let nextOut = view c
-
-                    // Output gate: the count moved, but the projection may
-                    // not (isEmpty above 1). Bump only when the output moved.
-                    if not (EqualityComparer<'Out>.Default.Equals(out, nextOut)) then
-                        out <- nextOut
-                        version <- version + 1L
-
-                // Re-sync after the delivery (see MapLookupNode).
-                depVersion <- source.Version
+        depVersion <- source.Version
 
     interface IAdaptiveValue<'Out> with
         member this.GetValue() =
@@ -1728,22 +1657,11 @@ type MapCountNode<'K, 'V, 'Out when 'K: equality>(source: IAdaptiveMap<'K, 'V>, 
 
                 try
                     if not initialized then
-                        // Snapshot first, register between (the MapLookupNode
-                        // pattern).
-                        let data = Collections.asDictionary (source.GetValue())
-
-                        for KeyValue(k, _) in data do
-                            mirror.Add k |> ignore
-
-                        count <- data.Count
-                        out <- view count
-                        this.Register()
-                        depVersion <- source.Version
+                        // Snapshot first: there is no registration anymore.
+                        this.Resync()
                         initialized <- true
-
-                    if source.Version <> depVersion then
-                        source.GetValue() |> ignore
-                        depVersion <- source.Version
+                    elif source.Version <> depVersion then
+                        this.Resync()
                 finally
                     if wasCollecting then
                         collector.PopFrame() |> ignore
@@ -1764,4 +1682,3 @@ type MapCountNode<'K, 'V, 'Out when 'K: equality>(source: IAdaptiveMap<'K, 'V>, 
         member this.Dispose() =
             if not disposed then
                 disposed <- true
-                this.Unregister()

@@ -1765,6 +1765,51 @@ type ScalarEscapeBenchmarks() =
 
             let _ = AdaptiveSlop.Core.AVal.getValue slopContainsBranch
             ()
+
+    // ── Churn-shaped benchmarks (the game regime) ────────────────────────────
+    // A FRESH lookup node per read — created, read once, never touched again
+    // — while an unrelated key is written every iteration. The persistent
+    // benchmarks above cannot see the regression: with write-time delivery,
+    // every write dispatched to every node created since the last GC
+    // (O(writes × churn × GC-interval)); with lazy re-sync the write is a
+    // version bump and the fresh node's read is one O(1) re-sync.
+
+    [<Benchmark>]
+    member this.SlopTryFindChurnWrite() =
+        for i in 1 .. this.Iterations do
+            slopMap.AddOrUpdate 1 i
+            let branch =
+                slopMap
+                |> AdaptiveSlop.Core.CMap.value
+                |> AdaptiveSlop.Core.AMap.tryFind 50
+
+            let _ = AdaptiveSlop.Core.AVal.getValue branch
+            ()
+
+    [<Benchmark>]
+    member this.SlopCountChurnWrite() =
+        for i in 1 .. this.Iterations do
+            slopMap.AddOrUpdate 1 i
+            let branch =
+                slopMap
+                |> AdaptiveSlop.Core.CMap.value
+                |> AdaptiveSlop.Core.AMap.count
+
+            let _ = AdaptiveSlop.Core.AVal.getValue branch
+            ()
+
+    [<Benchmark>]
+    member this.SlopContainsChurnWrite() =
+        for i in 1 .. this.Iterations do
+            slopSet.Add(2000 + i) |> ignore
+            slopSet.Remove(2000 + i) |> ignore
+            let branch =
+                slopSet
+                |> AdaptiveSlop.Core.CSet.value
+                |> AdaptiveSlop.Core.ASet.contains 50
+
+            let _ = AdaptiveSlop.Core.AVal.getValue branch
+            ()
 // Entry Point
 // =============================================================================
 

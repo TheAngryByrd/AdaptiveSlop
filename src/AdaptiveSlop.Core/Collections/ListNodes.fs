@@ -1139,27 +1139,28 @@ type MapUseListNode<'T, 'W when 'W: equality and 'W :> IDisposable>
 // =============================================================================
 // Scalar escape hatches: positional lookup and incremental count.
 //
-// Delta-sink scalar nodes (the ListReduceNode pattern): an op affects a fixed
-// watched position i when it inserts/removes at p &lt;= i (the position shifts)
-// or updates at p = i. The node advances its version only when an op affects
-// the watched position; the value itself is re-read lazily on the next read
-// (O(1), pull-lazy). Ops on unrelated positions cost the node and its
-// consumers nothing.
+// Lazy scalar nodes (see the map escapes in MapNodes.fs): they register
+// nothing, writes only bump the source version (O(1)), and the node
+// re-syncs at its next read. A watched position changes when the element
+// there actually moved (an insert/remove at p &lt;= i shifts it, an update at
+// p = i replaces it); the value is re-read lazily on the next read (O(1),
+// pull-lazy). Ops on unrelated positions cost the node and its consumers
+// nothing — and the write itself costs nothing either.
 //
-// Pull-only protocol: no parent edges, no write-time marking (see
-// SetNodes.fs for the full contract). For a direct changeable source the
-// delivery is synchronous, so the gate is exact; pull-lazy derived sources
-// move their version at write time, so the dirty indicator (version + 1)
-// makes the consumer re-read exactly once (the documented depth-2 rule).
+// Pull-only protocol: no parent edges, no write-time marking, no delivery
+// (see SetNodes.fs for the full contract). For a direct changeable source
+// the re-sync is O(1); pull-lazy derived sources move their version at
+// write time, so the dirty indicator (version + 1) makes the consumer
+// re-read exactly once (the documented depth-2 rule).
 // =============================================================================
 
 /// <summary>
 /// A positional lookup over an adaptive list (the node behind
-/// <c>AList.tryAt</c>/<c>AList.tryGet</c>/<c>AList.tryFirst</c>). Registers as
-/// a delta sink on the source; a delta advances the version only when an op
-/// touches the watched position (insert/remove at p &lt;= index, update at
-/// p = index). The value is re-read from the source view on the next read
-/// (O(1)).
+/// <c>AList.tryAt</c>/<c>AList.tryGet</c>/<c>AList.tryFirst</c>). Registers
+/// nothing; the position is re-read at the next read after a write, and the
+/// version advances only when the element at the watched position actually
+/// changed (a shift that lands the same value bumps nothing). The value is
+/// re-read from the source view (O(1)).
 /// </summary>
 type ListLookupNode<'T>(source: IAdaptiveList<'T>, index: int) =
     let mutable version = 0L
@@ -1167,11 +1168,6 @@ type ListLookupNode<'T>(source: IAdaptiveList<'T>, index: int) =
     let mutable initialized = false
     let mutable disposed = false
     let mutable value = ValueNone
-    // An affecting op landed: the cached value is stale and must be re-read
-    // on the next GetValue. Tracked apart from depVersion: OnDeltas re-syncs
-    // depVersion at delivery (so the dirty indicator stays precise for
-    // non-affecting ops), which the version check alone cannot distinguish.
-    let mutable stale = false
 
     member private this.ReadView() =
         let view = source.GetValue()
@@ -1182,44 +1178,16 @@ type ListLookupNode<'T>(source: IAdaptiveList<'T>, index: int) =
             else
                 ValueNone
 
-    member private this.Register() =
-        match box source with
-        | :? IListSinkRegistry as r -> r.AddListSink(box (this :> IListDeltaSink<'T>))
-        | _ -> ()
+    /// Lazy re-sync (see the map escapes in MapNodes.fs): re-read the
+    /// position and bump only when the element there actually moved.
+    member private this.Resync() =
+        let before = value
+        this.ReadView()
 
-    member private this.Unregister() =
-        match box source with
-        | :? IListSinkRegistry as r -> r.RemoveListSink(box (this :> IListDeltaSink<'T>))
-        | _ -> ()
+        if not (EqualityComparer<'T voption>.Default.Equals(before, value)) then
+            version <- version + 1L
 
-    interface IListDeltaSink<'T> with
-        member this.OnDeltas(ops: ListOp<'T>[], opCnt: int) =
-            if not disposed then
-                let mutable affected = false
-                let mutable i = 0
-
-                while not affected && i < opCnt do
-                    let op = ops[i]
-
-                    match op.Kind with
-                    | ListOpKind.Insert
-                    | ListOpKind.Remove ->
-                        if op.Position <= index then
-                            affected <- true
-                    | _ -> // Update (Clear is never delivered)
-                        if op.Position = index then
-                            affected <- true
-
-                    i <- i + 1
-
-                if affected then
-                    stale <- true
-                    version <- version + 1L
-
-                // The delivery consumed every change pending at the source:
-                // re-sync so the Version getter does not report a dirty
-                // indicator for changes the gate already filtered out.
-                depVersion <- source.Version
+        depVersion <- source.Version
 
     interface IAdaptiveValue<'T voption> with
         member this.GetValue() =
@@ -1230,8 +1198,8 @@ type ListLookupNode<'T>(source: IAdaptiveList<'T>, index: int) =
                 if disposed then
                     invalidOp "This adaptive value has been disposed."
 
-                // Internal source reads (the init snapshot, the drain
-                // forcing below) are machinery of this node, not dependencies
+                // Internal source reads (the init snapshot, the re-sync
+                // below) are machinery of this node, not dependencies
                 // of the consumer: suppress collection so the caller's frame
                 // sees only this node. Without this, the whole-list
                 // dependency leaks into the consumer's frame and defeats the
@@ -1248,26 +1216,11 @@ type ListLookupNode<'T>(source: IAdaptiveList<'T>, index: int) =
 
                 try
                     if not initialized then
-                        // Snapshot first, register between (the ListReduceNode
-                        // pattern): a dirty source draining during the snapshot
-                        // read pushes to registered sinks only.
-                        this.ReadView()
-                        this.Register()
-                        depVersion <- source.Version
+                        // Snapshot first: there is no registration anymore.
+                        this.Resync()
                         initialized <- true
-
-                    if source.Version <> depVersion then
-                        // Force the source drain and re-read the position.
-                        this.ReadView()
-                        depVersion <- source.Version
-                        stale <- false
-
-                    if stale then
-                        // An affecting op landed since the last read (the
-                        // delivery re-synced depVersion, so the version
-                        // check above cannot see it).
-                        this.ReadView()
-                        stale <- false
+                    elif source.Version <> depVersion then
+                        this.Resync()
                 finally
                     if wasCollecting then
                         collector.PopFrame() |> ignore
@@ -1279,11 +1232,10 @@ type ListLookupNode<'T>(source: IAdaptiveList<'T>, index: int) =
 
         member this.Version =
             // Dirty indicator (the ExternalValueNode pattern): while the
-            // source has unprocessed changes (or a re-read is pending),
-            // report version + 1 so version-checking consumers re-read
-            // exactly once; the drain at GetValue applies the gate and
-            // decides the real version.
-            if stale || source.Version <> depVersion then
+            // source has unprocessed changes, report version + 1 so
+            // version-checking consumers re-read exactly once; the re-sync
+            // at GetValue applies the gate and decides the real version.
+            if source.Version <> depVersion then
                 version + 1L
             else
                 version
@@ -1292,28 +1244,22 @@ type ListLookupNode<'T>(source: IAdaptiveList<'T>, index: int) =
         member this.Dispose() =
             if not disposed then
                 disposed <- true
-                this.Unregister()
 
 /// <summary>
 /// A last-element lookup over an adaptive list (the node behind
-/// <c>AList.tryLast</c>). Registers as a delta sink on the source and tracks
-/// the element count per op; a delta advances the version only when it
-/// changes the last element: an append (insert at p = count), a remove of the
-/// last element, or an update of the last element. An insert or remove
-/// elsewhere shifts positions but leaves the last element untouched, so it
-/// bumps nothing. The value is re-read from the source view on the next read
-/// (O(1)).
+/// <c>AList.tryLast</c>). Registers nothing; the last element is re-read at
+/// the next read after a write, and the version advances only when the last
+/// element actually changed: an append, a remove of the last element, or an
+/// update of the last element. An insert or remove elsewhere shifts
+/// positions but leaves the last element untouched, so it bumps nothing.
+/// The value is re-read from the source view (O(1)).
 /// </summary>
 type ListLastNode<'T>(source: IAdaptiveList<'T>) =
     let mutable version = 0L
     let mutable depVersion = 0L
     let mutable initialized = false
     let mutable disposed = false
-    let mutable count = 0
     let mutable value = ValueNone
-    // An affecting op landed: re-read on the next GetValue (see
-    // ListLookupNode for why this is separate from depVersion).
-    let mutable stale = false
 
     member private this.ReadView() =
         let view = source.GetValue()
@@ -1324,53 +1270,16 @@ type ListLastNode<'T>(source: IAdaptiveList<'T>) =
             else
                 ValueNone
 
-    member private this.Register() =
-        match box source with
-        | :? IListSinkRegistry as r -> r.AddListSink(box (this :> IListDeltaSink<'T>))
-        | _ -> ()
+    /// Lazy re-sync (see ListLookupNode): re-read the last element and bump
+    /// only when it actually moved.
+    member private this.Resync() =
+        let before = value
+        this.ReadView()
 
-    member private this.Unregister() =
-        match box source with
-        | :? IListSinkRegistry as r -> r.RemoveListSink(box (this :> IListDeltaSink<'T>))
-        | _ -> ()
+        if not (EqualityComparer<'T voption>.Default.Equals(before, value)) then
+            version <- version + 1L
 
-    interface IListDeltaSink<'T> with
-        member this.OnDeltas(ops: ListOp<'T>[], opCnt: int) =
-            if not disposed then
-                // Positions refer to the state as of the previous op, so the
-                // running count tracks the ops in order.
-                let mutable c = count
-                let mutable affected = false
-                let mutable i = 0
-
-                while i < opCnt do
-                    let op = ops[i]
-
-                    match op.Kind with
-                    | ListOpKind.Insert ->
-                        if op.Position = c then
-                            affected <- true
-
-                        c <- c + 1
-                    | ListOpKind.Remove ->
-                        if op.Position = c - 1 then
-                            affected <- true
-
-                        c <- c - 1
-                    | _ -> // Update (Clear is never delivered)
-                        if op.Position = c - 1 then
-                            affected <- true
-
-                    i <- i + 1
-
-                count <- c
-
-                if affected then
-                    stale <- true
-                    version <- version + 1L
-
-                // Re-sync after the delivery (see ListLookupNode).
-                depVersion <- source.Version
+        depVersion <- source.Version
 
     interface IAdaptiveValue<'T voption> with
         member this.GetValue() =
@@ -1391,22 +1300,11 @@ type ListLastNode<'T>(source: IAdaptiveList<'T>) =
 
                 try
                     if not initialized then
-                        // Snapshot first, register between (the ListLookupNode
-                        // pattern).
-                        this.ReadView()
-                        count <- source.GetValue().Count
-                        this.Register()
-                        depVersion <- source.Version
+                        // Snapshot first: there is no registration anymore.
+                        this.Resync()
                         initialized <- true
-
-                    if source.Version <> depVersion then
-                        this.ReadView()
-                        depVersion <- source.Version
-                        stale <- false
-
-                    if stale then
-                        this.ReadView()
-                        stale <- false
+                    elif source.Version <> depVersion then
+                        this.Resync()
                 finally
                     if wasCollecting then
                         collector.PopFrame() |> ignore
@@ -1418,7 +1316,7 @@ type ListLastNode<'T>(source: IAdaptiveList<'T>) =
 
         member this.Version =
             // Dirty indicator (see ListLookupNode.Version).
-            if stale || source.Version <> depVersion then
+            if source.Version <> depVersion then
                 version + 1L
             else
                 version
@@ -1427,19 +1325,18 @@ type ListLastNode<'T>(source: IAdaptiveList<'T>) =
         member this.Dispose() =
             if not disposed then
                 disposed <- true
-                this.Unregister()
 
 /// <summary>
-/// An incremental count over an adaptive list, projected through
-/// <paramref name="view"/> (the node behind <c>AList.count</c> with <c>id</c>
-/// and <c>AList.isEmpty</c> with <c>fun c -&gt; c = 0</c>). Registers as a
-/// delta sink and maintains the count per op (O(delta)); the version advances
-/// only when the projected output changed, so an update (no count change) or
-/// a count change that the projection collapses (2 -&gt; 3 under isEmpty)
-/// costs this node and its consumers nothing.
+/// A count over an adaptive list, projected through <paramref name="view"/>
+/// (the node behind <c>AList.count</c> with <c>id</c> and <c>AList.isEmpty</c>
+/// with <c>fun c -&gt; c = 0</c>). Registers nothing: the count is re-read at
+/// the next read after a write; the version advances only when the projected
+/// output changed, so an update (no count change) or a count change that the
+/// projection collapses (2 -&gt; 3 under isEmpty) costs this node and its
+/// consumers nothing.
 /// </summary>
 /// <remarks>
-/// The view projection runs at delivery time: keep it cheap (the built-in
+/// The view projection runs at re-sync time: keep it cheap (the built-in
 /// uses are <c>id</c> and <c>fun c -&gt; c = 0</c>).
 /// </remarks>
 type ListCountNode<'T, 'Out>(source: IAdaptiveList<'T>, [<InlineIfLambda>] view: int -> 'Out) =
@@ -1447,45 +1344,19 @@ type ListCountNode<'T, 'Out>(source: IAdaptiveList<'T>, [<InlineIfLambda>] view:
     let mutable depVersion = 0L
     let mutable initialized = false
     let mutable disposed = false
-    let mutable count = 0
     let mutable out = Unchecked.defaultof<'Out>
 
-    member private this.Register() =
-        match box source with
-        | :? IListSinkRegistry as r -> r.AddListSink(box (this :> IListDeltaSink<'T>))
-        | _ -> ()
+    /// Lazy re-sync (see ListLookupNode): re-read the count, project, and
+    /// bump only when the projected output moved.
+    member private this.Resync() =
+        let before = out
+        let nextOut = view (source.GetValue().Count)
 
-    member private this.Unregister() =
-        match box source with
-        | :? IListSinkRegistry as r -> r.RemoveListSink(box (this :> IListDeltaSink<'T>))
-        | _ -> ()
+        if not (EqualityComparer<'Out>.Default.Equals(before, nextOut)) then
+            out <- nextOut
+            version <- version + 1L
 
-    interface IListDeltaSink<'T> with
-        member this.OnDeltas(ops: ListOp<'T>[], opCnt: int) =
-            if not disposed then
-                let mutable c = count
-                let mutable i = 0
-
-                while i < opCnt do
-                    match ops[i].Kind with
-                    | ListOpKind.Insert -> c <- c + 1
-                    | ListOpKind.Remove -> c <- c - 1
-                    | _ -> ()
-
-                    i <- i + 1
-
-                if c <> count then
-                    count <- c
-                    let nextOut = view c
-
-                    // Output gate: the count moved, but the projection may
-                    // not (isEmpty above 1). Bump only when the output moved.
-                    if not (EqualityComparer<'Out>.Default.Equals(out, nextOut)) then
-                        out <- nextOut
-                        version <- version + 1L
-
-                // Re-sync after the delivery (see ListLookupNode).
-                depVersion <- source.Version
+        depVersion <- source.Version
 
     interface IAdaptiveValue<'Out> with
         member this.GetValue() =
@@ -1506,17 +1377,11 @@ type ListCountNode<'T, 'Out>(source: IAdaptiveList<'T>, [<InlineIfLambda>] view:
 
                 try
                     if not initialized then
-                        // Snapshot first, register between (the ListLookupNode
-                        // pattern).
-                        count <- source.GetValue().Count
-                        out <- view count
-                        this.Register()
-                        depVersion <- source.Version
+                        // Snapshot first: there is no registration anymore.
+                        this.Resync()
                         initialized <- true
-
-                    if source.Version <> depVersion then
-                        source.GetValue() |> ignore
-                        depVersion <- source.Version
+                    elif source.Version <> depVersion then
+                        this.Resync()
                 finally
                     if wasCollecting then
                         collector.PopFrame() |> ignore
@@ -1537,4 +1402,3 @@ type ListCountNode<'T, 'Out>(source: IAdaptiveList<'T>, [<InlineIfLambda>] view:
         member this.Dispose() =
             if not disposed then
                 disposed <- true
-                this.Unregister()
