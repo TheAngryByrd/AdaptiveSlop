@@ -2053,6 +2053,360 @@ let ``AMap tryFind find track entries`` () =
         source |> CMap.value |> AMap.find "missing" |> AVal.getValue |> ignore)
 
 [<Fact>]
+let ``AMap tryFind recomputes only when the watched key changes`` () =
+    let source = CMap.ofSeq [ "a", 1; "b", 2 ]
+    let mutable evals = 0
+
+    let branch =
+        source
+        |> CMap.value
+        |> AMap.tryFind "a"
+        |> AVal.map (fun v ->
+            evals <- evals + 1
+            v)
+
+    Assert.Equal(ValueSome 1, AVal.getValue branch)
+    Assert.Equal(1, evals)
+
+    // Unrelated writes: update, add, remove of other keys.
+    CMap.addOrUpdate "b" 20 source
+    Assert.Equal(ValueSome 1, AVal.getValue branch)
+
+    CMap.addOrUpdate "c" 3 source
+    Assert.Equal(ValueSome 1, AVal.getValue branch)
+
+    CMap.remove "b" source
+    Assert.Equal(ValueSome 1, AVal.getValue branch)
+    Assert.Equal(1, evals)
+
+    // The watched key.
+    CMap.addOrUpdate "a" 10 source
+    Assert.Equal(ValueSome 10, AVal.getValue branch)
+    Assert.Equal(2, evals)
+
+    CMap.remove "a" source
+    Assert.Equal(ValueNone, AVal.getValue branch)
+    Assert.Equal(3, evals)
+
+[<Fact>]
+let ``AMap tryFind on a derived map tracks the watched key`` () =
+    let source = CMap.ofSeq [ "a", 1; "b", 2 ]
+    let mutable evals = 0
+
+    let branch =
+        source
+        |> CMap.value
+        |> AMap.map (fun _ v -> v * 2)
+        |> AMap.tryFind "a"
+        |> AVal.map (fun v ->
+            evals <- evals + 1
+            v)
+
+    Assert.Equal(ValueSome 2, AVal.getValue branch)
+    Assert.Equal(1, evals)
+
+    // Conservative on derived sources: the output delta of AMap.map exists
+    // only after its drain (pull-lazy), so the per-key gate runs at the next
+    // read. An unrelated upstream change costs the branch one recompute; the
+    // value stays correct.
+    CMap.addOrUpdate "b" 20 source
+    Assert.Equal(ValueSome 2, AVal.getValue branch)
+    Assert.Equal(2, evals)
+
+    CMap.addOrUpdate "a" 5 source
+    Assert.Equal(ValueSome 10, AVal.getValue branch)
+    Assert.Equal(3, evals)
+
+    CMap.remove "a" source
+    Assert.Equal(ValueNone, AVal.getValue branch)
+    Assert.Equal(4, evals)
+
+[<Fact>]
+let ``AMap count recomputes only when the entry count changes`` () =
+    let source = CMap.ofSeq [ "a", 1; "b", 2 ]
+    let mutable evals = 0
+
+    let branch =
+        source
+        |> CMap.value
+        |> AMap.count
+        |> AVal.map (fun v ->
+            evals <- evals + 1
+            v)
+
+    Assert.Equal(2, AVal.getValue branch)
+    Assert.Equal(1, evals)
+
+    // Update of an existing key: the count does not move.
+    CMap.addOrUpdate "a" 10 source
+    Assert.Equal(2, AVal.getValue branch)
+    Assert.Equal(1, evals)
+
+    CMap.addOrUpdate "c" 3 source
+    Assert.Equal(3, AVal.getValue branch)
+    Assert.Equal(2, evals)
+
+    CMap.remove "c" source
+    Assert.Equal(2, AVal.getValue branch)
+    Assert.Equal(3, evals)
+
+[<Fact>]
+let ``AMap isEmpty recomputes only at the empty boundary`` () =
+    let source = CMap.ofSeq [ "a", 1 ]
+    let mutable evals = 0
+
+    let branch =
+        source
+        |> CMap.value
+        |> AMap.isEmpty
+        |> AVal.map (fun v ->
+            evals <- evals + 1
+            v)
+
+    Assert.Equal(false, AVal.getValue branch)
+    Assert.Equal(1, evals)
+
+    // Non-empty to non-empty: the flag does not move.
+    CMap.addOrUpdate "b" 2 source
+    Assert.Equal(false, AVal.getValue branch)
+    Assert.Equal(1, evals)
+
+    CMap.remove "a" source
+    CMap.remove "b" source
+    Assert.Equal(true, AVal.getValue branch)
+    Assert.Equal(2, evals)
+
+[<Fact>]
+let ``ASet contains recomputes only when the watched element changes`` () =
+    let source = CSet.ofSeq [ "a"; "b" ]
+    let mutable evals = 0
+
+    let branch =
+        source
+        |> CSet.value
+        |> ASet.contains "x"
+        |> AVal.map (fun v ->
+            evals <- evals + 1
+            v)
+
+    Assert.Equal(false, AVal.getValue branch)
+    Assert.Equal(1, evals)
+
+    CSet.add "c" source
+    Assert.Equal(false, AVal.getValue branch)
+
+    CSet.remove "a" source
+    Assert.Equal(false, AVal.getValue branch)
+    Assert.Equal(1, evals)
+
+    CSet.add "x" source
+    Assert.Equal(true, AVal.getValue branch)
+    Assert.Equal(2, evals)
+
+    CSet.remove "x" source
+    Assert.Equal(false, AVal.getValue branch)
+    Assert.Equal(3, evals)
+
+[<Fact>]
+let ``ASet count and isEmpty recompute only when their output changes`` () =
+    let source = CSet.ofSeq [ "a" ]
+    let mutable countEvals = 0
+    let mutable emptyEvals = 0
+
+    let countBranch =
+        source
+        |> CSet.value
+        |> ASet.count
+        |> AVal.map (fun v ->
+            countEvals <- countEvals + 1
+            v)
+
+    let emptyBranch =
+        source
+        |> CSet.value
+        |> ASet.isEmpty
+        |> AVal.map (fun v ->
+            emptyEvals <- emptyEvals + 1
+            v)
+
+    Assert.Equal(1, AVal.getValue countBranch)
+    Assert.Equal(false, AVal.getValue emptyBranch)
+    Assert.Equal(1, countEvals)
+    Assert.Equal(1, emptyEvals)
+
+    CSet.add "b" source
+    Assert.Equal(2, AVal.getValue countBranch)
+    Assert.Equal(false, AVal.getValue emptyBranch)
+    Assert.Equal(2, countEvals)
+    Assert.Equal(1, emptyEvals)
+
+    CSet.remove "a" source
+    CSet.remove "b" source
+    Assert.Equal(0, AVal.getValue countBranch)
+    Assert.Equal(true, AVal.getValue emptyBranch)
+    Assert.Equal(3, countEvals)
+    Assert.Equal(2, emptyEvals)
+
+[<Fact>]
+let ``AList tryAt recomputes only when an op touches the position`` () =
+    let source = CList.ofSeq [ 1; 2; 3 ]
+    let mutable evals = 0
+
+    let branch =
+        source
+        |> CList.value
+        |> AList.tryAt 1
+        |> AVal.map (fun v ->
+            evals <- evals + 1
+            v)
+
+    Assert.Equal(ValueSome 2, AVal.getValue branch)
+    Assert.Equal(1, evals)
+
+    // Update and insert after the watched position.
+    CList.updateAt 2 30 source
+    Assert.Equal(ValueSome 2, AVal.getValue branch)
+
+    CList.insertAt 3 4 source
+    Assert.Equal(ValueSome 2, AVal.getValue branch)
+    Assert.Equal(1, evals)
+
+    // Insert before the watched position: the position shifts.
+    CList.insertAt 0 0 source
+    Assert.Equal(ValueSome 1, AVal.getValue branch)
+    Assert.Equal(2, evals)
+
+    // Update at the watched position.
+    CList.updateAt 1 99 source
+    Assert.Equal(ValueSome 99, AVal.getValue branch)
+    Assert.Equal(3, evals)
+
+[<Fact>]
+let ``AList tryLast recomputes only when the last element changes`` () =
+    let source = CList.ofSeq [ 1; 2; 3 ]
+    let mutable evals = 0
+
+    let branch =
+        source
+        |> CList.value
+        |> AList.tryLast
+        |> AVal.map (fun v ->
+            evals <- evals + 1
+            v)
+
+    Assert.Equal(ValueSome 3, AVal.getValue branch)
+    Assert.Equal(1, evals)
+
+    // Insert and update away from the end: the last element is untouched.
+    CList.insertAt 0 0 source
+    Assert.Equal(ValueSome 3, AVal.getValue branch)
+
+    CList.updateAt 0 99 source
+    Assert.Equal(ValueSome 3, AVal.getValue branch)
+    Assert.Equal(1, evals)
+
+    CList.append 4 source
+    Assert.Equal(ValueSome 4, AVal.getValue branch)
+    Assert.Equal(2, evals)
+
+    CList.removeAt 4 source
+    Assert.Equal(ValueSome 3, AVal.getValue branch)
+    Assert.Equal(3, evals)
+
+[<Fact>]
+let ``AList count and isEmpty recompute only when their output changes`` () =
+    let source = CList.ofSeq [ 1 ]
+    let mutable countEvals = 0
+    let mutable emptyEvals = 0
+
+    let countBranch =
+        source
+        |> CList.value
+        |> AList.count
+        |> AVal.map (fun v ->
+            countEvals <- countEvals + 1
+            v)
+
+    let emptyBranch =
+        source
+        |> CList.value
+        |> AList.isEmpty
+        |> AVal.map (fun v ->
+            emptyEvals <- emptyEvals + 1
+            v)
+
+    Assert.Equal(1, AVal.getValue countBranch)
+    Assert.Equal(false, AVal.getValue emptyBranch)
+    Assert.Equal(1, countEvals)
+    Assert.Equal(1, emptyEvals)
+
+    // Update: the count does not move.
+    CList.updateAt 0 10 source
+    Assert.Equal(1, AVal.getValue countBranch)
+    Assert.Equal(false, AVal.getValue emptyBranch)
+    Assert.Equal(1, countEvals)
+    Assert.Equal(1, emptyEvals)
+
+    CList.append 2 source
+    Assert.Equal(2, AVal.getValue countBranch)
+    Assert.Equal(false, AVal.getValue emptyBranch)
+    Assert.Equal(2, countEvals)
+    Assert.Equal(1, emptyEvals)
+
+    CList.removeAt 1 source
+    CList.removeAt 0 source
+    Assert.Equal(0, AVal.getValue countBranch)
+    Assert.Equal(true, AVal.getValue emptyBranch)
+    Assert.Equal(3, countEvals)
+    Assert.Equal(2, emptyEvals)
+
+
+[<Fact>]
+let ``derived map stays consistent after set and remove between reads`` () =
+    // Regression (pre-existing journal-order divergence): set k then remove k
+    // with no drain between used to leave k present in the derived map (the
+    // journal replayed rems before sets regardless of arrival order). The
+    // append-time coalescing keeps the journal net.
+    let source = CMap.ofSeq [ "a", 1 ]
+    let derived = source |> CMap.value |> AMap.map (fun _ v -> v)
+
+    let lookup = derived |> AMap.tryFind "b" |> AVal.map id
+
+    Assert.Equal(ValueNone, AVal.getValue lookup)
+    CMap.addOrUpdate "b" 2 source
+    CMap.remove "b" source
+    Assert.False((AMap.force derived).ContainsKey "b")
+    Assert.Equal(ValueNone, AVal.getValue lookup)
+    // The reverse order (rem then set) keeps the set.
+    CMap.addOrUpdate "c" 3 source
+    CMap.remove "c" source
+    CMap.addOrUpdate "c" 4 source
+    Assert.True((AMap.force derived).ContainsKey "c")
+    Assert.Equal(ValueSome 4, AVal.getValue (derived |> AMap.tryFind "c"))
+
+[<Fact>]
+let ``derived set stays consistent after add and remove between reads`` () =
+    // The set analogue: add x then remove x with no drain between. The
+    // cancelled pair must not replay the add alone (the refcount would
+    // ratchet and the mapped output would keep a ghost element).
+    let source = CSet.ofSeq [ 1 ]
+    let derived = source |> CSet.value |> ASet.map (fun x -> x + 1)
+
+    let contains = derived |> ASet.contains 3 |> AVal.map id
+
+    Assert.Equal(false, AVal.getValue contains)
+    CSet.add 2 source |> ignore
+    CSet.remove 2 source |> ignore
+    Assert.False((ASet.force derived).Contains 3)
+    Assert.Equal(false, AVal.getValue contains)
+    // And the reverse order: rem then add cancels too (the element never
+    // left the derived state, so the refcount must not grow).
+    CSet.remove 1 source |> ignore
+    CSet.add 1 source |> ignore
+    Assert.True((ASet.force derived).Contains 2)
+    Assert.Equal(1, ASet.force derived |> Seq.filter (fun x -> x = 2) |> Seq.length)
+
+[<Fact>]
 let ``AMap reduce updates subtract the old value`` () =
     let source = CMap.empty<string, int>
     let total = AMap.reduce (AdaptiveReduction.sum ()) (CMap.value source)
