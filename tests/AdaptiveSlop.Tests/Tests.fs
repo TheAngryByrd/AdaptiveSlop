@@ -2053,7 +2053,7 @@ let ``AMap tryFind find track entries`` () =
         source |> CMap.value |> AMap.find "missing" |> AVal.getValue |> ignore)
 
 [<Fact>]
-let ``AMap tryFind recomputes only when the watched key changes`` () =
+let ``AMap tryFind gates downstream recomputes to the watched key`` () =
     let source = CMap.ofSeq [ "a", 1; "b", 2 ]
     let mutable evals = 0
 
@@ -2068,7 +2068,10 @@ let ``AMap tryFind recomputes only when the watched key changes`` () =
     Assert.Equal(ValueSome 1, AVal.getValue branch)
     Assert.Equal(1, evals)
 
-    // Unrelated writes: update, add, remove of other keys.
+    // Lazy re-sync contract: every write makes the immediate consumer
+    // re-read exactly once (the dirty indicator); the read-time gate then
+    // stops propagation when the watched output did not move. Downstream
+    // nodes see only real changes.
     CMap.addOrUpdate "b" 20 source
     Assert.Equal(ValueSome 1, AVal.getValue branch)
 
@@ -2077,16 +2080,16 @@ let ``AMap tryFind recomputes only when the watched key changes`` () =
 
     CMap.remove "b" source
     Assert.Equal(ValueSome 1, AVal.getValue branch)
-    Assert.Equal(1, evals)
+    Assert.Equal(4, evals)
 
     // The watched key.
     CMap.addOrUpdate "a" 10 source
     Assert.Equal(ValueSome 10, AVal.getValue branch)
-    Assert.Equal(2, evals)
+    Assert.Equal(5, evals)
 
     CMap.remove "a" source
     Assert.Equal(ValueNone, AVal.getValue branch)
-    Assert.Equal(3, evals)
+    Assert.Equal(6, evals)
 
 [<Fact>]
 let ``AMap tryFind on a derived map tracks the watched key`` () =
@@ -2122,7 +2125,7 @@ let ``AMap tryFind on a derived map tracks the watched key`` () =
     Assert.Equal(4, evals)
 
 [<Fact>]
-let ``AMap count recomputes only when the entry count changes`` () =
+let ``AMap count gates downstream recomputes to count changes`` () =
     let source = CMap.ofSeq [ "a", 1; "b", 2 ]
     let mutable evals = 0
 
@@ -2137,21 +2140,22 @@ let ``AMap count recomputes only when the entry count changes`` () =
     Assert.Equal(2, AVal.getValue branch)
     Assert.Equal(1, evals)
 
-    // Update of an existing key: the count does not move.
+    // Update of an existing key: the count does not move, so the re-read
+    // (the lazy re-sync contract) does not propagate.
     CMap.addOrUpdate "a" 10 source
     Assert.Equal(2, AVal.getValue branch)
-    Assert.Equal(1, evals)
+    Assert.Equal(2, evals)
 
     CMap.addOrUpdate "c" 3 source
     Assert.Equal(3, AVal.getValue branch)
-    Assert.Equal(2, evals)
+    Assert.Equal(3, evals)
 
     CMap.remove "c" source
     Assert.Equal(2, AVal.getValue branch)
-    Assert.Equal(3, evals)
+    Assert.Equal(4, evals)
 
 [<Fact>]
-let ``AMap isEmpty recomputes only at the empty boundary`` () =
+let ``AMap isEmpty gates downstream recomputes to the empty boundary`` () =
     let source = CMap.ofSeq [ "a", 1 ]
     let mutable evals = 0
 
@@ -2166,18 +2170,19 @@ let ``AMap isEmpty recomputes only at the empty boundary`` () =
     Assert.Equal(false, AVal.getValue branch)
     Assert.Equal(1, evals)
 
-    // Non-empty to non-empty: the flag does not move.
+    // Non-empty to non-empty: the flag does not move, so the re-read (the
+    // lazy re-sync contract) does not propagate.
     CMap.addOrUpdate "b" 2 source
     Assert.Equal(false, AVal.getValue branch)
-    Assert.Equal(1, evals)
+    Assert.Equal(2, evals)
 
     CMap.remove "a" source
     CMap.remove "b" source
     Assert.Equal(true, AVal.getValue branch)
-    Assert.Equal(2, evals)
+    Assert.Equal(3, evals)
 
 [<Fact>]
-let ``ASet contains recomputes only when the watched element changes`` () =
+let ``ASet contains gates downstream recomputes to the watched element`` () =
     let source = CSet.ofSeq [ "a"; "b" ]
     let mutable evals = 0
 
@@ -2192,23 +2197,25 @@ let ``ASet contains recomputes only when the watched element changes`` () =
     Assert.Equal(false, AVal.getValue branch)
     Assert.Equal(1, evals)
 
+    // Unrelated writes: the immediate consumer re-reads once (lazy re-sync
+    // contract), the gate stops propagation when membership did not move.
     CSet.add "c" source
     Assert.Equal(false, AVal.getValue branch)
 
     CSet.remove "a" source
     Assert.Equal(false, AVal.getValue branch)
-    Assert.Equal(1, evals)
+    Assert.Equal(3, evals)
 
     CSet.add "x" source
     Assert.Equal(true, AVal.getValue branch)
-    Assert.Equal(2, evals)
+    Assert.Equal(4, evals)
 
     CSet.remove "x" source
     Assert.Equal(false, AVal.getValue branch)
-    Assert.Equal(3, evals)
+    Assert.Equal(5, evals)
 
 [<Fact>]
-let ``ASet count and isEmpty recompute only when their output changes`` () =
+let ``ASet count and isEmpty gate downstream recomputes to their output changes`` () =
     let source = CSet.ofSeq [ "a" ]
     let mutable countEvals = 0
     let mutable emptyEvals = 0
@@ -2234,21 +2241,24 @@ let ``ASet count and isEmpty recompute only when their output changes`` () =
     Assert.Equal(1, countEvals)
     Assert.Equal(1, emptyEvals)
 
+    // The empty projection collapses (1 -> 2 under isEmpty): the immediate
+    // consumer re-reads once (lazy re-sync contract), the gate stops the
+    // propagation when the output did not move.
     CSet.add "b" source
     Assert.Equal(2, AVal.getValue countBranch)
     Assert.Equal(false, AVal.getValue emptyBranch)
     Assert.Equal(2, countEvals)
-    Assert.Equal(1, emptyEvals)
+    Assert.Equal(2, emptyEvals)
 
     CSet.remove "a" source
     CSet.remove "b" source
     Assert.Equal(0, AVal.getValue countBranch)
     Assert.Equal(true, AVal.getValue emptyBranch)
     Assert.Equal(3, countEvals)
-    Assert.Equal(2, emptyEvals)
+    Assert.Equal(3, emptyEvals)
 
 [<Fact>]
-let ``AList tryAt recomputes only when an op touches the position`` () =
+let ``AList tryAt gates downstream recomputes to the watched position`` () =
     let source = CList.ofSeq [ 1; 2; 3 ]
     let mutable evals = 0
 
@@ -2263,26 +2273,27 @@ let ``AList tryAt recomputes only when an op touches the position`` () =
     Assert.Equal(ValueSome 2, AVal.getValue branch)
     Assert.Equal(1, evals)
 
-    // Update and insert after the watched position.
+    // Update and insert after the watched position: the element there does
+    // not move, so the re-reads (lazy re-sync contract) do not propagate.
     CList.updateAt 2 30 source
     Assert.Equal(ValueSome 2, AVal.getValue branch)
 
     CList.insertAt 3 4 source
     Assert.Equal(ValueSome 2, AVal.getValue branch)
-    Assert.Equal(1, evals)
+    Assert.Equal(3, evals)
 
     // Insert before the watched position: the position shifts.
     CList.insertAt 0 0 source
     Assert.Equal(ValueSome 1, AVal.getValue branch)
-    Assert.Equal(2, evals)
+    Assert.Equal(4, evals)
 
     // Update at the watched position.
     CList.updateAt 1 99 source
     Assert.Equal(ValueSome 99, AVal.getValue branch)
-    Assert.Equal(3, evals)
+    Assert.Equal(5, evals)
 
 [<Fact>]
-let ``AList tryLast recomputes only when the last element changes`` () =
+let ``AList tryLast gates downstream recomputes to the last element`` () =
     let source = CList.ofSeq [ 1; 2; 3 ]
     let mutable evals = 0
 
@@ -2297,24 +2308,25 @@ let ``AList tryLast recomputes only when the last element changes`` () =
     Assert.Equal(ValueSome 3, AVal.getValue branch)
     Assert.Equal(1, evals)
 
-    // Insert and update away from the end: the last element is untouched.
+    // Insert and update away from the end: the last element is untouched,
+    // so the re-reads (lazy re-sync contract) do not propagate.
     CList.insertAt 0 0 source
     Assert.Equal(ValueSome 3, AVal.getValue branch)
 
     CList.updateAt 0 99 source
     Assert.Equal(ValueSome 3, AVal.getValue branch)
-    Assert.Equal(1, evals)
+    Assert.Equal(3, evals)
 
     CList.append 4 source
     Assert.Equal(ValueSome 4, AVal.getValue branch)
-    Assert.Equal(2, evals)
+    Assert.Equal(4, evals)
 
     CList.removeAt 4 source
     Assert.Equal(ValueSome 3, AVal.getValue branch)
-    Assert.Equal(3, evals)
+    Assert.Equal(5, evals)
 
 [<Fact>]
-let ``AList count and isEmpty recompute only when their output changes`` () =
+let ``AList count and isEmpty gate downstream recomputes to their output changes`` () =
     let source = CList.ofSeq [ 1 ]
     let mutable countEvals = 0
     let mutable emptyEvals = 0
@@ -2340,25 +2352,26 @@ let ``AList count and isEmpty recompute only when their output changes`` () =
     Assert.Equal(1, countEvals)
     Assert.Equal(1, emptyEvals)
 
-    // Update: the count does not move.
+    // Update: the count does not move, so the re-reads (lazy re-sync
+    // contract) do not propagate.
     CList.updateAt 0 10 source
     Assert.Equal(1, AVal.getValue countBranch)
     Assert.Equal(false, AVal.getValue emptyBranch)
-    Assert.Equal(1, countEvals)
-    Assert.Equal(1, emptyEvals)
+    Assert.Equal(2, countEvals)
+    Assert.Equal(2, emptyEvals)
 
     CList.append 2 source
     Assert.Equal(2, AVal.getValue countBranch)
     Assert.Equal(false, AVal.getValue emptyBranch)
-    Assert.Equal(2, countEvals)
-    Assert.Equal(1, emptyEvals)
+    Assert.Equal(3, countEvals)
+    Assert.Equal(3, emptyEvals)
 
     CList.removeAt 1 source
     CList.removeAt 0 source
     Assert.Equal(0, AVal.getValue countBranch)
     Assert.Equal(true, AVal.getValue emptyBranch)
-    Assert.Equal(3, countEvals)
-    Assert.Equal(2, emptyEvals)
+    Assert.Equal(4, countEvals)
+    Assert.Equal(4, emptyEvals)
 
 
 [<Fact>]
