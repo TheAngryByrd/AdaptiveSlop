@@ -869,6 +869,65 @@ let ``incremental law: AMap fold stays correct`` () =
 
     Check.QuickThrowOnFailure prop
 
+// Tail-only reads of 2+ level chains (the Defli stale-count report): the
+// middle transforms are never read, so the tail's version gate must settle
+// the whole chain from its own read. The oracle reads the changeable source
+// only; it never touches the middle transforms.
+[<Fact>]
+let ``incremental law: tail-only map chain reads stay correct`` () =
+    let prop (ops: int list) =
+        let m = CMap.empty<int, int>
+
+        let cnt =
+            CMap.value m
+            |> AMap.map (fun _ v -> v * 2)
+            |> AMap.filter (fun _ v -> v > 10)
+            |> AMap.count
+
+        AVal.getValue cnt |> ignore
+
+        for op in ops do
+            applyMapMutation op m
+
+            let expected =
+                AMap.toMap (CMap.value m) |> Map.filter (fun _ v -> v * 2 > 10) |> Map.count
+
+            let actual = AVal.getValue cnt
+
+            if actual <> expected then
+                failwithf "mismatch after op %A: count=%A expected=%A" op actual expected
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``incremental law: tail-only set chain reads stay correct`` () =
+    let prop (ops: int list) =
+        let s = CSet.empty<int>
+
+        let cnt =
+            CSet.value s
+            |> ASet.map (fun v -> v * 2)
+            |> ASet.filter (fun v -> v > 10)
+            |> ASet.count
+
+        AVal.getValue cnt |> ignore
+
+        for op in ops do
+            applySetMutation op s
+
+            let expected =
+                ASet.toSet (CSet.value s)
+                |> Set.map (fun v -> v * 2)
+                |> Set.filter (fun v -> v > 10)
+                |> Set.count
+
+            let actual = AVal.getValue cnt
+
+            if actual <> expected then
+                failwithf "mismatch after op %A: count=%A expected=%A" op actual expected
+
+    Check.QuickThrowOnFailure prop
+
 // =============================================================================
 // Scalar combinators with a dedicated generator. The scalar layer (map,
 // map2/3/4/N, bind/bind2/bind3) is the foundation of the collections (mapA

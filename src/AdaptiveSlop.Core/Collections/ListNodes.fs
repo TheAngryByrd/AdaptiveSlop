@@ -237,7 +237,15 @@ type FilterMapListNode<'T, 'U>(source: IAdaptiveList<'T>, [<InlineIfLambda>] map
             finally
                 ctx.ReleaseOwner()
 
-        member _.Version = version
+        member _.Version =
+            // Dirty indicator (see MapMapNode.Version in MapNodes.fs): while
+            // the source has unprocessed changes, report version + 1 so
+            // version-checking consumers re-read; the re-read drains the
+            // journal and settles the chain recursively.
+            if source.Version <> depVersion then
+                version + 1L
+            else
+                version
 
     interface IDisposable with
         member this.Dispose() =
@@ -408,7 +416,13 @@ type AppendListNode<'T>(left: IAdaptiveList<'T>, right: IAdaptiveList<'T>) =
             finally
                 ctx.ReleaseOwner()
 
-        member _.Version = version
+        member _.Version =
+            // Dirty indicator (see MapMapNode.Version): either side with
+            // unprocessed changes trips it.
+            if left.Version <> leftVersion || right.Version <> rightVersion then
+                version + 1L
+            else
+                version
 
     interface IDisposable with
         member this.Dispose() =
@@ -624,7 +638,12 @@ type ToSetListNode<'T when 'T: equality>(source: IAdaptiveList<'T>) =
             finally
                 ctx.ReleaseOwner()
 
-        member _.Version = version
+        member _.Version =
+            // Dirty indicator (see MapMapNode.Version).
+            if source.Version <> depVersion then
+                version + 1L
+            else
+                version
 
     interface IDisposable with
         member this.Dispose() =
@@ -1117,7 +1136,12 @@ type MapUseListNode<'T, 'W when 'W: equality and 'W :> IDisposable>
             finally
                 ctx.ReleaseOwner()
 
-        member _.Version = version
+        member _.Version =
+            // Dirty indicator (see MapMapNode.Version).
+            if source.Version <> depVersion then
+                version + 1L
+            else
+                version
 
     interface IDisposable with
         member this.Dispose() =

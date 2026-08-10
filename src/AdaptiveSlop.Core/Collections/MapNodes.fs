@@ -93,7 +93,18 @@ type MapMapNode<'K, 'V, 'U when 'K: equality>
             finally
                 ctx.ReleaseOwner()
 
-        member _.Version = state.Version
+        member _.Version =
+            // Dirty indicator (the MapLookupNode pattern): while the source
+            // has unprocessed changes, report version + 1 so version-checking
+            // consumers re-read; the re-read drains the journal and settles
+            // the chain recursively. Without it a tail-only read of a 2+
+            // level chain serves the stale value forever: a transform pushes
+            // downstream only at its own read, so a plain version hides
+            // upstream dirt from every gated consumer.
+            if source.Version <> state.DepVersions[0] then
+                state.Version + 1L
+            else
+                state.Version
 
     interface IDisposable with
         member this.Dispose() =
@@ -170,7 +181,12 @@ type FilterMapNode<'K, 'V when 'K: equality>
             finally
                 ctx.ReleaseOwner()
 
-        member _.Version = state.Version
+        member _.Version =
+            // Dirty indicator (see MapMapNode.Version).
+            if source.Version <> state.DepVersions[0] then
+                state.Version + 1L
+            else
+                state.Version
 
     interface IDisposable with
         member this.Dispose() =
@@ -300,7 +316,13 @@ type Choose2MapNode<'K, 'V1, 'V2, 'V3 when 'K: equality>
             finally
                 ctx.ReleaseOwner()
 
-        member _.Version = state.Version
+        member _.Version =
+            // Dirty indicator (see MapMapNode.Version): either side with
+            // unprocessed changes trips it.
+            if left.Version <> state.DepVersions[0] || right.Version <> state.DepVersions[1] then
+                state.Version + 1L
+            else
+                state.Version
 
     interface IDisposable with
         member this.Dispose() =
@@ -494,7 +516,12 @@ type SetToMapNode<'K, 'V, 'T when 'K: equality and 'T: equality>
             finally
                 ctx.ReleaseOwner()
 
-        member _.Version = state.Version
+        member _.Version =
+            // Dirty indicator (see MapMapNode.Version).
+            if source.Version <> state.DepVersions[0] then
+                state.Version + 1L
+            else
+                state.Version
 
     interface IDisposable with
         member this.Dispose() =
@@ -704,7 +731,12 @@ type SetToMapKeepAllNode<'K, 'V, 'T when 'K: equality and 'T: equality>
             finally
                 ctx.ReleaseOwner()
 
-        member _.Version = state.Version
+        member _.Version =
+            // Dirty indicator (see MapMapNode.Version).
+            if source.Version <> state.DepVersions[0] then
+                state.Version + 1L
+            else
+                state.Version
 
     interface IDisposable with
         member this.Dispose() =
@@ -920,7 +952,12 @@ type MapToSetNode<'K, 'V, 'T when 'K: equality and 'T: equality>
             finally
                 ctx.ReleaseOwner()
 
-        member _.Version = state.Version
+        member _.Version =
+            // Dirty indicator (see MapMapNode.Version).
+            if source.Version <> state.DepVersions[0] then
+                state.Version + 1L
+            else
+                state.Version
 
     interface IDisposable with
         member this.Dispose() =
@@ -1176,7 +1213,18 @@ type BindMapNode<'K, 'V, 'T when 'K: equality>
             finally
                 ctx.ReleaseOwner()
 
-        member _.Version = state.Version
+        member this.Version =
+            // Dirty indicator (see MapMapNode.Version): the outer value or
+            // the current inner with unprocessed changes trips it. Guarded by
+            // the init flags: inner is null before the first read.
+            if
+                initialized
+                && (value.Version <> state.DepVersions[0]
+                    || (hasInner && inner.Version <> innerVersion))
+            then
+                state.Version + 1L
+            else
+                state.Version
 
     interface IDisposable with
         member this.Dispose() =
@@ -1297,7 +1345,12 @@ type AListToMapNode<'K, 'V when 'K: equality>(source: IAdaptiveList<'K * 'V>) =
             finally
                 ctx.ReleaseOwner()
 
-        member _.Version = version
+        member _.Version =
+            // Dirty indicator (see MapMapNode.Version).
+            if source.Version <> depVersion then
+                version + 1L
+            else
+                version
 
     interface IDisposable with
         member this.Dispose() =
@@ -1464,7 +1517,12 @@ type MapUseMapNode<'K, 'V, 'W when 'K: equality and 'W: equality and 'W :> IDisp
             finally
                 ctx.ReleaseOwner()
 
-        member _.Version = state.Version
+        member _.Version =
+            // Dirty indicator (see MapMapNode.Version).
+            if source.Version <> state.DepVersions[0] then
+                state.Version + 1L
+            else
+                state.Version
 
     interface IDisposable with
         member this.Dispose() =

@@ -102,7 +102,15 @@ type MapSetNode<'T, 'U when 'T: equality and 'U: equality>
             finally
                 ctx.ReleaseOwner()
 
-        member _.Version = state.Version
+        member _.Version =
+            // Dirty indicator (see MapMapNode.Version in MapNodes.fs): while
+            // the source has unprocessed changes, report version + 1 so
+            // version-checking consumers re-read; the re-read drains the
+            // journal and settles the chain recursively.
+            if source.Version <> state.DepVersions[0] then
+                state.Version + 1L
+            else
+                state.Version
 
     interface IDisposable with
         member this.Dispose() =
@@ -174,7 +182,12 @@ type FilterSetNode<'T when 'T: equality>(source: IAdaptiveSet<'T>, [<InlineIfLam
             finally
                 ctx.ReleaseOwner()
 
-        member _.Version = state.Version
+        member _.Version =
+            // Dirty indicator (see MapMapNode.Version).
+            if source.Version <> state.DepVersions[0] then
+                state.Version + 1L
+            else
+                state.Version
 
     interface IDisposable with
         member this.Dispose() =
@@ -252,7 +265,13 @@ type UnionSetNode<'T when 'T: equality>(left: IAdaptiveSet<'T>, right: IAdaptive
             finally
                 ctx.ReleaseOwner()
 
-        member _.Version = state.Version
+        member _.Version =
+            // Dirty indicator (see MapMapNode.Version): either side with
+            // unprocessed changes trips it.
+            if left.Version <> state.DepVersions[0] || right.Version <> state.DepVersions[1] then
+                state.Version + 1L
+            else
+                state.Version
 
     interface IDisposable with
         member this.Dispose() =
@@ -352,7 +371,13 @@ type TwoSourceSetNode<'T when 'T: equality>(op: TwoSetOp, left: IAdaptiveSet<'T>
             finally
                 ctx.ReleaseOwner()
 
-        member _.Version = state.Version
+        member _.Version =
+            // Dirty indicator (see MapMapNode.Version): either side with
+            // unprocessed changes trips it.
+            if left.Version <> state.DepVersions[0] || right.Version <> state.DepVersions[1] then
+                state.Version + 1L
+            else
+                state.Version
 
     interface IDisposable with
         member this.Dispose() =
@@ -710,7 +735,26 @@ type CollectSetNode<'T, 'U when 'T: equality and 'U: equality>
             finally
                 ctx.ReleaseOwner()
 
-        member _.Version = state.Version
+        member this.Version =
+            // Dirty indicator (see MapMapNode.Version): the outer source OR any
+            // inner set with unprocessed changes trips it. A changeable inner
+            // delivers at write time (OnInnerDeltas bumps state.Version, so the
+            // plain branch already reports a new version); a derived inner
+            // (map|>filter, etc.) delivers only when this node is pulled, so
+            // without scanning the inner entries its upstream dirt is hidden
+            // from every gated consumer (a tail-only count/contains over the
+            // collect serves the stale value forever).
+            if source.Version <> state.DepVersions[0] then
+                state.Version + 1L
+            else
+                let mutable dirty = false
+                let mutable ie = state.Inner.GetEnumerator()
+
+                while not dirty && ie.MoveNext() do
+                    if ie.Current.Value.Node.Version <> ie.Current.Value.Version then
+                        dirty <- true
+
+                if dirty then state.Version + 1L else state.Version
 
     interface IDisposable with
         member this.Dispose() =
@@ -832,7 +876,18 @@ type BindSetNode<'T, 'U when 'U: equality>
             finally
                 ctx.ReleaseOwner()
 
-        member _.Version = state.Version
+        member this.Version =
+            // Dirty indicator (see MapMapNode.Version): the outer value or
+            // the current inner with unprocessed changes trips it. Guarded by
+            // the init flags: inner is null before the first read.
+            if
+                initialized
+                && (value.Version <> state.DepVersions[0]
+                    || (hasInner && inner.Version <> innerVersion))
+            then
+                state.Version + 1L
+            else
+                state.Version
 
     interface IDisposable with
         member this.Dispose() =
@@ -965,7 +1020,12 @@ type MapUseSetNode<'A, 'B when 'A: equality and 'B: equality and 'B :> IDisposab
             finally
                 ctx.ReleaseOwner()
 
-        member _.Version = state.Version
+        member _.Version =
+            // Dirty indicator (see MapMapNode.Version).
+            if source.Version <> state.DepVersions[0] then
+                state.Version + 1L
+            else
+                state.Version
 
     interface IDisposable with
         member this.Dispose() =
