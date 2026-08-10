@@ -735,12 +735,26 @@ type CollectSetNode<'T, 'U when 'T: equality and 'U: equality>
             finally
                 ctx.ReleaseOwner()
 
-        member _.Version =
-            // Dirty indicator (see MapMapNode.Version).
+        member this.Version =
+            // Dirty indicator (see MapMapNode.Version): the outer source OR any
+            // inner set with unprocessed changes trips it. A changeable inner
+            // delivers at write time (OnInnerDeltas bumps state.Version, so the
+            // plain branch already reports a new version); a derived inner
+            // (map|>filter, etc.) delivers only when this node is pulled, so
+            // without scanning the inner entries its upstream dirt is hidden
+            // from every gated consumer (a tail-only count/contains over the
+            // collect serves the stale value forever).
             if source.Version <> state.DepVersions[0] then
                 state.Version + 1L
             else
-                state.Version
+                let mutable dirty = false
+                let mutable ie = state.Inner.GetEnumerator()
+
+                while not dirty && ie.MoveNext() do
+                    if ie.Current.Value.Node.Version <> ie.Current.Value.Version then
+                        dirty <- true
+
+                if dirty then state.Version + 1L else state.Version
 
     interface IDisposable with
         member this.Dispose() =

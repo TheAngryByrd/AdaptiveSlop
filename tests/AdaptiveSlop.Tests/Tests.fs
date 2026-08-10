@@ -3202,6 +3202,55 @@ let ``ASet.collect accepts poll inner sets (ofReader)`` () =
     Assert.Equal<Set<int>>(Set.ofList [ 2; 3 ], ASet.toSet u)
 
 [<Fact>]
+let ``ASet.collect with a derived inner settles a tail-only count`` () =
+    // A derived inner (map|>filter) does not deliver at write time: it
+    // delivers only when the collect is pulled. The collect's dirty
+    // indicator must therefore scan the inner entries, or a tail-only
+    // count/contains over the collect serves the stale value forever.
+    let innerSrc = CSet.empty<int>
+    let derived = innerSrc |> ASet.map (fun v -> v * 2) |> ASet.filter (fun v -> v > 10)
+    let buckets = CSet.ofSeq [ 1 ]
+    let collected = ASet.collect (fun _ -> derived) (CSet.value buckets)
+    let cnt = collected |> ASet.count
+    let has84 = collected |> ASet.contains 84
+
+    Assert.Equal(0, AVal.getValue cnt)
+    Assert.False(AVal.getValue has84)
+
+    // 42*2 = 84 > 10: the derived inner gains it, the tail must settle.
+    CSet.add 42 innerSrc |> ignore
+    Assert.Equal(1, AVal.getValue cnt)
+    Assert.True(AVal.getValue has84)
+
+    // A second derived-inner change with no intermediate read.
+    CSet.add 30 innerSrc |> ignore
+    // 30*2 = 60 > 10: count rises to 2.
+    Assert.Equal(2, AVal.getValue cnt)
+
+    // A filtered-out element (5*2 = 10, not > 10) does not move the count.
+    CSet.add 5 innerSrc |> ignore
+    Assert.Equal(2, AVal.getValue cnt)
+
+    // Removing a contributing element drops it.
+    CSet.remove 42 innerSrc |> ignore
+    Assert.Equal(1, AVal.getValue cnt)
+
+[<Fact>]
+let ``ASet.collect with a derived inner settles a tail-only reader of the collect`` () =
+    // Same gap, exercised by reading the collect itself (not just a scalar
+    // escape): the whole-collection view is served by GetValue, gated by the
+    // version a downstream map consumer recorded.
+    let innerSrc = CSet.empty<int>
+    let derived = innerSrc |> ASet.map (fun v -> v * 2) |> ASet.filter (fun v -> v > 10)
+    let buckets = CSet.ofSeq [ 1 ]
+    let collected = ASet.collect (fun _ -> derived) (CSet.value buckets)
+    let cnt = collected |> ASet.toAVal |> AVal.map (fun s -> s.Count)
+
+    Assert.Equal(0, AVal.getValue cnt)
+    CSet.add 42 innerSrc |> ignore
+    Assert.Equal(1, AVal.getValue cnt)
+
+[<Fact>]
 let ``ASet.bind swaps the inner set and unregisters the old one eagerly`` () =
     let selected = CVal.create 0
     let buckets = [| CSet.ofSeq [ 1; 2 ]; CSet.ofSeq [ 3; 4 ] |]
