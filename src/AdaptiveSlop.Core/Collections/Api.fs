@@ -776,6 +776,27 @@ module AMap =
         )
 
     /// <summary>
+    /// Groups the entries of a map by a computed key (FDA <c>AMap.groupBy</c>
+    /// parity). The output entries are live adaptive maps: the per-group
+    /// content follows the source adaptively, and the groups' own changes
+    /// reach the consumers without re-reading the whole map. A group
+    /// disappears when it becomes empty (removed at the next drain); a key
+    /// whose value changes group is moved between groups.
+    /// </summary>
+    /// <example>
+    /// <code>
+    /// // towers grouped by type; the per-type map stays live
+    /// let byType = AMap.groupBy (fun _ t -> t.Type) towers
+    /// // adaptively count each type
+    /// let counts =
+    ///     byType
+    ///     |> AMap.mapA (fun _ group -> AMap.count group)
+    /// </code>
+    /// </example>
+    let inline groupBy ([<InlineIfLambda>] keyOf: 'K -> 'V -> 'G) (mapValue: amap<'K, 'V>) : amap<'G, amap<'K, 'V>> =
+        new GroupByMapNode<'K, 'V, 'G>(mapValue, keyOf)
+
+    /// <summary>
     /// Merges both maps with a mapping that receives the key and both side
     /// values (voptions) and returns the output value (voption). The mapping
     /// is called only when at least one side has a value (FDA parity); a key

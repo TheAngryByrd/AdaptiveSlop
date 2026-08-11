@@ -2309,6 +2309,125 @@ let ``AMap *A reductions follow adaptive predicates`` () =
         failwithf "sum with 80: %d" (AVal.getValue sum)
 
 [<Fact>]
+let ``AMap groupBy groups by the computed key`` () =
+    let law (m: Map<int, int>) =
+        let materialize (g: amap<int, amap<int, int>>) =
+            AMap.toMap g |> Map.map (fun _ child -> AMap.toMap child)
+
+        let actual =
+            AMap.ofSeq (Map.toSeq m) |> AMap.groupBy (fun _ v -> v % 3) |> materialize
+
+        let expected =
+            Map.toSeq m
+            |> Seq.groupBy (fun (_, v) -> v % 3)
+            |> Seq.map (fun (g, xs) -> g, Map.ofSeq xs)
+            |> Map.ofSeq
+
+        actual = expected
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``incremental law: AMap groupBy stays grouped`` () =
+    let prop (ops: int list) =
+        let materialize (g: amap<int, amap<int, int>>) =
+            AMap.toMap g |> Map.map (fun _ child -> AMap.toMap child)
+
+        let m = CMap.empty<int, int>
+        let grouped = AMap.groupBy (fun _ v -> v % 3) (CMap.value m)
+
+        for op in ops do
+            applyMapMutation op m
+
+            let source = AMap.toMap (CMap.value m)
+            let actual = materialize grouped
+
+            let expected =
+                Map.toSeq source
+                |> Seq.groupBy (fun (_, v) -> v % 3)
+                |> Seq.map (fun (g, xs) -> g, Map.ofSeq xs)
+                |> Map.ofSeq
+
+            if actual <> expected then
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``AMap groupBy moves entries between groups and drops empty groups`` () =
+    let materialize (g: amap<int, amap<int, int>>) =
+        AMap.toMap g |> Map.map (fun _ child -> AMap.toMap child)
+
+    let m = CMap.empty<int, int>
+    let grouped = AMap.groupBy (fun _ v -> v % 3) (CMap.value m)
+
+    CMap.addOrUpdate 1 1 m // group 1
+    CMap.addOrUpdate 2 2 m // group 2
+    CMap.addOrUpdate 3 6 m // group 0
+    let v1 = materialize grouped
+
+    if
+        v1
+        <> Map.ofList [ 0, Map.ofList [ 3, 6 ]; 1, Map.ofList [ 1, 1 ]; 2, Map.ofList [ 2, 2 ] ]
+    then
+        failwithf "init: %A" v1
+
+    CMap.addOrUpdate 1 3 m // move key 1: group 1 -> 0; group 1 becomes empty and disappears
+    let v2 = materialize grouped
+
+    if v2 <> Map.ofList [ 0, Map.ofList [ 1, 3; 3, 6 ]; 2, Map.ofList [ 2, 2 ] ] then
+        failwithf "move: %A" v2
+
+    CMap.remove 3 m // group 0 loses 3 but keeps 1
+    let v3 = materialize grouped
+
+    if v3 <> Map.ofList [ 0, Map.ofList [ 1, 3 ]; 2, Map.ofList [ 2, 2 ] ] then
+        failwithf "remove member: %A" v3
+
+    CMap.remove 1 m // group 0 becomes empty and disappears; group 2 remains
+    let v4 = materialize grouped
+
+    if v4 <> Map.ofList [ 2, Map.ofList [ 2, 2 ] ] then
+        failwithf "after group 0 drops: %A" v4
+
+    CMap.remove 2 m // the last group disappears: nothing left
+    let v5 = materialize grouped
+
+    if not v5.IsEmpty then
+        failwithf "all gone: %A" v5
+
+[<Fact>]
+let ``AMap groupBy feeds adaptive consumers per group`` () =
+    let m = CMap.empty<int, int>
+    let grouped = AMap.groupBy (fun _ v -> v % 2) (CMap.value m)
+    let counts = AMap.mapA (fun _ g -> AMap.count g) grouped
+
+    CMap.addOrUpdate 1 1 m // group 1
+    CMap.addOrUpdate 2 2 m // group 0
+    let c1 = AMap.toMap counts
+
+    if c1 <> Map.ofList [ 0, 1; 1, 1 ] then
+        failwithf "counts init: %A" c1
+
+    CMap.addOrUpdate 3 4 m // group 0 grows
+    let c2 = AMap.toMap counts
+
+    if c2 <> Map.ofList [ 0, 2; 1, 1 ] then
+        failwithf "counts grow: %A" c2
+
+    CMap.remove 1 m // group 1 empty: the group key disappears from the output
+    let c3 = AMap.toMap counts
+
+    if c3 <> Map.ofList [ 0, 2 ] then
+        failwithf "counts drop: %A" c3
+
+    CMap.addOrUpdate 1 5 m // group 1 reappears with the new member
+    let c4 = AMap.toMap counts
+
+    if c4 <> Map.ofList [ 0, 2; 1, 1 ] then
+        failwithf "counts reappear: %A" c4
+
+[<Fact>]
 let ``AMap joinOn builds each key's subgraph once and swaps inputs in place`` () =
     let left = CMap.empty<int, int>
     let right = CMap.empty<int, int>
