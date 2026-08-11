@@ -323,6 +323,74 @@ let ``law: AMap reductions over constant sources`` () =
     Check.QuickThrowOnFailure law
 
 [<Fact>]
+let ``law: AMap *A reductions over constant sources`` () =
+    let law (m: Map<int, int>) =
+        let byKey = fun k v -> AVal.constant (k + v)
+        let even = fun _ v -> AVal.constant (v % 2 = 0)
+
+        let actualSum = m |> Map.toSeq |> AMap.ofSeq |> AMap.sumByA byKey |> AVal.getValue
+        let expectedSum = Map.fold (fun s k v -> s + k + v) 0 m
+
+        let actualCount =
+            m |> Map.toSeq |> AMap.ofSeq |> AMap.countByA even |> AVal.getValue
+
+        let expectedCount = m |> Map.filter (fun _ v -> v % 2 = 0) |> Map.count
+        actualSum = expectedSum && actualCount = expectedCount
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: AList *A reductions over constant sources`` () =
+    let law (xs: int list) =
+        let byValue = fun v -> AVal.constant (v * 2)
+        let even = fun v -> AVal.constant (v % 2 = 0)
+
+        let actualSum = xs |> AList.ofSeq |> AList.sumByA byValue |> AVal.getValue
+        let expectedSum = xs |> List.map ((*) 2) |> List.sum
+
+        let actualMin = xs |> AList.ofSeq |> AList.tryMinA byValue |> AVal.getValue
+
+        let expectedMin =
+            if List.isEmpty xs then
+                ValueNone
+            else
+                ValueSome(List.min (List.map ((*) 2) xs))
+
+        let actualCount = xs |> AList.ofSeq |> AList.countByA even |> AVal.getValue
+        let expectedCount = xs |> List.filter (fun v -> v % 2 = 0) |> List.length
+
+        actualSum = expectedSum
+        && actualMin = expectedMin
+        && actualCount = expectedCount
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: ASet tryMinA and tryMaxA over constant sources`` () =
+    let law (s: Set<int>) =
+        let mapping = fun x -> AVal.constant (x * 10)
+
+        let actualMin = s |> ASet.ofSeq |> ASet.tryMinA mapping |> AVal.getValue
+
+        let expectedMin =
+            if Set.isEmpty s then
+                ValueNone
+            else
+                ValueSome(Set.minElement s * 10)
+
+        let actualMax = s |> ASet.ofSeq |> ASet.tryMaxA mapping |> AVal.getValue
+
+        let expectedMax =
+            if Set.isEmpty s then
+                ValueNone
+            else
+                ValueSome(Set.maxElement s * 10)
+
+        actualMin = expectedMin && actualMax = expectedMax
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
 let ``law: ASet mapA with constants maps`` () =
     let law (s: Set<int>) =
         let actual =
@@ -345,6 +413,18 @@ let ``law: AMap mapV and filter preserve content`` () =
 
         let expectedFiltered = m |> Map.filter (fun _ v -> v % 2 = 0)
         actualMapped = expectedMapped && actualFiltered = expectedFiltered
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: AMap difference keeps left-only keys`` () =
+    let law (m: Map<int, int>, n: Map<int, int>) =
+        let actual =
+            AMap.difference (AMap.ofSeq (Map.toSeq m)) (AMap.ofSeq (Map.toSeq n))
+            |> AMap.toMap
+
+        let expected = m |> Map.filter (fun k _ -> not (Map.containsKey k n))
+        actual = expected
 
     Check.QuickThrowOnFailure law
 
@@ -866,6 +946,107 @@ let ``incremental law: AMap fold stays correct`` () =
 
             if actual <> expected then
                 failwithf "mismatch after op %A: total=%A" op actual
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``incremental law: AMap *A reductions stay correct`` () =
+    let prop (ops: int list) =
+        let m = CMap.empty<int, int>
+        let even = fun _ v -> AVal.constant (v % 2 = 0)
+        let byKey = fun k v -> AVal.constant (float (k + v)) // DivideByInt types: float
+
+        let countEvens = AMap.countByA even (CMap.value m)
+        let existsEvens = AMap.existsA even (CMap.value m)
+        let forallEvens = AMap.forallA even (CMap.value m)
+        let sum = AMap.sumByA byKey (CMap.value m)
+        let average = AMap.averageByA byKey (CMap.value m)
+
+        for op in ops do
+            applyMapMutation op m
+
+            let source = AMap.toMap (CMap.value m)
+            let expectedCount = source |> Map.filter (fun _ v -> v % 2 = 0) |> Map.count
+            let expectedSum = Map.fold (fun s k v -> s + float (k + v)) 0.0 source
+
+            // DivideByInt on an empty map is NaN; compare NaN-aware.
+            let expectedAverage = expectedSum / float (Map.count source)
+            let actualAverage = AVal.getValue average
+
+            if AVal.getValue countEvens <> expectedCount then
+                failwithf "countByA after %A" op
+
+            if AVal.getValue existsEvens <> (expectedCount > 0) then
+                failwithf "existsA after %A" op
+
+            if AVal.getValue forallEvens <> (expectedCount = Map.count source) then
+                failwithf "forallA after %A" op
+
+            if AVal.getValue sum <> expectedSum then
+                failwithf "sumByA after %A" op
+
+            if
+                not (
+                    (Double.IsNaN actualAverage && Double.IsNaN expectedAverage)
+                    || actualAverage = expectedAverage
+                )
+            then
+                failwithf "averageByA after %A: %A vs %A" op actualAverage expectedAverage
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``incremental law: AList *A reductions stay correct`` () =
+    let prop (ops: int list) =
+        let l = CList.empty<int>
+        let even = fun v -> AVal.constant (v % 2 = 0)
+        let byValue = fun v -> AVal.constant (v * 2)
+
+        let countEvens = AList.countByA even (CList.value l)
+        let existsEvens = AList.existsA even (CList.value l)
+        let forallEvens = AList.forallA even (CList.value l)
+        let sum = AList.sumByA byValue (CList.value l)
+        let min = AList.tryMinA byValue (CList.value l)
+        let max = AList.tryMaxA byValue (CList.value l)
+        let model = ResizeArray<int>()
+
+        for op in ops do
+            applyListMutation op l model
+
+            let source = List.ofSeq model
+            let mapped = source |> List.map ((*) 2)
+            let expectedCount = source |> List.filter (fun v -> v % 2 = 0) |> List.length
+            let expectedSum = mapped |> List.sum
+
+            let expectedMin =
+                if List.isEmpty mapped then
+                    ValueNone
+                else
+                    ValueSome(List.min mapped)
+
+            let expectedMax =
+                if List.isEmpty mapped then
+                    ValueNone
+                else
+                    ValueSome(List.max mapped)
+
+            if AVal.getValue countEvens <> expectedCount then
+                failwithf "countByA after %A" op
+
+            if AVal.getValue existsEvens <> (expectedCount > 0) then
+                failwithf "existsA after %A" op
+
+            if AVal.getValue forallEvens <> (expectedCount = List.length source) then
+                failwithf "forallA after %A" op
+
+            if AVal.getValue sum <> expectedSum then
+                failwithf "sumByA after %A" op
+
+            if AVal.getValue min <> expectedMin then
+                failwithf "tryMinA after %A" op
+
+            if AVal.getValue max <> expectedMax then
+                failwithf "tryMaxA after %A" op
 
     Check.QuickThrowOnFailure prop
 
@@ -2040,6 +2221,92 @@ let ``AMap joinOn matches the model under both-side mutation`` () =
                 failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
 
     Check.One(scenarioConfig, prop)
+
+[<Fact>]
+let ``AMap difference matches the model under both-side mutation`` () =
+    let prop (sc: JoinScenario) =
+        let left = CMap.empty<int, int>
+        let right = CMap.empty<int, int>
+
+        for (k, v) in sc.initialA do
+            CMap.addOrUpdate k v left
+
+        for (k, v) in sc.initialB do
+            CMap.addOrUpdate k v right
+
+        let diff = AMap.difference (CMap.value left) (CMap.value right)
+        let modelA = Dictionary<int, int>()
+        let modelB = Dictionary<int, int>()
+
+        for (k, v) in sc.initialA do
+            modelA[k] <- v
+
+        for (k, v) in sc.initialB do
+            modelB[k] <- v
+
+        let apply (op: JoinOp) =
+            match op with
+            | LeftEdit(Upsert(key, value)) ->
+                CMap.addOrUpdate key value left
+                modelA[key] <- value
+            | LeftEdit(MapOp.Remove key) ->
+                CMap.remove key left
+                modelA.Remove key |> ignore
+            | LeftEdit(MapOp.SetValue _) -> ()
+            | RightEdit(Upsert(key, value)) ->
+                CMap.addOrUpdate key value right
+                modelB[key] <- value
+            | RightEdit(MapOp.Remove key) ->
+                CMap.remove key right
+                modelB.Remove key |> ignore
+            | RightEdit(MapOp.SetValue _) -> ()
+
+        for op in sc.ops do
+            apply op
+
+            let actual = AMap.toMap diff
+
+            let expected =
+                Map.ofSeq (
+                    seq {
+                        for KeyValue(k, v) in modelA do
+                            if not (modelB.ContainsKey k) then
+                                k, v
+                    }
+                )
+
+            if actual <> expected then
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
+
+    Check.One(scenarioConfig, prop)
+
+[<Fact>]
+let ``AMap *A reductions follow adaptive predicates`` () =
+    let m = CMap.empty<int, int>
+    let threshold = CVal.create 50
+    CMap.addOrUpdate 1 10 m
+    CMap.addOrUpdate 2 60 m
+    CMap.addOrUpdate 3 90 m
+
+    let over =
+        AMap.countByA (fun _ v -> AVal.map (fun t -> v > t) (CVal.value threshold)) (CMap.value m)
+
+    let sum =
+        AMap.sumByA (fun _ v -> AVal.map (fun t -> v + t) (CVal.value threshold)) (CMap.value m)
+
+    if AVal.getValue over <> 2 then
+        failwithf "over 50: %d" (AVal.getValue over)
+
+    if AVal.getValue sum <> 310 then
+        failwithf "sum with 50: %d" (AVal.getValue sum)
+
+    CVal.set 80 threshold
+
+    if AVal.getValue over <> 1 then
+        failwithf "over 80: %d" (AVal.getValue over)
+
+    if AVal.getValue sum <> 400 then
+        failwithf "sum with 80: %d" (AVal.getValue sum)
 
 [<Fact>]
 let ``AMap joinOn builds each key's subgraph once and swaps inputs in place`` () =

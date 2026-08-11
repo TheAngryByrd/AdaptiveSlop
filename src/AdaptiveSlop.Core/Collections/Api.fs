@@ -452,6 +452,22 @@ module ASet =
     let inline tryMax (set: aset<'T>) : aval<'T voption> =
         reduce (AdaptiveReduction.tryMax ()) set
 
+    /// <summary>
+    /// Adaptively gets the minimum of the avals mapped from the elements, or
+    /// <c>ValueNone</c> when empty (the voption counterpart of the <c>*A</c>
+    /// family, mirroring <see cref="tryMin"/>).
+    /// </summary>
+    let inline tryMinA ([<InlineIfLambda>] mapping: 'T -> aval<'U>) (set: aset<'T>) : aval<'U voption> =
+        reduceByA (AdaptiveReduction.tryMin ()) mapping set
+
+    /// <summary>
+    /// Adaptively gets the maximum of the avals mapped from the elements, or
+    /// <c>ValueNone</c> when empty (the voption counterpart of the <c>*A</c>
+    /// family, mirroring <see cref="tryMax"/>).
+    /// </summary>
+    let inline tryMaxA ([<InlineIfLambda>] mapping: 'T -> aval<'U>) (set: aset<'T>) : aval<'U voption> =
+        reduceByA (AdaptiveReduction.tryMax ()) mapping set
+
     /// <summary>A constant set with a single element.</summary>
     let inline single (value: 'T) : aset<'T> =
         new ConstantSet<'T>(fun () -> [ value ].ToFrozenSet())
@@ -741,6 +757,21 @@ module AMap =
             fun k lv rv ->
                 match struct (lv, rv) with
                 | ValueSome l, ValueSome r -> ValueSome(combine k l r)
+                | _ -> ValueNone
+        )
+
+    /// <summary>
+    /// The keys present in the left map but not in the right map, with the
+    /// left values (the AMap counterpart of <c>ASet.difference</c>). Right
+    /// values are ignored; only the right keys matter.
+    /// </summary>
+    let inline difference (left: amap<'K, 'V>) (right: amap<'K, 'V>) : amap<'K, 'V> =
+        new Choose2MapNode<'K, 'V, 'V, 'V>(
+            left,
+            right,
+            fun k lv rv ->
+                match struct (lv, rv) with
+                | ValueSome l, ValueNone -> ValueSome l
                 | _ -> ValueNone
         )
 
@@ -1150,6 +1181,58 @@ module AMap =
     /// <summary>Adaptively counts the entries that satisfy the predicate.</summary>
     let inline countBy ([<InlineIfLambda>] predicate: 'K -> 'V -> bool) (mapValue: amap<'K, 'V>) : aval<int> =
         new MapReduceNode<'K, 'V, bool, int, int>(mapValue, predicate, AdaptiveReduction.countPositive)
+
+    // =========================================================================
+    // The *A reductions (docs/2026-08-05-MAPA-DESIGN.md §10): composition over
+    // mapA/filterA + the existing reduction nodes. No new node types. FDA
+    // argument order: reduction, mapping, map.
+    // =========================================================================
+
+    /// <summary>
+    /// Adaptively reduces the map after mapping every entry to an adaptive
+    /// value (the AMap counterpart of <c>ASet.reduceByA</c>). The mapping
+    /// produces distinct pairs <c>struct (k, x)</c>, so duplicate mapped
+    /// values keep their multiplicity (a plain mapA would deduplicate them);
+    /// the reduction projects the value side.
+    /// </summary>
+    let inline reduceByA
+        (reduction: AdaptiveReduction<'U, 's, 'v>)
+        ([<InlineIfLambda>] mapping: 'K -> 'V -> aval<'U>)
+        (mapValue: amap<'K, 'V>)
+        : aval<'v> =
+        mapValue
+        |> mapA (fun k v -> AVal.map (fun x -> struct (k, x)) (mapping k v))
+        |> reduceBy reduction (fun _ struct (_, x) -> x)
+
+    /// <summary>Adaptively counts the entries whose predicate aval holds <c>true</c> (the AMap counterpart of <c>ASet.countByA</c>).</summary>
+    let inline countByA ([<InlineIfLambda>] predicate: 'K -> 'V -> aval<bool>) (mapValue: amap<'K, 'V>) : aval<int> =
+        mapValue |> filterA predicate |> count
+
+    /// <summary>Adaptively tests if any entry's predicate aval holds <c>true</c> (the AMap counterpart of <c>ASet.existsA</c>).</summary>
+    let inline existsA ([<InlineIfLambda>] predicate: 'K -> 'V -> aval<bool>) (mapValue: amap<'K, 'V>) : aval<bool> =
+        mapValue |> countByA predicate |> AVal.map (fun c -> c <> 0)
+
+    /// <summary>Adaptively tests if every entry's predicate aval holds <c>true</c> (the AMap counterpart of <c>ASet.forallA</c>).</summary>
+    let inline forallA ([<InlineIfLambda>] predicate: 'K -> 'V -> aval<bool>) (mapValue: amap<'K, 'V>) : aval<bool> =
+        mapValue
+        |> filterA (fun k v -> AVal.map not (predicate k v))
+        |> count
+        |> AVal.map (fun c -> c = 0)
+
+    /// <summary>Adaptively sums the avals mapped from the entries (the AMap counterpart of <c>ASet.sumByA</c>).</summary>
+    let inline sumByA ([<InlineIfLambda>] mapping: 'K -> 'V -> aval<'U>) (mapValue: amap<'K, 'V>) : aval<'U> =
+        reduceByA (AdaptiveReduction.sum ()) mapping mapValue
+
+    /// <summary>
+    /// Adaptively averages the avals mapped from the entries (needs a numeric
+    /// type with <c>DivideByInt</c>, e.g. <c>float</c>; the AMap counterpart
+    /// of <c>ASet.averageByA</c>).
+    /// </summary>
+    let inline averageByA ([<InlineIfLambda>] mapping: 'K -> 'V -> aval<'U>) (mapValue: amap<'K, 'V>) : aval<'U> =
+        AVal.map2
+            (fun total count -> LanguagePrimitives.DivideByInt total count)
+            (reduceByA (AdaptiveReduction.sum ()) mapping mapValue)
+            (count mapValue)
 
     /// <summary>
     /// Adaptively looks up the key: the value, or <c>ValueNone</c> when the
@@ -1620,6 +1703,73 @@ module AList =
     /// </summary>
     let inline averageBy ([<InlineIfLambda>] mapping: 'T -> ^U) (list: alist<'T>) : aval< ^U > =
         AVal.map2 (fun total c -> LanguagePrimitives.DivideByInt total c) (sumBy mapping list) (count list)
+
+    // =========================================================================
+    // The *A reductions (docs/2026-08-05-MAPA-DESIGN.md §10): composition over
+    // mapA/filterA + the existing reduction nodes. Value-only mapping
+    // ('T -> aval<'U>), FDA parity: the mapped value follows the ELEMENT, not
+    // the position (mapiA's mapping-time positions stick on shifts, so an
+    // index-aware reduction would not track live positions). No new node
+    // types. FDA argument order: reduction, mapping, list.
+    // =========================================================================
+
+    /// <summary>
+    /// Adaptively reduces the list after mapping every element to an adaptive
+    /// value (the AList counterpart of <c>ASet.reduceByA</c>). The mapped
+    /// values keep their multiplicity (a list has no deduplication).
+    /// </summary>
+    let inline reduceByA
+        (reduction: AdaptiveReduction<'U, 's, 'v>)
+        ([<InlineIfLambda>] mapping: 'T -> aval<'U>)
+        (list: alist<'T>)
+        : aval<'v> =
+        list |> mapA mapping |> reduceBy reduction id
+
+    /// <summary>Adaptively counts the elements whose predicate aval holds <c>true</c> (the AList counterpart of <c>ASet.countByA</c>).</summary>
+    let inline countByA ([<InlineIfLambda>] predicate: 'T -> aval<bool>) (list: alist<'T>) : aval<int> =
+        list |> filterA predicate |> count
+
+    /// <summary>Adaptively tests if any element's predicate aval holds <c>true</c> (the AList counterpart of <c>ASet.existsA</c>).</summary>
+    let inline existsA ([<InlineIfLambda>] predicate: 'T -> aval<bool>) (list: alist<'T>) : aval<bool> =
+        list |> countByA predicate |> AVal.map (fun c -> c <> 0)
+
+    /// <summary>Adaptively tests if every element's predicate aval holds <c>true</c> (the AList counterpart of <c>ASet.forallA</c>).</summary>
+    let inline forallA ([<InlineIfLambda>] predicate: 'T -> aval<bool>) (list: alist<'T>) : aval<bool> =
+        list
+        |> filterA (fun x -> AVal.map not (predicate x))
+        |> count
+        |> AVal.map (fun c -> c = 0)
+
+    /// <summary>Adaptively sums the avals mapped from the elements (the AList counterpart of <c>ASet.sumByA</c>).</summary>
+    let inline sumByA ([<InlineIfLambda>] mapping: 'T -> aval<'U>) (list: alist<'T>) : aval<'U> =
+        reduceByA (AdaptiveReduction.sum ()) mapping list
+
+    /// <summary>
+    /// Adaptively averages the avals mapped from the elements (needs a
+    /// numeric type with <c>DivideByInt</c>, e.g. <c>float</c>; the AList
+    /// counterpart of <c>ASet.averageByA</c>).
+    /// </summary>
+    let inline averageByA ([<InlineIfLambda>] mapping: 'T -> aval<'U>) (list: alist<'T>) : aval<'U> =
+        AVal.map2
+            (fun total count -> LanguagePrimitives.DivideByInt total count)
+            (reduceByA (AdaptiveReduction.sum ()) mapping list)
+            (count list)
+
+    /// <summary>
+    /// Adaptively gets the minimum of the avals mapped from the elements, or
+    /// <c>ValueNone</c> when empty (the voption counterpart of the <c>*A</c>
+    /// family, mirroring <see cref="tryMin"/>).
+    /// </summary>
+    let inline tryMinA ([<InlineIfLambda>] mapping: 'T -> aval<'U>) (list: alist<'T>) : aval<'U voption> =
+        reduceByA (AdaptiveReduction.tryMin ()) mapping list
+
+    /// <summary>
+    /// Adaptively gets the maximum of the avals mapped from the elements, or
+    /// <c>ValueNone</c> when empty (the voption counterpart of the <c>*A</c>
+    /// family, mirroring <see cref="tryMax"/>).
+    /// </summary>
+    let inline tryMaxA ([<InlineIfLambda>] mapping: 'T -> aval<'U>) (list: alist<'T>) : aval<'U voption> =
+        reduceByA (AdaptiveReduction.tryMax ()) mapping list
 
     /// <summary>
     /// An adaptive list over an adaptive value of a sequence (FDA
