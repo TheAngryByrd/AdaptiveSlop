@@ -6137,3 +6137,37 @@ let ``changeable nodes round-trip nested in a record`` () =
 
     CVal.set "pear" doc'.Selected
     Assert.Equal("pear", AVal.getValue (CVal.value doc'.Selected))
+
+[<Fact>]
+let ``cval of a plain F# collection round-trips`` () =
+    let v = CVal.create [ 1; 2; 3 ]
+    let json = JsonSerializer.Serialize v
+
+    Assert.Equal("[1,2,3]", json)
+
+    let v' = JsonSerializer.Deserialize<cval<int list>> json
+    Assert.Equal<int list>([ 1; 2; 3 ], AVal.getValue (CVal.value v'))
+
+[<Fact>]
+let ``nodes nested in nodes round-trip`` () =
+    let v = CVal.create (CVal.create 7)
+    let json = JsonSerializer.Serialize v
+
+    Assert.Equal("7", json)
+
+    let v' = JsonSerializer.Deserialize<cval<cval<int>>> json
+    Assert.Equal(7, AVal.getValue (CVal.value v'.Value))
+
+[<Fact>]
+let ``collections of nodes round-trip`` () =
+    let s = CSet.ofSeq [ CVal.create 1; CVal.create 2 ]
+    let json = JsonSerializer.Serialize s
+
+    let s' = JsonSerializer.Deserialize<cset<cval<int>>> json
+    Assert.Equal(2, (ASet.count (CSet.value s') |> AVal.getValue))
+
+    let m = CMap.ofSeq [ "x", CVal.create 5 ]
+    let jsonM = JsonSerializer.Serialize m
+
+    let m' = JsonSerializer.Deserialize<cmap<string, cval<int>>> jsonM
+    Assert.Equal(5, ((AMap.getValue (CMap.value m'))["x"] |> fun n -> AVal.getValue (CVal.value n)))
