@@ -1876,11 +1876,8 @@ let ``joinOn swap path: updates and one drain read allocate nothing`` () =
         CMap.addOrUpdate i 100 right
 
     let joined =
-        AMap.joinOn
-            (fun _ _ -> 0)
-            (fun _ lV rV -> AVal.map2 (fun l r -> ValueSome(l + (r |> ValueOption.defaultValue 0))) lV rV)
-            (CMap.value left)
-            (CMap.value right)
+        AMap.joinOn (CMap.value left) (CMap.value right) (fun _ _ -> 0) (fun _ lV rV ->
+            AVal.map2 (fun l r -> ValueSome(l + (r |> ValueOption.defaultValue 0))) lV rV)
 
     for i in 0..49 do
         CMap.addOrUpdate i i left

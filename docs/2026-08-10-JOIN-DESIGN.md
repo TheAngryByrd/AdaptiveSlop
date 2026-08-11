@@ -83,9 +83,15 @@ Decisions recorded (open questions from the review):
 
 ## 4. Argument order
 
-`joinOn` takes `(keyOfLeft) (mapping) (left) (right)`, matching `choose2`'s
-convention (config first, then the collections, left before right). The pipe
-form does not apply: a piped value lands in the `right` slot.
+`joinOn` takes `(left) (right) (keyOfLeft) (mapping)` — the maps first. The
+order is deliberate: the lambdas elaborate after the map types are pinned, so
+a record-field access in `keyOfLeft` or the mapping resolves against the
+actual map types. With the lambdas first, F# resolves the field against the
+first record in scope with a matching field (verified: a `v.Id` access
+resolved to the wrong record type and failed to compile). The pipe form does
+not apply: a piped value lands in the mapping slot, a compile error (with the
+old order it landed in the right slot and could compile with silently swapped
+maps).
 
 ## 5. Non-goals (recorded)
 

@@ -1841,10 +1841,10 @@ type JoinBenchmarks() =
 
         joinDerived <-
             AdaptiveSlop.Core.AMap.joinOn
-                (fun k _ -> k % this.Enemies + 1) // stable join key from the key
-                (fun _ pV tV -> AdaptiveSlop.Core.AVal.map2 (fun p t -> ValueSome(struct (p, t))) pV tV)
                 (AdaptiveSlop.Core.CMap.value projectiles)
                 (AdaptiveSlop.Core.CMap.value enemies)
+                (fun k _ -> k % this.Enemies + 1) // stable join key from the key
+                (fun _ pV tV -> AdaptiveSlop.Core.AVal.map2 (fun p t -> ValueSome(struct (p, t))) pV tV)
 
         mapADerived <-
             AdaptiveSlop.Core.CMap.value projectiles

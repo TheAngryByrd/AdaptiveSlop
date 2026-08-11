@@ -2374,18 +2374,17 @@ let ``AMap joinOn matches the model under both-side mutation`` () =
             CMap.addOrUpdate k v right
 
         let joined =
-            AMap.joinOn
-                (fun _ v -> v % 7) // join key from the value: updates churn the key
-                (fun _ lV rV ->
-                    AVal.map2
-                        (fun l r ->
-                            match r with
-                            | ValueSome rv -> ValueSome(l + rv)
-                            | ValueNone -> ValueNone) // inner join: drop on a missing right side
-                        lV
-                        rV)
-                (CMap.value left)
-                (CMap.value right)
+            AMap.joinOn (CMap.value left) (CMap.value right) (fun _ v -> v % 7) (fun  // join key from the value: updates churn the key
+                                                                                     _
+                                                                                     lV
+                                                                                     rV ->
+                AVal.map2
+                    (fun l r ->
+                        match r with
+                        | ValueSome rv -> ValueSome(l + rv)
+                        | ValueNone -> ValueNone) // inner join: drop on a missing right side
+                    lV
+                    rV)
 
         let modelA = Dictionary<int, int>()
         let modelB = Dictionary<int, int>()
@@ -2646,20 +2645,19 @@ let ``AMap joinOn builds each key's subgraph once and swaps inputs in place`` ()
     let mutable calls = 0
 
     let joined =
-        AMap.joinOn
-            (fun _ _ -> 0) // stable join key: the swap path is the hot path
-            (fun _ lV rV ->
-                calls <- calls + 1
+        AMap.joinOn (CMap.value left) (CMap.value right) (fun _ _ -> 0) (fun  // stable join key: the swap path is the hot path
+                                                                             _
+                                                                             lV
+                                                                             rV ->
+            calls <- calls + 1
 
-                AVal.map2
-                    (fun l r ->
-                        match r with
-                        | ValueSome rv -> ValueSome(l + rv)
-                        | ValueNone -> ValueNone)
-                    lV
-                    rV)
-            (CMap.value left)
-            (CMap.value right)
+            AVal.map2
+                (fun l r ->
+                    match r with
+                    | ValueSome rv -> ValueSome(l + rv)
+                    | ValueNone -> ValueNone)
+                lV
+                rV)
 
     CMap.addOrUpdate 1 10 left
     let v1 = AMap.toMap joined
@@ -2703,11 +2701,8 @@ let ``AMap joinOn regression: add-then-remove and remove-then-add between reads`
     CMap.addOrUpdate 0 100 right
 
     let joined =
-        AMap.joinOn
-            (fun _ _ -> 0)
-            (fun _ lV rV -> AVal.map2 (fun l r -> ValueSome(l + (r |> ValueOption.defaultValue 0))) lV rV)
-            (CMap.value left)
-            (CMap.value right)
+        AMap.joinOn (CMap.value left) (CMap.value right) (fun _ _ -> 0) (fun _ lV rV ->
+            AVal.map2 (fun l r -> ValueSome(l + (r |> ValueOption.defaultValue 0))) lV rV)
 
     // Add-then-remove between reads: the journal nets to nothing.
     CMap.addOrUpdate 1 10 left
@@ -2741,18 +2736,17 @@ let ``AMap joinOn re-joins when the join key changes`` () =
     CMap.addOrUpdate 1 100 right // join key 1 only; join key 0 is missing until the catch-up
 
     let joined =
-        AMap.joinOn
-            (fun _ v -> v % 7) // value 1 -> key 1; value 8 -> key 1; value 14 -> key 0
-            (fun _ lV rV ->
-                AVal.map2
-                    (fun l r ->
-                        match r with
-                        | ValueSome rv -> ValueSome(l + rv)
-                        | ValueNone -> ValueNone)
-                    lV
-                    rV)
-            (CMap.value left)
-            (CMap.value right)
+        AMap.joinOn (CMap.value left) (CMap.value right) (fun _ v -> v % 7) (fun  // value 1 -> key 1; value 8 -> key 1; value 14 -> key 0
+                                                                                 _
+                                                                                 lV
+                                                                                 rV ->
+            AVal.map2
+                (fun l r ->
+                    match r with
+                    | ValueSome rv -> ValueSome(l + rv)
+                    | ValueNone -> ValueNone)
+                lV
+                rV)
 
     CMap.addOrUpdate 1 1 left // join key 1: 1 + 100
     let v1 = AMap.toMap joined
@@ -2788,11 +2782,8 @@ let ``AMap joinOn defers transaction writes until commit`` () =
     CMap.addOrUpdate 1 10 left
 
     let joined =
-        AMap.joinOn
-            (fun _ _ -> 0)
-            (fun _ lV rV -> AVal.map2 (fun l r -> ValueSome(l + (r |> ValueOption.defaultValue 0))) lV rV)
-            (CMap.value left)
-            (CMap.value right)
+        AMap.joinOn (CMap.value left) (CMap.value right) (fun _ _ -> 0) (fun _ lV rV ->
+            AVal.map2 (fun l r -> ValueSome(l + (r |> ValueOption.defaultValue 0))) lV rV)
 
     let before = AMap.toMap joined
 
@@ -2826,24 +2817,23 @@ let ``AMap joinOn composes into a 3-way join`` () =
 
     let join1 =
         AMap.joinOn
-            (fun _ key -> key) // join key: the middle key from the left value
-            (fun _ keyV valueV -> AVal.map2 (fun t p -> ValueSome(struct (t, p))) keyV valueV)
             left // left: id -> middle key
             middle // middle: key -> value
+            (fun _ key -> key) // join key: the middle key from the left value
+            (fun _ keyV valueV -> AVal.map2 (fun t p -> ValueSome(struct (t, p))) keyV valueV)
 
     let joinedRows =
-        AMap.joinOn
-            (fun _ struct (key, _) -> key) // join key: the middle key carried by the first join
-            (fun _ structV outerV ->
-                AVal.map2
-                    (fun struct (key, value) c ->
-                        match c with
-                        | ValueSome cid -> ValueSome(struct (value, cid))
-                        | ValueNone -> ValueNone)
-                    structV
-                    outerV)
-            join1
-            outer
+        AMap.joinOn join1 outer (fun _ struct (key, _) -> key) (fun  // join key: the middle key carried by the first join
+                                                                    _
+                                                                    structV
+                                                                    outerV ->
+            AVal.map2
+                (fun struct (key, value) c ->
+                    match c with
+                    | ValueSome cid -> ValueSome(struct (value, cid))
+                    | ValueNone -> ValueNone)
+                structV
+                outerV)
 
     let v1 = AMap.toMap joinedRows
 

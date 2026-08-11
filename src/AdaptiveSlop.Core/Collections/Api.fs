@@ -1078,6 +1078,14 @@ module AMap =
     /// is <c>ValueNone</c>.
     /// </remarks>
     /// <remarks>
+    /// Argument order: the two maps come first, so the lambdas elaborate
+    /// after the map types are pinned — a record-field access in
+    /// <c>keyOfLeft</c> or the mapping resolves against the actual map types,
+    /// not the first record in scope with a matching field. The pipe form
+    /// does not apply: a piped value lands in the mapping slot, a compile
+    /// error.
+    /// </remarks>
+    /// <remarks>
     /// Performance guidance for hot per-key subgraphs (docs/2026-08-10-JOIN-
     /// DESIGN.md §6): the per-key subgraph is forced per updated key per read.
     /// A coarser join key reduces the entry count, the direct lever. A static-
@@ -1095,23 +1103,24 @@ module AMap =
     /// // the catalog falls back to the price stored on the order
     /// let orderViews =
     ///     AMap.joinOn
+    ///         orders
+    ///         products
     ///         (fun _ order -> order.ProductId)
     ///         (fun _ orderV priceV ->
     ///             AVal.map2
     ///                 (fun order price ->
-    ///                     { Order = order
-    ///                       Price = price |> ValueOption.defaultValue order.StoredPrice })
+    ///                     ValueSome
+    ///                         { Order = order
+    ///                           Price = price |> ValueOption.defaultValue order.StoredPrice })
     ///                 orderV
     ///                 priceV)
-    ///         orders
-    ///         products
     /// </code>
     /// </example>
     let inline joinOn
-        ([<InlineIfLambda>] keyOfLeft: 'K1 -> 'V1 -> 'K2)
-        ([<InlineIfLambda>] mapping: 'K1 -> aval<'V1> -> aval<'V2 voption> -> aval<'U voption>)
         (left: amap<'K1, 'V1>)
         (right: amap<'K2, 'V2>)
+        ([<InlineIfLambda>] keyOfLeft: 'K1 -> 'V1 -> 'K2)
+        ([<InlineIfLambda>] mapping: 'K1 -> aval<'V1> -> aval<'V2 voption> -> aval<'U voption>)
         : amap<'K1, 'U> =
         new JoinMapNode<'K1, 'V1, 'K2, 'V2, 'U>(left, right, keyOfLeft, mapping)
 
