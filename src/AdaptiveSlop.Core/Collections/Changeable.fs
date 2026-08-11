@@ -3,6 +3,7 @@ namespace AdaptiveSlop.Core
 open System
 open System.Collections.Generic
 open System.Threading
+open System.Text.Json.Serialization
 
 // =============================================================================
 // Changeable collection sources (PLAN.md Section 6.9)
@@ -148,6 +149,9 @@ type internal PostedOpRing<'P>(capacity: int) =
 /// until the next write. <c>CSet.force</c> materializes an immutable snapshot.
 /// </para>
 /// </remarks>
+// Round-trips the node through System.Text.Json as its bare element array (see
+// ChangeableConverterFactory).
+[<JsonConverter(typeof<ChangeableConverterFactory>)>]
 type ChangeableSet<'T>(initial: seq<'T>) =
     // The graph this node belongs to, captured at creation (the ambient graph
     // of the creating thread).
@@ -476,6 +480,9 @@ type ChangeableSet<'T>(initial: seq<'T>) =
 /// are confined to the owner thread. See <see cref="ChangeableSet&lt;'T&gt;"/>
 /// for the transaction and view contracts.
 /// </summary>
+// Round-trips the node through System.Text.Json as its bare JSON object (see
+// ChangeableConverterFactory).
+[<JsonConverter(typeof<ChangeableConverterFactory>)>]
 type ChangeableMap<'K, 'V when 'K: equality>(initial: seq<'K * 'V>) =
     // The graph this node belongs to, captured at creation (the ambient graph
     // of the creating thread).
@@ -873,6 +880,9 @@ type cmap<'K, 'V when 'K: equality> = ChangeableMap<'K, 'V>
 /// snapshot.
 /// </para>
 /// </remarks>
+// Round-trips the node through System.Text.Json as its bare element array (see
+// ChangeableConverterFactory).
+[<JsonConverter(typeof<ChangeableConverterFactory>)>]
 type ChangeableList<'T>(initial: seq<'T>) =
     // The graph this node belongs to, captured at creation (the ambient graph
     // of the creating thread).

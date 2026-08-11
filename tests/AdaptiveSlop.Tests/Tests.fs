@@ -8,6 +8,7 @@ module AdaptiveSlop.Tests
 
 open System
 open System.Collections.Generic
+open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
 open global.Xunit
@@ -6065,3 +6066,108 @@ let ``direct read of another thread's node throws in debug`` () =
 
     Assert.True(threw)
 #endif
+
+// ---- System.Text.Json round-trip of changeable nodes (see ChangeableConverterFactory) ----
+
+[<Fact>]
+let ``cval round-trips through System.Text.Json`` () =
+    let v = CVal.create 10
+    let json = JsonSerializer.Serialize v
+
+    Assert.Equal("10", json)
+
+    let v' = JsonSerializer.Deserialize<cval<int>> json
+    Assert.Equal(10, AVal.getValue (CVal.value v'))
+
+    CVal.set 12 v'
+    Assert.Equal(12, AVal.getValue (CVal.value v'))
+
+[<Fact>]
+let ``cset round-trips through System.Text.Json`` () =
+    let s = CSet.ofSeq [ 1; 2; 3 ]
+    let json = JsonSerializer.Serialize s
+
+    let s' = JsonSerializer.Deserialize<cset<int>> json
+    Assert.Equal(3, (ASet.count (CSet.value s') |> AVal.getValue))
+
+    CSet.add 4 s'
+    Assert.Equal(4, (ASet.count (CSet.value s') |> AVal.getValue))
+
+[<Fact>]
+let ``cmap round-trips through System.Text.Json`` () =
+    let m = CMap.ofSeq [ "a", 1; "b", 2 ]
+    let json = JsonSerializer.Serialize m
+
+    Assert.Equal("""{"a":1,"b":2}""", json)
+
+    let m' = JsonSerializer.Deserialize<cmap<string, int>> json
+    Assert.Equal(2, (AMap.getValue (CMap.value m')).Count)
+
+    CMap.addOrUpdate "c" 3 m'
+    Assert.Equal(3, (AMap.getValue (CMap.value m')).Count)
+
+[<Fact>]
+let ``clist round-trips through System.Text.Json`` () =
+    let l = CList.ofSeq [ 1; 2; 3 ]
+    let json = JsonSerializer.Serialize l
+
+    Assert.Equal("[1,2,3]", json)
+
+    let l' = JsonSerializer.Deserialize<clist<int>> json
+    Assert.Equal(3, (AList.getValue (CList.value l')).Count)
+
+    CList.append 4 l'
+    Assert.Equal(4, (AList.getValue (CList.value l')).Count)
+
+type JsonDoc =
+    { Selected: cval<string>
+      Prices: cmap<string, int> }
+
+[<Fact>]
+let ``changeable nodes round-trip nested in a record`` () =
+    let doc: JsonDoc =
+        { Selected = CVal.create "apple"
+          Prices = CMap.ofSeq [ "apple", 10 ] }
+
+    let json = JsonSerializer.Serialize doc
+
+    let doc' = JsonSerializer.Deserialize<JsonDoc> json
+    Assert.Equal("apple", AVal.getValue (CVal.value doc'.Selected))
+    Assert.Equal(10, (AMap.getValue (CMap.value doc'.Prices))["apple"])
+
+    CVal.set "pear" doc'.Selected
+    Assert.Equal("pear", AVal.getValue (CVal.value doc'.Selected))
+
+[<Fact>]
+let ``cval of a plain F# collection round-trips`` () =
+    let v = CVal.create [ 1; 2; 3 ]
+    let json = JsonSerializer.Serialize v
+
+    Assert.Equal("[1,2,3]", json)
+
+    let v' = JsonSerializer.Deserialize<cval<int list>> json
+    Assert.Equal<int list>([ 1; 2; 3 ], AVal.getValue (CVal.value v'))
+
+[<Fact>]
+let ``nodes nested in nodes round-trip`` () =
+    let v = CVal.create (CVal.create 7)
+    let json = JsonSerializer.Serialize v
+
+    Assert.Equal("7", json)
+
+    let v' = JsonSerializer.Deserialize<cval<cval<int>>> json
+    Assert.Equal(7, AVal.getValue (CVal.value v'.Value))
+
+[<Fact>]
+let ``collections of nodes round-trip`` () =
+    let s = CSet.ofSeq [ CVal.create 1; CVal.create 2 ]
+    let json = JsonSerializer.Serialize s
+
+    let s' = JsonSerializer.Deserialize<cset<cval<int>>> json
+    Assert.Equal(2, (ASet.count (CSet.value s') |> AVal.getValue))
+
+    let m = CMap.ofSeq [ "x", CVal.create 5 ]
+    let jsonM = JsonSerializer.Serialize m
+
+    let m' = JsonSerializer.Deserialize<cmap<string, cval<int>>> jsonM
+    Assert.Equal(5, ((AMap.getValue (CMap.value m'))["x"] |> fun n -> AVal.getValue (CVal.value n)))

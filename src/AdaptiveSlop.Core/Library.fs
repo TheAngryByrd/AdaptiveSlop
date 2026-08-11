@@ -3,6 +3,7 @@ namespace AdaptiveSlop.Core
 open System
 open System.Buffers
 open System.Collections.Generic
+open System.Text.Json.Serialization
 open System.Diagnostics
 open System.Threading
 open System.Threading.Tasks
@@ -686,6 +687,9 @@ type AdaptiveNode<'T>([<InlineIfLambda>] compute: unit -> 'T) =
             finally
                 AdaptiveRuntime.exitEvaluation ctx
 
+// Round-trips the node through System.Text.Json as its bare value (see
+// ChangeableConverterFactory).
+[<JsonConverter(typeof<ChangeableConverterFactory>)>]
 type ChangeableValue<'T>(initial: 'T) =
     // The graph this node belongs to, captured at creation (the ambient graph
     // of the creating thread).
