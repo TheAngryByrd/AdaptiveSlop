@@ -78,6 +78,14 @@ module ASet =
         new ElementSetNode<'T, 'U>(set, fun x -> AVal.map Option.toValueOption (mapping x))
 
     /// <summary>
+    /// The voption counterpart of <see cref="chooseA"/>: the mapping returns
+    /// <c>aval&lt;'U voption&gt;</c> directly, without the option-to-voption
+    /// wrapper node per element (the no-allocation path).
+    /// </summary>
+    let inline chooseAV ([<InlineIfLambda>] mapping: 'T -> aval<'U voption>) (set: aset<'T>) : aset<'U> =
+        new ElementSetNode<'T, 'U>(set, mapping)
+
+    /// <summary>
     /// Adaptively keeps the elements whose predicate aval holds <c>true</c>
     /// (FDA <c>ASet.filterA</c> parity).
     /// </summary>
@@ -1030,6 +1038,17 @@ module AMap =
         new ElementMapNode<'K, 'V, 'U>(mapValue, fun k v -> AVal.map Option.toValueOption (mapping k v))
 
     /// <summary>
+    /// The voption counterpart of <see cref="chooseA"/>: the mapping returns
+    /// <c>aval&lt;'U voption&gt;</c> directly, without the option-to-voption
+    /// wrapper node per entry (the no-allocation path).
+    /// </summary>
+    let inline chooseAV
+        ([<InlineIfLambda>] mapping: 'K -> 'V -> aval<'U voption>)
+        (mapValue: amap<'K, 'V>)
+        : amap<'K, 'U> =
+        new ElementMapNode<'K, 'V, 'U>(mapValue, mapping)
+
+    /// <summary>
     /// Adaptively keeps the entries whose predicate aval holds <c>true</c>
     /// (FDA <c>AMap.filterA</c> parity).
     /// </summary>
@@ -1266,6 +1285,24 @@ module AMap =
             (fun total count -> LanguagePrimitives.DivideByInt total count)
             (reduceByA (AdaptiveReduction.sum ()) mapping mapValue)
             (count mapValue)
+
+    /// <summary>
+    /// Adaptively gets the minimum of the avals mapped from the entries, or
+    /// <c>ValueNone</c> when empty (the voption counterpart of the <c>*A</c>
+    /// family; AMap has no plain <c>tryMin</c>, this mirrors the ASet/AList
+    /// members for family symmetry).
+    /// </summary>
+    let inline tryMinA ([<InlineIfLambda>] mapping: 'K -> 'V -> aval<'U>) (mapValue: amap<'K, 'V>) : aval<'U voption> =
+        reduceByA (AdaptiveReduction.tryMin ()) mapping mapValue
+
+    /// <summary>
+    /// Adaptively gets the maximum of the avals mapped from the entries, or
+    /// <c>ValueNone</c> when empty (the voption counterpart of the <c>*A</c>
+    /// family; AMap has no plain <c>tryMax</c>, this mirrors the ASet/AList
+    /// members for family symmetry).
+    /// </summary>
+    let inline tryMaxA ([<InlineIfLambda>] mapping: 'K -> 'V -> aval<'U>) (mapValue: amap<'K, 'V>) : aval<'U voption> =
+        reduceByA (AdaptiveReduction.tryMax ()) mapping mapValue
 
     /// <summary>
     /// Adaptively looks up the key: the value, or <c>ValueNone</c> when the
@@ -1532,6 +1569,10 @@ module AList =
                 | None -> ValueNone
         )
 
+    /// <summary>Keeps the entries whose index-aware mapping returns a value (the voption counterpart of <see cref="choosei"/>).</summary>
+    let inline chooseiV ([<InlineIfLambda>] f: int -> 'T -> 'U voption) (list: alist<'T>) : alist<'U> =
+        new FilterMapListNode<'T, 'U>(list, fun i x -> f i x)
+
     /// <summary>Keeps the elements whose index-aware predicate holds (FDA <c>AList.filteri</c> parity).</summary>
     let inline filteri ([<InlineIfLambda>] predicate: int -> 'T -> bool) (list: alist<'T>) : alist<'T> =
         new FilterMapListNode<'T, 'T>(list, fun i x -> if predicate i x then ValueSome x else ValueNone)
@@ -1560,6 +1601,14 @@ module AList =
         new ElementListNode<'T, 'U>(list, fun _ x -> AVal.map Option.toValueOption (mapping x))
 
     /// <summary>
+    /// The voption counterpart of <see cref="chooseA"/>: the mapping returns
+    /// <c>aval&lt;'U voption&gt;</c> directly, without the option-to-voption
+    /// wrapper node per element (the no-allocation path).
+    /// </summary>
+    let inline chooseAV ([<InlineIfLambda>] mapping: 'T -> aval<'U voption>) (list: alist<'T>) : alist<'U> =
+        new ElementListNode<'T, 'U>(list, fun _ x -> mapping x)
+
+    /// <summary>
     /// Adaptively keeps the elements whose predicate aval holds <c>true</c>
     /// (FDA <c>AList.filterA</c> parity).
     /// </summary>
@@ -1584,6 +1633,14 @@ module AList =
     /// </summary>
     let inline chooseiA ([<InlineIfLambda>] mapping: int -> 'T -> aval<'U option>) (list: alist<'T>) : alist<'U> =
         new ElementListNode<'T, 'U>(list, fun i x -> AVal.map Option.toValueOption (mapping i x))
+
+    /// <summary>
+    /// The voption counterpart of <see cref="chooseiA"/>: the mapping returns
+    /// <c>aval&lt;'U voption&gt;</c> directly, without the option-to-voption
+    /// wrapper node per element (the no-allocation path).
+    /// </summary>
+    let inline chooseiAV ([<InlineIfLambda>] mapping: int -> 'T -> aval<'U voption>) (list: alist<'T>) : alist<'U> =
+        new ElementListNode<'T, 'U>(list, fun i x -> mapping i x)
 
     /// <summary>
     /// Adaptively keeps the elements whose predicate aval holds <c>true</c>,

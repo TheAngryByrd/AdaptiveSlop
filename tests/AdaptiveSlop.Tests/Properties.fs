@@ -391,6 +391,97 @@ let ``law: ASet tryMinA and tryMaxA over constant sources`` () =
     Check.QuickThrowOnFailure law
 
 [<Fact>]
+let ``law: ASet chooseAV selects (voption form)`` () =
+    let law (s: Set<int>) =
+        let choose = fun x -> if x % 2 = 0 then ValueSome(x * 10) else ValueNone
+
+        let actual =
+            s
+            |> ASet.ofSeq
+            |> ASet.chooseAV (fun x -> AVal.constant (choose x))
+            |> ASet.toSet
+
+        let expected = s |> Set.filter (fun x -> x % 2 = 0) |> Set.map ((*) 10)
+        actual = expected
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: AMap chooseAV selects (voption form)`` () =
+    let law (m: Map<int, int>) =
+        let choose = fun v -> if v % 2 = 0 then ValueSome(v * 10) else ValueNone
+
+        let actual =
+            m
+            |> Map.toSeq
+            |> AMap.ofSeq
+            |> AMap.chooseAV (fun _ v -> AVal.constant (choose v))
+            |> AMap.toMap
+
+        let expected = m |> Map.filter (fun _ v -> v % 2 = 0) |> Map.map (fun _ v -> v * 10)
+        actual = expected
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: AList chooseAV and chooseiV select (voption forms)`` () =
+    let law (xs: int list) =
+        let choose = fun x -> if x % 2 = 0 then ValueSome(x * 10) else ValueNone
+
+        let actualAV =
+            xs
+            |> AList.ofSeq
+            |> AList.chooseAV (fun x -> AVal.constant (choose x))
+            |> AList.toList
+
+        let expectedAV = xs |> List.filter (fun x -> x % 2 = 0) |> List.map ((*) 10)
+
+        // The index-aware form on a constant list maps at the final positions.
+        let actualiV =
+            xs
+            |> AList.ofSeq
+            |> AList.chooseiV (fun i x -> if i % 2 = 0 then choose x else ValueNone)
+            |> AList.toList
+
+        let expectediV =
+            xs
+            |> List.mapi (fun i x -> if i % 2 = 0 then choose x else ValueNone)
+            |> List.filter ValueOption.isSome
+            |> List.map ValueOption.get
+
+        actualAV = expectedAV && actualiV = expectediV
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: AMap tryMinA and tryMaxA over constant sources`` () =
+    let law (m: Map<int, int>) =
+        let mapping = fun k v -> AVal.constant (k + v)
+        let mapped = m |> Map.toSeq |> Seq.map (fun (k, v) -> k + v)
+
+        let actualMin =
+            m |> Map.toSeq |> AMap.ofSeq |> AMap.tryMinA mapping |> AVal.getValue
+
+        let actualMax =
+            m |> Map.toSeq |> AMap.ofSeq |> AMap.tryMaxA mapping |> AVal.getValue
+
+        let expectedMin =
+            if Seq.isEmpty mapped then
+                ValueNone
+            else
+                ValueSome(Seq.min mapped)
+
+        let expectedMax =
+            if Seq.isEmpty mapped then
+                ValueNone
+            else
+                ValueSome(Seq.max mapped)
+
+        actualMin = expectedMin && actualMax = expectedMax
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
 let ``law: ASet mapA with constants maps`` () =
     let law (s: Set<int>) =
         let actual =
@@ -1049,6 +1140,126 @@ let ``incremental law: AList *A reductions stay correct`` () =
                 failwithf "tryMaxA after %A" op
 
     Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``incremental law: ASet chooseAV stays chosen`` () =
+    let prop (ops: int list) =
+        let s = CSet.empty<int>
+        let choose = fun x -> if x % 2 = 0 then ValueSome(x * 10) else ValueNone
+        let chosen = ASet.chooseAV (fun x -> AVal.constant (choose x)) (CSet.value s)
+
+        for op in ops do
+            applySetMutation op s
+            let source = Set.ofSeq (ASet.toSet (CSet.value s))
+            let actual = ASet.toSet chosen
+            let expected = source |> Set.filter (fun x -> x % 2 = 0) |> Set.map ((*) 10)
+
+            if actual <> expected then
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``incremental law: AMap chooseAV stays chosen`` () =
+    let prop (ops: int list) =
+        let m = CMap.empty<int, int>
+        let choose = fun v -> if v % 2 = 0 then ValueSome(v * 10) else ValueNone
+        let chosen = AMap.chooseAV (fun _ v -> AVal.constant (choose v)) (CMap.value m)
+
+        for op in ops do
+            applyMapMutation op m
+            let source = AMap.toMap (CMap.value m)
+            let actual = AMap.toMap chosen
+
+            let expected =
+                source |> Map.filter (fun _ v -> v % 2 = 0) |> Map.map (fun _ v -> v * 10)
+
+            if actual <> expected then
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``incremental law: AList chooseAV and chooseiV stay chosen`` () =
+    let prop (ops: int list) =
+        let l = CList.empty<int>
+        let choose = fun x -> if x % 2 = 0 then ValueSome(x * 10) else ValueNone
+
+        // Position-independent mappings: chooseiV's mapping-time positions
+        // stick on shifts (documented semantic), so the index-aware model
+        // only holds for the constant case (see the static law).
+        let chosen = AList.chooseAV (fun x -> AVal.constant (choose x)) (CList.value l)
+        let choseni = AList.chooseiV (fun _ x -> choose x) (CList.value l)
+        let model = ResizeArray<int>()
+
+        for op in ops do
+            applyListMutation op l model
+
+            let source = List.ofSeq model
+            let expected = source |> List.filter (fun x -> x % 2 = 0) |> List.map ((*) 10)
+
+            if AList.toList chosen <> expected then
+                failwithf "chooseAV after %A" op
+
+            if AList.toList choseni <> expected then
+                failwithf "chooseiV after %A" op
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``incremental law: AMap tryMinA and tryMaxA stay correct`` () =
+    let prop (ops: int list) =
+        let m = CMap.empty<int, int>
+        let mapping = fun k v -> AVal.constant (k + v)
+        let min = AMap.tryMinA mapping (CMap.value m)
+        let max = AMap.tryMaxA mapping (CMap.value m)
+
+        for op in ops do
+            applyMapMutation op m
+
+            let mapped = AMap.toMap (CMap.value m) |> Map.toSeq |> Seq.map (fun (k, v) -> k + v)
+
+            let expectedMin =
+                if Seq.isEmpty mapped then
+                    ValueNone
+                else
+                    ValueSome(Seq.min mapped)
+
+            let expectedMax =
+                if Seq.isEmpty mapped then
+                    ValueNone
+                else
+                    ValueSome(Seq.max mapped)
+
+            if AVal.getValue min <> expectedMin then
+                failwithf "tryMinA after %A" op
+
+            if AVal.getValue max <> expectedMax then
+                failwithf "tryMaxA after %A" op
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``AMap chooseA and chooseAV agree`` () =
+    let m = CMap.empty<int, int>
+
+    let opt =
+        AMap.chooseA (fun _ v -> AVal.constant (if v % 2 = 0 then Some(v * 10) else None)) (CMap.value m)
+
+    let vopt =
+        AMap.chooseAV (fun _ v -> AVal.constant (if v % 2 = 0 then ValueSome(v * 10) else ValueNone)) (CMap.value m)
+
+    CMap.addOrUpdate 1 2 m
+    CMap.addOrUpdate 2 3 m
+
+    if AMap.toMap opt <> AMap.toMap vopt then
+        failwithf "init: %A vs %A" (AMap.toMap opt) (AMap.toMap vopt)
+
+    CMap.addOrUpdate 1 5 m
+    CMap.remove 2 m
+
+    if AMap.toMap opt <> AMap.toMap vopt then
+        failwithf "after ops: %A vs %A" (AMap.toMap opt) (AMap.toMap vopt)
 
 // Tail-only reads of 2+ level chains (the stale-count report): the
 // middle transforms are never read, so the tail's version gate must settle

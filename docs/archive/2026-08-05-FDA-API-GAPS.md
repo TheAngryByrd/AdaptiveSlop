@@ -215,6 +215,21 @@ Items resolved since the decisions above were recorded; the resolution wins.
   carrying voption in the same position (`aval<'U voption>` here). AMap has
   no plain `tryMin`/`tryMax`, so no counterparts; `AMap.tryFind` is already
   the adaptive voption form.
+- **voption pairs scan (2026-08-10, second pass)** — the full option/voption
+  pair inventory, resolved:
+  - `choose`/`chooseV` on all three collections: complete (pre-existing).
+  - `choose2`/`choose2V` on AMap: complete (pre-existing).
+  - `chooseA` (option) on all three: `chooseAV` (voption) **added** — the
+    mapping returns `aval<'U voption>` directly, skipping the
+    option-to-voption wrapper node per element (the no-allocation path).
+  - `AList.choosei` (option): `chooseiV` (voption) **added** (was missing).
+  - `AList.chooseiA` (option): `chooseiAV` (voption) **added**.
+  - `AMap.tryMinA`/`tryMaxA` **added** for family symmetry (AMap has no
+    plain `tryMin`/`tryMax`; the members mirror the ASet/AList ones).
+  - `AListSliceExtensions.GetSlice(start: int option, finish: int option)`:
+    **excluded** — F# slice syntax is compiler-mandated `option` (the
+    compiler generates `Option` arguments from `list.[a..b]`); a voption
+    form is not reachable from the syntax. Recorded, not provided.
 - **`AMap.difference`** — our addition (the AMap counterpart of
   `ASet.difference`): **done** — left-only keys on `Choose2MapNode`.
 - **`AMap.joinOn`** — our addition (the map analog of `AVal.map2` with
