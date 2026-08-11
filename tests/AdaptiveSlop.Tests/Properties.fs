@@ -323,6 +323,165 @@ let ``law: AMap reductions over constant sources`` () =
     Check.QuickThrowOnFailure law
 
 [<Fact>]
+let ``law: AMap *A reductions over constant sources`` () =
+    let law (m: Map<int, int>) =
+        let byKey = fun k v -> AVal.constant (k + v)
+        let even = fun _ v -> AVal.constant (v % 2 = 0)
+
+        let actualSum = m |> Map.toSeq |> AMap.ofSeq |> AMap.sumByA byKey |> AVal.getValue
+        let expectedSum = Map.fold (fun s k v -> s + k + v) 0 m
+
+        let actualCount =
+            m |> Map.toSeq |> AMap.ofSeq |> AMap.countByA even |> AVal.getValue
+
+        let expectedCount = m |> Map.filter (fun _ v -> v % 2 = 0) |> Map.count
+        actualSum = expectedSum && actualCount = expectedCount
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: AList *A reductions over constant sources`` () =
+    let law (xs: int list) =
+        let byValue = fun v -> AVal.constant (v * 2)
+        let even = fun v -> AVal.constant (v % 2 = 0)
+
+        let actualSum = xs |> AList.ofSeq |> AList.sumByA byValue |> AVal.getValue
+        let expectedSum = xs |> List.map ((*) 2) |> List.sum
+
+        let actualMin = xs |> AList.ofSeq |> AList.tryMinA byValue |> AVal.getValue
+
+        let expectedMin =
+            if List.isEmpty xs then
+                ValueNone
+            else
+                ValueSome(List.min (List.map ((*) 2) xs))
+
+        let actualCount = xs |> AList.ofSeq |> AList.countByA even |> AVal.getValue
+        let expectedCount = xs |> List.filter (fun v -> v % 2 = 0) |> List.length
+
+        actualSum = expectedSum
+        && actualMin = expectedMin
+        && actualCount = expectedCount
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: ASet tryMinA and tryMaxA over constant sources`` () =
+    let law (s: Set<int>) =
+        let mapping = fun x -> AVal.constant (x * 10)
+
+        let actualMin = s |> ASet.ofSeq |> ASet.tryMinA mapping |> AVal.getValue
+
+        let expectedMin =
+            if Set.isEmpty s then
+                ValueNone
+            else
+                ValueSome(Set.minElement s * 10)
+
+        let actualMax = s |> ASet.ofSeq |> ASet.tryMaxA mapping |> AVal.getValue
+
+        let expectedMax =
+            if Set.isEmpty s then
+                ValueNone
+            else
+                ValueSome(Set.maxElement s * 10)
+
+        actualMin = expectedMin && actualMax = expectedMax
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: ASet chooseAV selects (voption form)`` () =
+    let law (s: Set<int>) =
+        let choose = fun x -> if x % 2 = 0 then ValueSome(x * 10) else ValueNone
+
+        let actual =
+            s
+            |> ASet.ofSeq
+            |> ASet.chooseAV (fun x -> AVal.constant (choose x))
+            |> ASet.toSet
+
+        let expected = s |> Set.filter (fun x -> x % 2 = 0) |> Set.map ((*) 10)
+        actual = expected
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: AMap chooseAV selects (voption form)`` () =
+    let law (m: Map<int, int>) =
+        let choose = fun v -> if v % 2 = 0 then ValueSome(v * 10) else ValueNone
+
+        let actual =
+            m
+            |> Map.toSeq
+            |> AMap.ofSeq
+            |> AMap.chooseAV (fun _ v -> AVal.constant (choose v))
+            |> AMap.toMap
+
+        let expected = m |> Map.filter (fun _ v -> v % 2 = 0) |> Map.map (fun _ v -> v * 10)
+        actual = expected
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: AList chooseAV and chooseiV select (voption forms)`` () =
+    let law (xs: int list) =
+        let choose = fun x -> if x % 2 = 0 then ValueSome(x * 10) else ValueNone
+
+        let actualAV =
+            xs
+            |> AList.ofSeq
+            |> AList.chooseAV (fun x -> AVal.constant (choose x))
+            |> AList.toList
+
+        let expectedAV = xs |> List.filter (fun x -> x % 2 = 0) |> List.map ((*) 10)
+
+        // The index-aware form on a constant list maps at the final positions.
+        let actualiV =
+            xs
+            |> AList.ofSeq
+            |> AList.chooseiV (fun i x -> if i % 2 = 0 then choose x else ValueNone)
+            |> AList.toList
+
+        let expectediV =
+            xs
+            |> List.mapi (fun i x -> if i % 2 = 0 then choose x else ValueNone)
+            |> List.filter ValueOption.isSome
+            |> List.map ValueOption.get
+
+        actualAV = expectedAV && actualiV = expectediV
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: AMap tryMinA and tryMaxA over constant sources`` () =
+    let law (m: Map<int, int>) =
+        let mapping = fun k v -> AVal.constant (k + v)
+        let mapped = m |> Map.toSeq |> Seq.map (fun (k, v) -> k + v)
+
+        let actualMin =
+            m |> Map.toSeq |> AMap.ofSeq |> AMap.tryMinA mapping |> AVal.getValue
+
+        let actualMax =
+            m |> Map.toSeq |> AMap.ofSeq |> AMap.tryMaxA mapping |> AVal.getValue
+
+        let expectedMin =
+            if Seq.isEmpty mapped then
+                ValueNone
+            else
+                ValueSome(Seq.min mapped)
+
+        let expectedMax =
+            if Seq.isEmpty mapped then
+                ValueNone
+            else
+                ValueSome(Seq.max mapped)
+
+        actualMin = expectedMin && actualMax = expectedMax
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
 let ``law: ASet mapA with constants maps`` () =
     let law (s: Set<int>) =
         let actual =
@@ -345,6 +504,18 @@ let ``law: AMap mapV and filter preserve content`` () =
 
         let expectedFiltered = m |> Map.filter (fun _ v -> v % 2 = 0)
         actualMapped = expectedMapped && actualFiltered = expectedFiltered
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``law: AMap difference keeps left-only keys`` () =
+    let law (m: Map<int, int>, n: Map<int, int>) =
+        let actual =
+            AMap.difference (AMap.ofSeq (Map.toSeq m)) (AMap.ofSeq (Map.toSeq n))
+            |> AMap.toMap
+
+        let expected = m |> Map.filter (fun k _ -> not (Map.containsKey k n))
+        actual = expected
 
     Check.QuickThrowOnFailure law
 
@@ -869,7 +1040,228 @@ let ``incremental law: AMap fold stays correct`` () =
 
     Check.QuickThrowOnFailure prop
 
-// Tail-only reads of 2+ level chains (the Defli stale-count report): the
+[<Fact>]
+let ``incremental law: AMap *A reductions stay correct`` () =
+    let prop (ops: int list) =
+        let m = CMap.empty<int, int>
+        let even = fun _ v -> AVal.constant (v % 2 = 0)
+        let byKey = fun k v -> AVal.constant (float (k + v)) // DivideByInt types: float
+
+        let countEvens = AMap.countByA even (CMap.value m)
+        let existsEvens = AMap.existsA even (CMap.value m)
+        let forallEvens = AMap.forallA even (CMap.value m)
+        let sum = AMap.sumByA byKey (CMap.value m)
+        let average = AMap.averageByA byKey (CMap.value m)
+
+        for op in ops do
+            applyMapMutation op m
+
+            let source = AMap.toMap (CMap.value m)
+            let expectedCount = source |> Map.filter (fun _ v -> v % 2 = 0) |> Map.count
+            let expectedSum = Map.fold (fun s k v -> s + float (k + v)) 0.0 source
+
+            // DivideByInt on an empty map is NaN; compare NaN-aware.
+            let expectedAverage = expectedSum / float (Map.count source)
+            let actualAverage = AVal.getValue average
+
+            if AVal.getValue countEvens <> expectedCount then
+                failwithf "countByA after %A" op
+
+            if AVal.getValue existsEvens <> (expectedCount > 0) then
+                failwithf "existsA after %A" op
+
+            if AVal.getValue forallEvens <> (expectedCount = Map.count source) then
+                failwithf "forallA after %A" op
+
+            if AVal.getValue sum <> expectedSum then
+                failwithf "sumByA after %A" op
+
+            if
+                not (
+                    (Double.IsNaN actualAverage && Double.IsNaN expectedAverage)
+                    || actualAverage = expectedAverage
+                )
+            then
+                failwithf "averageByA after %A: %A vs %A" op actualAverage expectedAverage
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``incremental law: AList *A reductions stay correct`` () =
+    let prop (ops: int list) =
+        let l = CList.empty<int>
+        let even = fun v -> AVal.constant (v % 2 = 0)
+        let byValue = fun v -> AVal.constant (v * 2)
+
+        let countEvens = AList.countByA even (CList.value l)
+        let existsEvens = AList.existsA even (CList.value l)
+        let forallEvens = AList.forallA even (CList.value l)
+        let sum = AList.sumByA byValue (CList.value l)
+        let min = AList.tryMinA byValue (CList.value l)
+        let max = AList.tryMaxA byValue (CList.value l)
+        let model = ResizeArray<int>()
+
+        for op in ops do
+            applyListMutation op l model
+
+            let source = List.ofSeq model
+            let mapped = source |> List.map ((*) 2)
+            let expectedCount = source |> List.filter (fun v -> v % 2 = 0) |> List.length
+            let expectedSum = mapped |> List.sum
+
+            let expectedMin =
+                if List.isEmpty mapped then
+                    ValueNone
+                else
+                    ValueSome(List.min mapped)
+
+            let expectedMax =
+                if List.isEmpty mapped then
+                    ValueNone
+                else
+                    ValueSome(List.max mapped)
+
+            if AVal.getValue countEvens <> expectedCount then
+                failwithf "countByA after %A" op
+
+            if AVal.getValue existsEvens <> (expectedCount > 0) then
+                failwithf "existsA after %A" op
+
+            if AVal.getValue forallEvens <> (expectedCount = List.length source) then
+                failwithf "forallA after %A" op
+
+            if AVal.getValue sum <> expectedSum then
+                failwithf "sumByA after %A" op
+
+            if AVal.getValue min <> expectedMin then
+                failwithf "tryMinA after %A" op
+
+            if AVal.getValue max <> expectedMax then
+                failwithf "tryMaxA after %A" op
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``incremental law: ASet chooseAV stays chosen`` () =
+    let prop (ops: int list) =
+        let s = CSet.empty<int>
+        let choose = fun x -> if x % 2 = 0 then ValueSome(x * 10) else ValueNone
+        let chosen = ASet.chooseAV (fun x -> AVal.constant (choose x)) (CSet.value s)
+
+        for op in ops do
+            applySetMutation op s
+            let source = Set.ofSeq (ASet.toSet (CSet.value s))
+            let actual = ASet.toSet chosen
+            let expected = source |> Set.filter (fun x -> x % 2 = 0) |> Set.map ((*) 10)
+
+            if actual <> expected then
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``incremental law: AMap chooseAV stays chosen`` () =
+    let prop (ops: int list) =
+        let m = CMap.empty<int, int>
+        let choose = fun v -> if v % 2 = 0 then ValueSome(v * 10) else ValueNone
+        let chosen = AMap.chooseAV (fun _ v -> AVal.constant (choose v)) (CMap.value m)
+
+        for op in ops do
+            applyMapMutation op m
+            let source = AMap.toMap (CMap.value m)
+            let actual = AMap.toMap chosen
+
+            let expected =
+                source |> Map.filter (fun _ v -> v % 2 = 0) |> Map.map (fun _ v -> v * 10)
+
+            if actual <> expected then
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``incremental law: AList chooseAV and chooseiV stay chosen`` () =
+    let prop (ops: int list) =
+        let l = CList.empty<int>
+        let choose = fun x -> if x % 2 = 0 then ValueSome(x * 10) else ValueNone
+
+        // Position-independent mappings: chooseiV's mapping-time positions
+        // stick on shifts (documented semantic), so the index-aware model
+        // only holds for the constant case (see the static law).
+        let chosen = AList.chooseAV (fun x -> AVal.constant (choose x)) (CList.value l)
+        let choseni = AList.chooseiV (fun _ x -> choose x) (CList.value l)
+        let model = ResizeArray<int>()
+
+        for op in ops do
+            applyListMutation op l model
+
+            let source = List.ofSeq model
+            let expected = source |> List.filter (fun x -> x % 2 = 0) |> List.map ((*) 10)
+
+            if AList.toList chosen <> expected then
+                failwithf "chooseAV after %A" op
+
+            if AList.toList choseni <> expected then
+                failwithf "chooseiV after %A" op
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``incremental law: AMap tryMinA and tryMaxA stay correct`` () =
+    let prop (ops: int list) =
+        let m = CMap.empty<int, int>
+        let mapping = fun k v -> AVal.constant (k + v)
+        let min = AMap.tryMinA mapping (CMap.value m)
+        let max = AMap.tryMaxA mapping (CMap.value m)
+
+        for op in ops do
+            applyMapMutation op m
+
+            let mapped = AMap.toMap (CMap.value m) |> Map.toSeq |> Seq.map (fun (k, v) -> k + v)
+
+            let expectedMin =
+                if Seq.isEmpty mapped then
+                    ValueNone
+                else
+                    ValueSome(Seq.min mapped)
+
+            let expectedMax =
+                if Seq.isEmpty mapped then
+                    ValueNone
+                else
+                    ValueSome(Seq.max mapped)
+
+            if AVal.getValue min <> expectedMin then
+                failwithf "tryMinA after %A" op
+
+            if AVal.getValue max <> expectedMax then
+                failwithf "tryMaxA after %A" op
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``AMap chooseA and chooseAV agree`` () =
+    let m = CMap.empty<int, int>
+
+    let opt =
+        AMap.chooseA (fun _ v -> AVal.constant (if v % 2 = 0 then Some(v * 10) else None)) (CMap.value m)
+
+    let vopt =
+        AMap.chooseAV (fun _ v -> AVal.constant (if v % 2 = 0 then ValueSome(v * 10) else ValueNone)) (CMap.value m)
+
+    CMap.addOrUpdate 1 2 m
+    CMap.addOrUpdate 2 3 m
+
+    if AMap.toMap opt <> AMap.toMap vopt then
+        failwithf "init: %A vs %A" (AMap.toMap opt) (AMap.toMap vopt)
+
+    CMap.addOrUpdate 1 5 m
+    CMap.remove 2 m
+
+    if AMap.toMap opt <> AMap.toMap vopt then
+        failwithf "after ops: %A vs %A" (AMap.toMap opt) (AMap.toMap vopt)
+
+// Tail-only reads of 2+ level chains (the stale-count report): the
 // middle transforms are never read, so the tail's version gate must settle
 // the whole chain from its own read. The oracle reads the changeable source
 // only; it never touches the middle transforms.
@@ -1968,6 +2360,503 @@ let ``AMap join choose2V with mapA matches the model`` () =
                 failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
 
     Check.One(scenarioConfig, prop)
+
+[<Fact>]
+let ``AMap joinOn matches the model under both-side mutation`` () =
+    let prop (sc: JoinScenario) =
+        let left = CMap.empty<int, int>
+        let right = CMap.empty<int, int>
+
+        for (k, v) in sc.initialA do
+            CMap.addOrUpdate k v left
+
+        for (k, v) in sc.initialB do
+            CMap.addOrUpdate k v right
+
+        let joined =
+            AMap.joinOn (CMap.value left) (CMap.value right) (fun _ v -> v % 7) (fun  // join key from the value: updates churn the key
+                                                                                     _
+                                                                                     lV
+                                                                                     rV ->
+                AVal.map2
+                    (fun l r ->
+                        match r with
+                        | ValueSome rv -> ValueSome(l + rv)
+                        | ValueNone -> ValueNone) // inner join: drop on a missing right side
+                    lV
+                    rV)
+
+        let modelA = Dictionary<int, int>()
+        let modelB = Dictionary<int, int>()
+
+        for (k, v) in sc.initialA do
+            modelA[k] <- v
+
+        for (k, v) in sc.initialB do
+            modelB[k] <- v
+
+        let apply (op: JoinOp) =
+            match op with
+            | LeftEdit(Upsert(key, value)) ->
+                CMap.addOrUpdate key value left
+                modelA[key] <- value
+            | LeftEdit(MapOp.Remove key) ->
+                CMap.remove key left
+                modelA.Remove key |> ignore
+            | LeftEdit(MapOp.SetValue _) -> ()
+            | RightEdit(Upsert(key, value)) ->
+                CMap.addOrUpdate key value right
+                modelB[key] <- value
+            | RightEdit(MapOp.Remove key) ->
+                CMap.remove key right
+                modelB.Remove key |> ignore
+            | RightEdit(MapOp.SetValue _) -> ()
+
+        for op in sc.ops do
+            apply op
+
+            let actual = AMap.toMap joined
+
+            let expected =
+                Map.ofSeq (
+                    seq {
+                        for KeyValue(k, a) in modelA do
+                            match modelB.TryGetValue(a % 7) with
+                            | true, b -> k, a + b
+                            | false, _ -> ()
+                    }
+                )
+
+            if actual <> expected then
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
+
+    Check.One(scenarioConfig, prop)
+
+[<Fact>]
+let ``AMap difference matches the model under both-side mutation`` () =
+    let prop (sc: JoinScenario) =
+        let left = CMap.empty<int, int>
+        let right = CMap.empty<int, int>
+
+        for (k, v) in sc.initialA do
+            CMap.addOrUpdate k v left
+
+        for (k, v) in sc.initialB do
+            CMap.addOrUpdate k v right
+
+        let diff = AMap.difference (CMap.value left) (CMap.value right)
+        let modelA = Dictionary<int, int>()
+        let modelB = Dictionary<int, int>()
+
+        for (k, v) in sc.initialA do
+            modelA[k] <- v
+
+        for (k, v) in sc.initialB do
+            modelB[k] <- v
+
+        let apply (op: JoinOp) =
+            match op with
+            | LeftEdit(Upsert(key, value)) ->
+                CMap.addOrUpdate key value left
+                modelA[key] <- value
+            | LeftEdit(MapOp.Remove key) ->
+                CMap.remove key left
+                modelA.Remove key |> ignore
+            | LeftEdit(MapOp.SetValue _) -> ()
+            | RightEdit(Upsert(key, value)) ->
+                CMap.addOrUpdate key value right
+                modelB[key] <- value
+            | RightEdit(MapOp.Remove key) ->
+                CMap.remove key right
+                modelB.Remove key |> ignore
+            | RightEdit(MapOp.SetValue _) -> ()
+
+        for op in sc.ops do
+            apply op
+
+            let actual = AMap.toMap diff
+
+            let expected =
+                Map.ofSeq (
+                    seq {
+                        for KeyValue(k, v) in modelA do
+                            if not (modelB.ContainsKey k) then
+                                k, v
+                    }
+                )
+
+            if actual <> expected then
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
+
+    Check.One(scenarioConfig, prop)
+
+[<Fact>]
+let ``AMap *A reductions follow adaptive predicates`` () =
+    let m = CMap.empty<int, int>
+    let threshold = CVal.create 50
+    CMap.addOrUpdate 1 10 m
+    CMap.addOrUpdate 2 60 m
+    CMap.addOrUpdate 3 90 m
+
+    let over =
+        AMap.countByA (fun _ v -> AVal.map (fun t -> v > t) (CVal.value threshold)) (CMap.value m)
+
+    let sum =
+        AMap.sumByA (fun _ v -> AVal.map (fun t -> v + t) (CVal.value threshold)) (CMap.value m)
+
+    if AVal.getValue over <> 2 then
+        failwithf "over 50: %d" (AVal.getValue over)
+
+    if AVal.getValue sum <> 310 then
+        failwithf "sum with 50: %d" (AVal.getValue sum)
+
+    CVal.set 80 threshold
+
+    if AVal.getValue over <> 1 then
+        failwithf "over 80: %d" (AVal.getValue over)
+
+    if AVal.getValue sum <> 400 then
+        failwithf "sum with 80: %d" (AVal.getValue sum)
+
+[<Fact>]
+let ``AMap groupBy groups by the computed key`` () =
+    let law (m: Map<int, int>) =
+        let materialize (g: amap<int, amap<int, int>>) =
+            AMap.toMap g |> Map.map (fun _ child -> AMap.toMap child)
+
+        let actual =
+            AMap.ofSeq (Map.toSeq m) |> AMap.groupBy (fun _ v -> v % 3) |> materialize
+
+        let expected =
+            Map.toSeq m
+            |> Seq.groupBy (fun (_, v) -> v % 3)
+            |> Seq.map (fun (g, xs) -> g, Map.ofSeq xs)
+            |> Map.ofSeq
+
+        actual = expected
+
+    Check.QuickThrowOnFailure law
+
+[<Fact>]
+let ``incremental law: AMap groupBy stays grouped`` () =
+    let prop (ops: int list) =
+        let materialize (g: amap<int, amap<int, int>>) =
+            AMap.toMap g |> Map.map (fun _ child -> AMap.toMap child)
+
+        let m = CMap.empty<int, int>
+        let grouped = AMap.groupBy (fun _ v -> v % 3) (CMap.value m)
+
+        for op in ops do
+            applyMapMutation op m
+
+            let source = AMap.toMap (CMap.value m)
+            let actual = materialize grouped
+
+            let expected =
+                Map.toSeq source
+                |> Seq.groupBy (fun (_, v) -> v % 3)
+                |> Seq.map (fun (g, xs) -> g, Map.ofSeq xs)
+                |> Map.ofSeq
+
+            if actual <> expected then
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
+
+    Check.QuickThrowOnFailure prop
+
+[<Fact>]
+let ``AMap groupBy moves entries between groups and drops empty groups`` () =
+    let materialize (g: amap<int, amap<int, int>>) =
+        AMap.toMap g |> Map.map (fun _ child -> AMap.toMap child)
+
+    let m = CMap.empty<int, int>
+    let grouped = AMap.groupBy (fun _ v -> v % 3) (CMap.value m)
+
+    CMap.addOrUpdate 1 1 m // group 1
+    CMap.addOrUpdate 2 2 m // group 2
+    CMap.addOrUpdate 3 6 m // group 0
+    let v1 = materialize grouped
+
+    if
+        v1
+        <> Map.ofList [ 0, Map.ofList [ 3, 6 ]; 1, Map.ofList [ 1, 1 ]; 2, Map.ofList [ 2, 2 ] ]
+    then
+        failwithf "init: %A" v1
+
+    CMap.addOrUpdate 1 3 m // move key 1: group 1 -> 0; group 1 becomes empty and disappears
+    let v2 = materialize grouped
+
+    if v2 <> Map.ofList [ 0, Map.ofList [ 1, 3; 3, 6 ]; 2, Map.ofList [ 2, 2 ] ] then
+        failwithf "move: %A" v2
+
+    CMap.remove 3 m // group 0 loses 3 but keeps 1
+    let v3 = materialize grouped
+
+    if v3 <> Map.ofList [ 0, Map.ofList [ 1, 3 ]; 2, Map.ofList [ 2, 2 ] ] then
+        failwithf "remove member: %A" v3
+
+    CMap.remove 1 m // group 0 becomes empty and disappears; group 2 remains
+    let v4 = materialize grouped
+
+    if v4 <> Map.ofList [ 2, Map.ofList [ 2, 2 ] ] then
+        failwithf "after group 0 drops: %A" v4
+
+    CMap.remove 2 m // the last group disappears: nothing left
+    let v5 = materialize grouped
+
+    if not v5.IsEmpty then
+        failwithf "all gone: %A" v5
+
+[<Fact>]
+let ``AMap groupBy feeds adaptive consumers per group`` () =
+    let m = CMap.empty<int, int>
+    let grouped = AMap.groupBy (fun _ v -> v % 2) (CMap.value m)
+    let counts = AMap.mapA (fun _ g -> AMap.count g) grouped
+
+    CMap.addOrUpdate 1 1 m // group 1
+    CMap.addOrUpdate 2 2 m // group 0
+    let c1 = AMap.toMap counts
+
+    if c1 <> Map.ofList [ 0, 1; 1, 1 ] then
+        failwithf "counts init: %A" c1
+
+    CMap.addOrUpdate 3 4 m // group 0 grows
+    let c2 = AMap.toMap counts
+
+    if c2 <> Map.ofList [ 0, 2; 1, 1 ] then
+        failwithf "counts grow: %A" c2
+
+    CMap.remove 1 m // group 1 empty: the group key disappears from the output
+    let c3 = AMap.toMap counts
+
+    if c3 <> Map.ofList [ 0, 2 ] then
+        failwithf "counts drop: %A" c3
+
+    CMap.addOrUpdate 1 5 m // group 1 reappears with the new member
+    let c4 = AMap.toMap counts
+
+    if c4 <> Map.ofList [ 0, 2; 1, 1 ] then
+        failwithf "counts reappear: %A" c4
+
+[<Fact>]
+let ``AMap joinOn builds each key's subgraph once and swaps inputs in place`` () =
+    let left = CMap.empty<int, int>
+    let right = CMap.empty<int, int>
+    CMap.addOrUpdate 0 100 right
+    let mutable calls = 0
+
+    let joined =
+        AMap.joinOn (CMap.value left) (CMap.value right) (fun _ _ -> 0) (fun  // stable join key: the swap path is the hot path
+                                                                             _
+                                                                             lV
+                                                                             rV ->
+            calls <- calls + 1
+
+            AVal.map2
+                (fun l r ->
+                    match r with
+                    | ValueSome rv -> ValueSome(l + rv)
+                    | ValueNone -> ValueNone)
+                lV
+                rV)
+
+    CMap.addOrUpdate 1 10 left
+    let v1 = AMap.toMap joined
+    let callsAfterInit = calls
+
+    CMap.addOrUpdate 1 11 left // in-place swap: no mapping re-run
+    let v2 = AMap.toMap joined
+    let callsAfterUpdate = calls
+
+    AMap.toMap joined |> ignore // clean re-read: nothing runs
+    let callsAfterClean = calls
+
+    CMap.remove 1 left // removal drops the entry and its subgraph
+    let v3 = AMap.toMap joined
+    CMap.addOrUpdate 2 12 left // new key: the mapping runs again
+    let v4 = AMap.toMap joined
+    let callsAfterReadd = calls
+
+    if v1 <> Map.ofList [ 1, 110 ] then
+        failwithf "init: %A" v1
+
+    if v2 <> Map.ofList [ 1, 111 ] then
+        failwithf "update: %A" v2
+
+    if callsAfterInit <> 1 || callsAfterUpdate <> 1 || callsAfterClean <> 1 then
+        failwithf "mapping re-ran: init=%d update=%d clean=%d" callsAfterInit callsAfterUpdate callsAfterClean
+
+    if not v3.IsEmpty then
+        failwithf "removal: %A" v3
+
+    if v4 <> Map.ofList [ 2, 112 ] then
+        failwithf "re-add: %A" v4
+
+    if callsAfterReadd <> 2 then
+        failwithf "re-add did not rebuild: %d" callsAfterReadd
+
+[<Fact>]
+let ``AMap joinOn regression: add-then-remove and remove-then-add between reads`` () =
+    let left = CMap.empty<int, int>
+    let right = CMap.empty<int, int>
+    CMap.addOrUpdate 0 100 right
+
+    let joined =
+        AMap.joinOn (CMap.value left) (CMap.value right) (fun _ _ -> 0) (fun _ lV rV ->
+            AVal.map2 (fun l r -> ValueSome(l + (r |> ValueOption.defaultValue 0))) lV rV)
+
+    // Add-then-remove between reads: the journal nets to nothing.
+    CMap.addOrUpdate 1 10 left
+    CMap.remove 1 left
+    let afterNet = AMap.toMap joined
+
+    if not afterNet.IsEmpty then
+        failwithf "add-then-remove: %A" afterNet
+
+    // Remove-then-add: the entry must be present with the last value.
+    CMap.addOrUpdate 1 10 left
+    CMap.remove 1 left
+    CMap.addOrUpdate 1 11 left
+    let afterReadd = AMap.toMap joined
+
+    if afterReadd <> Map.ofList [ 1, 111 ] then
+        failwithf "remove-then-add: %A" afterReadd
+
+    // Update-then-remove: nothing remains.
+    CMap.addOrUpdate 1 12 left
+    CMap.remove 1 left
+    let afterUpdateRemove = AMap.toMap joined
+
+    if not afterUpdateRemove.IsEmpty then
+        failwithf "update-then-remove: %A" afterUpdateRemove
+
+[<Fact>]
+let ``AMap joinOn re-joins when the join key changes`` () =
+    let left = CMap.empty<int, int>
+    let right = CMap.empty<int, int>
+    CMap.addOrUpdate 1 100 right // join key 1 only; join key 0 is missing until the catch-up
+
+    let joined =
+        AMap.joinOn (CMap.value left) (CMap.value right) (fun _ v -> v % 7) (fun  // value 1 -> key 1; value 8 -> key 1; value 14 -> key 0
+                                                                                 _
+                                                                                 lV
+                                                                                 rV ->
+            AVal.map2
+                (fun l r ->
+                    match r with
+                    | ValueSome rv -> ValueSome(l + rv)
+                    | ValueNone -> ValueNone)
+                lV
+                rV)
+
+    CMap.addOrUpdate 1 1 left // join key 1: 1 + 100
+    let v1 = AMap.toMap joined
+    CMap.addOrUpdate 1 8 left // join key still 1: swap path, 8 + 100
+    let v2 = AMap.toMap joined
+    CMap.addOrUpdate 1 14 left // join key 0: right missing -> dropped
+    let v3 = AMap.toMap joined
+    CMap.addOrUpdate 0 21 right // right catch-up: the entry re-joins via the scan
+    let v4 = AMap.toMap joined
+    CMap.addOrUpdate 1 1 left // back to join key 1: re-point, 1 + 100
+    let v5 = AMap.toMap joined
+
+    if v1 <> Map.ofList [ 1, 101 ] then
+        failwithf "init: %A" v1
+
+    if v2 <> Map.ofList [ 1, 108 ] then
+        failwithf "same-key update: %A" v2
+
+    if not v3.IsEmpty then
+        failwithf "key change to missing: %A" v3
+
+    if v4 <> Map.ofList [ 1, 35 ] then
+        failwithf "right catch-up: %A" v4
+
+    if v5 <> Map.ofList [ 1, 101 ] then
+        failwithf "key change back: %A" v5
+
+[<Fact>]
+let ``AMap joinOn defers transaction writes until commit`` () =
+    let left = CMap.empty<int, int>
+    let right = CMap.empty<int, int>
+    CMap.addOrUpdate 0 100 right
+    CMap.addOrUpdate 1 10 left
+
+    let joined =
+        AMap.joinOn (CMap.value left) (CMap.value right) (fun _ _ -> 0) (fun _ lV rV ->
+            AVal.map2 (fun l r -> ValueSome(l + (r |> ValueOption.defaultValue 0))) lV rV)
+
+    let before = AMap.toMap joined
+
+    let inside =
+        Transaction.run (fun () ->
+            CMap.addOrUpdate 1 20 left
+            AMap.toMap joined) // reads inside see pre-transaction values
+
+    let after = AMap.toMap joined
+
+    if before <> Map.ofList [ 1, 110 ] then
+        failwithf "before: %A" before
+
+    if inside <> Map.ofList [ 1, 110 ] then
+        failwithf "inside: %A" inside
+
+    if after <> Map.ofList [ 1, 120 ] then
+        failwithf "after: %A" after
+
+[<Fact>]
+let ``AMap joinOn composes into a 3-way join`` () =
+    // The 3-way join shape: left entries -> (middle row) -> (outer row),
+    // with the middle map's values updating every iteration.
+    let left = CMap.empty<int, int> // left id -> middle key
+    let middle = CMap.empty<int, int> // middle key -> value
+    let outer = CMap.empty<int, int> // middle key -> outer id
+
+    CMap.addOrUpdate 1 10 middle
+    CMap.addOrUpdate 1 7 outer
+    CMap.addOrUpdate 5 1 left // left 5 points at middle key 1
+
+    let join1 =
+        AMap.joinOn
+            left // left: id -> middle key
+            middle // middle: key -> value
+            (fun _ key -> key) // join key: the middle key from the left value
+            (fun _ keyV valueV -> AVal.map2 (fun t p -> ValueSome(struct (t, p))) keyV valueV)
+
+    let joinedRows =
+        AMap.joinOn join1 outer (fun _ struct (key, _) -> key) (fun  // join key: the middle key carried by the first join
+                                                                    _
+                                                                    structV
+                                                                    outerV ->
+            AVal.map2
+                (fun struct (key, value) c ->
+                    match c with
+                    | ValueSome cid -> ValueSome(struct (value, cid))
+                    | ValueNone -> ValueNone)
+                structV
+                outerV)
+
+    let v1 = AMap.toMap joinedRows
+
+    if v1 <> Map.ofList [ 5, struct (ValueSome 10, 7) ] then
+        failwithf "init: %A" v1
+
+    CMap.addOrUpdate 1 11 middle // per-iteration value update flows through both joins
+    let v2 = AMap.toMap joinedRows
+
+    if v2 <> Map.ofList [ 5, struct (ValueSome 11, 7) ] then
+        failwithf "value update: %A" v2
+
+    CMap.remove 1 middle // missing middle row: the second join keeps the row (outer still resolves)
+    let v3 = AMap.toMap joinedRows
+
+    if v3 <> Map.ofList [ 5, struct (ValueNone, 7) ] then
+        failwithf "middle removed: %A" v3
+
+    CMap.remove 1 outer // outer gone: the innermost join drops the row
+    let v4 = AMap.toMap joinedRows
+
+    if not v4.IsEmpty then
+        failwithf "outer removed: %A" v4
 
 [<Fact>]
 let ``AMap mapA with cross-map lookup matches the model`` () =

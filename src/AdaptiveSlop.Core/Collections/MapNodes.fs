@@ -1740,3 +1740,287 @@ type MapCountNode<'K, 'V, 'Out when 'K: equality>(source: IAdaptiveMap<'K, 'V>, 
         member this.Dispose() =
             if not disposed then
                 disposed <- true
+
+// =============================================================================
+// The groupBy node family (docs/2026-08-10-JOIN-DESIGN.md)
+//
+// AMap.groupBy — every group is a live adaptive map (a GroupMapChildNode)
+// owned by the GroupByMapNode. The groupBy drain routes source deltas into
+// the children by computed group key; the children deliver their own deltas
+// to their own consumers. A group disappears when it becomes empty (removed
+// at the next drain). A key whose value changes group is moved (removed from
+// the old child, added to the new one): the per-key group is tracked in a
+// memberGroup map, because a remove delta carries no value to compute the
+// group from.
+// =============================================================================
+
+/// <summary>
+/// A live per-group map (the value of a <c>AMap.groupBy</c> output entry).
+/// The owning <see cref="GroupByMapNode&lt;'K,'V,'G&gt;"/> is its only
+/// writer: it applies one set/remove entry at a time (equal-value elision)
+/// and delivers the delta to its own consumers. The node is garbage
+/// collected with its group (weak sink references, no manual disposal).
+/// </summary>
+type internal GroupMapChildNode<'K, 'V when 'K: equality>() =
+    let mutable data = Dictionary<'K, 'V>()
+    let mutable version = 0L
+    let mutable sinks = SinkList.Create()
+    let mutable out = MapDelta<'K, 'V>.Create()
+    let mutable disposed = false
+
+    member _.Count = data.Count
+
+    /// Apply one set entry (equal-value elision) and deliver the delta.
+    member internal this.ApplySetOne(k: 'K, v: 'V) =
+        if not disposed then
+            out.Clear()
+            let mutable old = Unchecked.defaultof<'V>
+
+            if not (data.TryGetValue(k, &old) && EqualityComparer<'V>.Default.Equals(old, v)) then
+                data[k] <- v
+                out.Sets <- Collections.bufferAppend out.Sets (struct (k, v))
+
+            if not out.IsEmpty then
+                version <- version + 1L
+                Collections.pushMapDelta &sinks out
+                GraphContext.Default.BumpWriteGeneration()
+
+    /// Apply one remove entry and deliver the delta.
+    member internal this.ApplyRemOne(k: 'K) =
+        if not disposed then
+            out.Clear()
+
+            if data.Remove k then
+                out.Rems <- Collections.bufferAppend out.Rems k
+
+            if not out.IsEmpty then
+                version <- version + 1L
+                Collections.pushMapDelta &sinks out
+                GraphContext.Default.BumpWriteGeneration()
+
+    interface IAdaptiveMap<'K, 'V> with
+        member this.GetValue() =
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
+
+            try
+                if disposed then
+                    invalidOp "This adaptive map has been disposed."
+
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                data :> IReadOnlyDictionary<'K, 'V>
+            finally
+                ctx.ReleaseOwner()
+
+        member _.Version = version
+
+    interface IMapSinkRegistry with
+        member this.AddMapSink(sink) = Collections.addSink &sinks sink
+
+        member this.RemoveMapSink(sink) = Collections.removeSink &sinks sink
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                Collections.clearSinks &sinks
+
+/// <summary>
+/// Groups the entries of an adaptive map by a computed key (the node behind
+/// <c>AMap.groupBy</c>). The output entries are live adaptive maps
+/// (<see cref="GroupMapChildNode&lt;'K,'V&gt;"/>); group-content changes
+/// reach the consumers through the children (their deltas and versions), so
+/// the output map's version moves only for group add/remove. A group
+/// disappears when it becomes empty (removed at the next drain); a key whose
+/// value changes group is moved between children.
+/// </summary>
+type GroupByMapNode<'K, 'V, 'G when 'K: equality and 'G: equality>
+    (source: IAdaptiveMap<'K, 'V>, [<InlineIfLambda>] keyOf: 'K -> 'V -> 'G) =
+    let mutable journal = MapDelta<'K, 'V>.Create()
+    let mutable output = Dictionary<'G, amap<'K, 'V>>()
+    let mutable groups = Dictionary<'G, GroupMapChildNode<'K, 'V>>()
+    let mutable memberGroup = Dictionary<'K, 'G>()
+    let mutable out = MapDelta<'G, amap<'K, 'V>>.Create()
+    let mutable sinks = SinkList.Create()
+    let mutable version = 0L
+    let mutable depVersion = 0L
+    let mutable initialized = false
+    let mutable disposed = false
+
+    member private this.Register() =
+        match box source with
+        | :? IMapSinkRegistry as r -> r.AddMapSink(box (this :> IMapDeltaSink<'K, 'V>))
+        | _ -> ()
+
+    member private this.Unregister() =
+        match box source with
+        | :? IMapSinkRegistry as r -> r.RemoveMapSink(box (this :> IMapDeltaSink<'K, 'V>))
+        | _ -> ()
+
+    member private this.GetChild(g: 'G) =
+        let mutable child = Unchecked.defaultof<GroupMapChildNode<'K, 'V>>
+
+        if not (groups.TryGetValue(g, &child)) then
+            child <- new GroupMapChildNode<'K, 'V>()
+            groups[g] <- child
+
+        child
+
+    /// Drop a group that became empty: the child dies with the group (its
+    /// consumers' entries are removed by the output rem delta).
+    member private this.DropGroupIfEmpty(g: 'G, child: GroupMapChildNode<'K, 'V>) =
+        if child.Count = 0 then
+            groups.Remove g |> ignore
+            output.Remove g |> ignore
+            out.Rems <- Collections.bufferAppend out.Rems g
+
+    member private this.ApplySet(k: 'K, v: 'V) =
+        let newG = keyOf k v
+        let mutable oldG = Unchecked.defaultof<'G>
+
+        if memberGroup.TryGetValue(k, &oldG) then
+            if oldG <> newG then
+                // Group move: remove from the old child, add to the new one.
+                let oldChild = groups[oldG]
+                oldChild.ApplyRemOne k
+                this.DropGroupIfEmpty(oldG, oldChild)
+
+        // The key's current group, both on creation and on a move.
+        memberGroup[k] <- newG
+
+        let wasNew = not (output.ContainsKey newG)
+        let child = this.GetChild newG
+
+        if wasNew then
+            output[newG] <- child
+
+        child.ApplySetOne(k, v)
+
+        if wasNew then
+            out.Sets <- Collections.bufferAppend out.Sets (struct (newG, (child :> amap<'K, 'V>)))
+
+    member private this.ApplyRem(k: 'K) =
+        let mutable g = Unchecked.defaultof<'G>
+
+        if memberGroup.TryGetValue(k, &g) then
+            memberGroup.Remove k |> ignore
+            let child = groups[g]
+            child.ApplyRemOne k
+            this.DropGroupIfEmpty(g, child)
+
+    member private this.EnsureInitialized() =
+        if not initialized then
+            // Snapshot first, register between, then load (see ElementSetNode).
+            let snapshot = Dictionary<'K, 'V>(source.GetValue())
+            this.Register()
+            let mutable e = snapshot.GetEnumerator()
+
+            while e.MoveNext() do
+                let kvp = e.Current
+                this.ApplySet(kvp.Key, kvp.Value)
+
+            depVersion <- source.Version
+            initialized <- true
+
+    /// Apply the source journal: route every entry into its group's child.
+    member private this.Drain() =
+        let rems = journal.Rems
+        let sets = journal.Sets
+        let remStart = rems.Count
+        let setStart = sets.Count
+        let mutable i = 0
+        // Suspend the append-time cross-kind cancellation (see journalAppendMap).
+        journal.InDrain[0] <- 1
+        let mutable remsDone = 0
+        let mutable setsDone = 0
+
+        try
+            while i < remStart do
+                this.ApplyRem(rems.Items[i])
+                i <- i + 1
+                remsDone <- i
+
+            i <- 0
+
+            while i < setStart do
+                let struct (k, v) = sets.Items[i]
+                this.ApplySet(k, v)
+                i <- i + 1
+                setsDone <- i
+        finally
+            journal.InDrain[0] <- 0
+            // Compact against the LIVE journal counts (see ElementSetNode).
+            let remLive = journal.Rems.Count
+
+            if remLive > remsDone then
+                Array.Copy(journal.Rems.Items, remsDone, journal.Rems.Items, 0, remLive - remsDone)
+                journal.Rems.Count <- remLive - remsDone
+            else
+                journal.Rems.Count <- 0
+
+            let setLive = journal.Sets.Count
+
+            if setLive > setsDone then
+                Array.Copy(journal.Sets.Items, setsDone, journal.Sets.Items, 0, setLive - setsDone)
+                journal.Sets.Count <- setLive - setsDone
+            else
+                journal.Sets.Count <- 0
+
+    /// Drain the journal, then push the accumulated output delta once.
+    member private this.Process() =
+        let ctx = GraphContext.Default
+        let wasActive = ctx.TxActive
+        ctx.TxActive <- true
+
+        try
+            if not journal.IsEmpty then
+                this.Drain()
+
+            if not out.IsEmpty then
+                version <- version + 1L
+                Collections.pushMapDelta &sinks out
+                out.Clear()
+        finally
+            ctx.TxActive <- wasActive
+
+    interface IMapDeltaSink<'K, 'V> with
+        member this.OnDeltas(setEntries: struct ('K * 'V)[], setCnt: int, removedKeys: 'K[], remCnt: int) =
+            if not disposed then
+                Collections.journalAppendMap &journal setEntries setCnt removedKeys remCnt
+                version <- version + 1L
+                GraphContext.Default.BumpWriteGeneration()
+
+    interface IAdaptiveMap<'G, amap<'K, 'V>> with
+        member this.GetValue() =
+            let ctx = GraphContext.Default
+            ctx.ClaimOwner()
+
+            try
+                if disposed then
+                    invalidOp "This adaptive map has been disposed."
+
+                this.EnsureInitialized()
+
+                if source.Version <> depVersion then
+                    source.GetValue() |> ignore
+                    depVersion <- source.Version
+
+                this.Process()
+                AdaptiveRuntime.addDependency (this :> IAdaptiveObject) version
+                output :> IReadOnlyDictionary<'G, amap<'K, 'V>>
+            finally
+                ctx.ReleaseOwner()
+
+        member _.Version = version
+
+    interface IDisposable with
+        member this.Dispose() =
+            if not disposed then
+                disposed <- true
+                this.Unregister()
+                Collections.clearSinks &sinks
+
+    interface IMapSinkRegistry with
+        member this.AddMapSink(sink) = Collections.addSink &sinks sink
+
+        member this.RemoveMapSink(sink) = Collections.removeSink &sinks sink

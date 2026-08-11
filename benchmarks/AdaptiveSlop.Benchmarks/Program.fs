@@ -1778,10 +1778,9 @@ type ScalarEscapeBenchmarks() =
     member this.SlopTryFindChurnWrite() =
         for i in 1 .. this.Iterations do
             slopMap.AddOrUpdate 1 i
+
             let branch =
-                slopMap
-                |> AdaptiveSlop.Core.CMap.value
-                |> AdaptiveSlop.Core.AMap.tryFind 50
+                slopMap |> AdaptiveSlop.Core.CMap.value |> AdaptiveSlop.Core.AMap.tryFind 50
 
             let _ = AdaptiveSlop.Core.AVal.getValue branch
             ()
@@ -1790,10 +1789,7 @@ type ScalarEscapeBenchmarks() =
     member this.SlopCountChurnWrite() =
         for i in 1 .. this.Iterations do
             slopMap.AddOrUpdate 1 i
-            let branch =
-                slopMap
-                |> AdaptiveSlop.Core.CMap.value
-                |> AdaptiveSlop.Core.AMap.count
+            let branch = slopMap |> AdaptiveSlop.Core.CMap.value |> AdaptiveSlop.Core.AMap.count
 
             let _ = AdaptiveSlop.Core.AVal.getValue branch
             ()
@@ -1803,15 +1799,81 @@ type ScalarEscapeBenchmarks() =
         for i in 1 .. this.Iterations do
             slopSet.Add(2000 + i) |> ignore
             slopSet.Remove(2000 + i) |> ignore
+
             let branch =
-                slopSet
-                |> AdaptiveSlop.Core.CSet.value
-                |> AdaptiveSlop.Core.ASet.contains 50
+                slopSet |> AdaptiveSlop.Core.CSet.value |> AdaptiveSlop.Core.ASet.contains 50
 
             let _ = AdaptiveSlop.Core.AVal.getValue branch
             ()
 // Entry Point
 // =============================================================================
+
+/// The join churn regime: the left map's entries are updated every iteration
+/// and joined by a computed key to a right map. JoinOnUpdateAll is the
+/// per-key swappable-input join (no subgraph rebuild on updates);
+/// MapATryFindUpdateAll is the pre-joinOn idiom (mapA + tryFind) that
+/// rebuilds every per-key subgraph on every update (the measured ~5% of
+/// busy time as AdaptiveNode ZeroCreate in a profiled join projection).
+[<MemoryDiagnoser>]
+type JoinBenchmarks() =
+    let mutable enemies = Unchecked.defaultof<AdaptiveSlop.Core.cmap<int, int>>
+    let mutable projectiles = Unchecked.defaultof<AdaptiveSlop.Core.cmap<int, int>>
+
+    let mutable joinDerived =
+        Unchecked.defaultof<AdaptiveSlop.Core.amap<int, struct (int * int voption)>>
+
+    let mutable mapADerived =
+        Unchecked.defaultof<AdaptiveSlop.Core.amap<int, struct (int * int voption)>>
+
+    [<Params(200)>]
+    member val Enemies = 0 with get, set
+
+    [<GlobalSetup>]
+    member this.Setup() =
+        enemies <- AdaptiveSlop.Core.CMap.empty<int, int>
+        projectiles <- AdaptiveSlop.Core.CMap.empty<int, int>
+
+        for i in 1 .. this.Enemies do
+            AdaptiveSlop.Core.CMap.addOrUpdate i (i * 10) enemies
+
+        for i in 1 .. (this.Enemies / 2) do
+            AdaptiveSlop.Core.CMap.addOrUpdate i i projectiles
+
+        joinDerived <-
+            AdaptiveSlop.Core.AMap.joinOn
+                (AdaptiveSlop.Core.CMap.value projectiles)
+                (AdaptiveSlop.Core.CMap.value enemies)
+                (fun k _ -> k % this.Enemies + 1) // stable join key from the key
+                (fun _ pV tV -> AdaptiveSlop.Core.AVal.map2 (fun p t -> ValueSome(struct (p, t))) pV tV)
+
+        mapADerived <-
+            AdaptiveSlop.Core.CMap.value projectiles
+            |> AdaptiveSlop.Core.AMap.mapA (fun k p ->
+                AdaptiveSlop.Core.AMap.tryFind (k % this.Enemies + 1) (AdaptiveSlop.Core.CMap.value enemies)
+                |> AdaptiveSlop.Core.AVal.map (fun t -> struct (p, t)))
+
+        // Warm-up: subgraphs built, buffers grown, JIT settled.
+        for i in 1 .. (this.Enemies / 2) do
+            AdaptiveSlop.Core.CMap.addOrUpdate i (i + 1) projectiles
+
+        AdaptiveSlop.Core.AMap.getValue joinDerived |> ignore
+        AdaptiveSlop.Core.AMap.getValue mapADerived |> ignore
+
+    [<Benchmark>]
+    member this.JoinOnUpdateAll() =
+        for i in 1..50 do
+            for p in 1 .. (this.Enemies / 2) do
+                AdaptiveSlop.Core.CMap.addOrUpdate p (p * 10 + i) projectiles
+
+            AdaptiveSlop.Core.AMap.getValue joinDerived |> ignore
+
+    [<Benchmark>]
+    member this.MapATryFindUpdateAll() =
+        for i in 1..50 do
+            for p in 1 .. (this.Enemies / 2) do
+                AdaptiveSlop.Core.CMap.addOrUpdate p (p * 10 + i) projectiles
+
+            AdaptiveSlop.Core.AMap.getValue mapADerived |> ignore
 
 [<EntryPoint>]
 let main args =

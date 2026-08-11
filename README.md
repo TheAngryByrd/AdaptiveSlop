@@ -240,20 +240,25 @@ let statuses =
   `containsKey`, `tryGetValue`, `item`, `clear`, `value`, `force`, `toMap`
 - **CList** — `empty`, `append`, `insertAt`, `removeAt`, `updateAt`, `addRange`,
   `updateTo`, `perform`, `value`, `force`, `toArray`
-- **ASet** — `map`, `filter`, `choose`, `union`, `intersect`, `mapA`, `filterA`,
-  `chooseA`, `collect`, `collect'`, `bind`, `bind2`, `bind3`, `range`, `mapUse`, `count`,
-  `countBy`, `sum`, `average`, `sort`, `custom`, `getValue`, `force`, `toSet`, `ofSeq`
-- **AMap** — `map`, `mapV`, `filter`, `filterV`, `choose`, `chooseV`, `choose2V`,
-  `unionWith`, `intersect`, `intersectV`, `mapA`, `filterA`, `chooseA`, `mapUse`, `bind`,
-  `bind2`, `bind3`, `keys`, `toASet`, `fold`, `foldGroup`, `foldHalfGroup`, `sumBy`,
-  `averageBy`, `tryFind`, `find`, `getValue`, `force`, `toMap`, `ofSeq`
-- **AList** — `map`, `mapi`, `filter`, `choose`, `indexed`, `mapA`, `mapiA`, `filterA`,
-  `chooseA`, `append`, `concat`, `bind`, `bind2`, `bind3`, `ofAVal`, `ofSeq`, `ofArray`,
-  `range`, `init`, `toAVal`, `tryAt`, `tryGet`, `tryFirst`, `tryLast`, `rev`, `sort`,
-  `pairwise`, `take`, `takeA`, `skip`, `skipA`, `sub`, `subA`, `reduce`, `reduceBy`,
-  `fold`, `foldGroup`, `foldHalfGroup`, `exists`, `forall`, `countBy`, `tryMin`,
-  `tryMax`, `sum`, `sumBy`, `average`, `averageBy`, `mapUse`, `custom`, `getValue`,
-  `force`, `toArray`
+- **ASet** — `map`, `filter`, `choose`, `chooseV`, `chooseA`, `chooseAV`, `union`, `intersect`,
+  `mapA`, `filterA`, `collect`, `collect'`, `bind`, `bind2`, `bind3`, `range`, `mapUse`,
+  `count`, `countBy`, `sum`, `average`, `sort`, `custom`, `getValue`, `force`, `toSet`,
+  `ofSeq`, `reduceByA`, `countByA`, `existsA`, `forallA`, `sumByA`, `averageByA`,
+  `tryMinA`, `tryMaxA`
+- **AMap** — `map`, `mapV`, `filter`, `filterV`, `choose`, `chooseV`, `chooseA`, `chooseAV`,
+  `choose2`, `choose2V`, `unionWith`, `union`, `intersect`, `intersectV`, `intersectWith`,
+  `difference`, `groupBy`, `joinOn`, `mapA`, `filterA`, `mapUse`, `bind`, `bind2`, `bind3`,
+  `keys`, `toASet`, `fold`, `foldGroup`, `foldHalfGroup`, `sumBy`, `averageBy`, `tryFind`,
+  `find`, `getValue`, `force`, `toMap`, `ofSeq`, `reduceByA`, `countByA`, `existsA`,
+  `forallA`, `sumByA`, `averageByA`, `tryMinA`, `tryMaxA`
+- **AList** — `map`, `mapi`, `filter`, `choose`, `chooseV`, `choosei`, `chooseiV`, `indexed`,
+  `mapA`, `mapiA`, `filterA`, `chooseA`, `chooseAV`, `chooseiA`, `chooseiAV`, `append`,
+  `concat`, `bind`, `bind2`, `bind3`, `ofAVal`, `ofSeq`, `ofArray`, `range`, `init`,
+  `toAVal`, `tryAt`, `tryGet`, `tryFirst`, `tryLast`, `rev`, `sort`, `pairwise`, `take`,
+  `takeA`, `skip`, `skipA`, `sub`, `subA`, `reduce`, `reduceBy`, `fold`, `foldGroup`,
+  `foldHalfGroup`, `exists`, `forall`, `countBy`, `tryMin`, `tryMax`, `sum`, `sumBy`,
+  `average`, `averageBy`, `mapUse`, `custom`, `getValue`, `force`, `toArray`, `reduceByA`,
+  `countByA`, `existsA`, `forallA`, `sumByA`, `averageByA`, `tryMinA`, `tryMaxA`
 - **Transaction** — `run`
 - **Posting** — `pump`
 
