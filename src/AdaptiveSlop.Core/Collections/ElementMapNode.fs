@@ -265,7 +265,7 @@ type ElementMapNode<'K, 'V, 'U when 'K: equality>
             Collections.removeSink &state.Sinks sink
 
 // =============================================================================
-// The per-key join node (docs/2026-08-05-JOIN-DESIGN.md)
+// The per-key join node (docs/2026-08-10-JOIN-DESIGN.md)
 //
 // AMap.joinOn — an equi-join over two maps with a computed join key. The left
 // map is enumerated per key; the join key is computed from the left entry

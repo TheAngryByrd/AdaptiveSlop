@@ -242,18 +242,23 @@ let statuses =
   `updateTo`, `perform`, `value`, `force`, `toArray`
 - **ASet** — `map`, `filter`, `choose`, `union`, `intersect`, `mapA`, `filterA`,
   `chooseA`, `collect`, `collect'`, `bind`, `bind2`, `bind3`, `range`, `mapUse`, `count`,
-  `countBy`, `sum`, `average`, `sort`, `custom`, `getValue`, `force`, `toSet`, `ofSeq`
+  `countBy`, `sum`, `average`, `sort`, `custom`, `getValue`, `force`, `toSet`, `ofSeq`,
+  `reduceByA`, `countByA`, `existsA`, `forallA`, `sumByA`, `averageByA`, `tryMinA`,
+  `tryMaxA`
 - **AMap** — `map`, `mapV`, `filter`, `filterV`, `choose`, `chooseV`, `choose2V`,
-  `unionWith`, `intersect`, `intersectV`, `mapA`, `filterA`, `chooseA`, `mapUse`, `bind`,
+  `unionWith`, `union`, `intersect`, `intersectV`, `intersectWith`, `difference`,
+  `groupBy`, `joinOn`, `mapA`, `filterA`, `chooseA`, `mapUse`, `bind`,
   `bind2`, `bind3`, `keys`, `toASet`, `fold`, `foldGroup`, `foldHalfGroup`, `sumBy`,
-  `averageBy`, `tryFind`, `find`, `getValue`, `force`, `toMap`, `ofSeq`
+  `averageBy`, `tryFind`, `find`, `getValue`, `force`, `toMap`, `ofSeq`, `reduceByA`,
+  `countByA`, `existsA`, `forallA`, `sumByA`, `averageByA`
 - **AList** — `map`, `mapi`, `filter`, `choose`, `indexed`, `mapA`, `mapiA`, `filterA`,
   `chooseA`, `append`, `concat`, `bind`, `bind2`, `bind3`, `ofAVal`, `ofSeq`, `ofArray`,
   `range`, `init`, `toAVal`, `tryAt`, `tryGet`, `tryFirst`, `tryLast`, `rev`, `sort`,
   `pairwise`, `take`, `takeA`, `skip`, `skipA`, `sub`, `subA`, `reduce`, `reduceBy`,
   `fold`, `foldGroup`, `foldHalfGroup`, `exists`, `forall`, `countBy`, `tryMin`,
   `tryMax`, `sum`, `sumBy`, `average`, `averageBy`, `mapUse`, `custom`, `getValue`,
-  `force`, `toArray`
+  `force`, `toArray`, `reduceByA`, `countByA`, `existsA`, `forallA`, `sumByA`,
+  `averageByA`, `tryMinA`, `tryMaxA`
 - **Transaction** — `run`
 - **Posting** — `pump`
 

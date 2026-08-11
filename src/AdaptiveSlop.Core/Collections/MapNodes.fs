@@ -1742,7 +1742,7 @@ type MapCountNode<'K, 'V, 'Out when 'K: equality>(source: IAdaptiveMap<'K, 'V>, 
                 disposed <- true
 
 // =============================================================================
-// The groupBy node family (docs/2026-08-05-JOIN-DESIGN.md)
+// The groupBy node family (docs/2026-08-10-JOIN-DESIGN.md)
 //
 // AMap.groupBy — every group is a live adaptive map (a GroupMapChildNode)
 // owned by the GroupByMapNode. The groupBy drain routes source deltas into

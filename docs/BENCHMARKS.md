@@ -1722,3 +1722,26 @@ entities (identical in both libraries — the graph does not allocate it).
 | **AdaptiveSlop**       | **500**   | **100**        | **1,606.50 μs** | **16.447 μs** | **14.579 μs** |  **1.00** |    **0.01** |      **-** |         **-** |          **NA** |
 | FSharpDataAdaptive | 500   | 100        | 3,048.02 μs | 21.423 μs | 18.991 μs |  1.90 |    0.02 | 3.9063 |   47200 B |          NA |
 
+
+## 2026-08-10 — joinOn vs mapA+tryFind (the Defli Homing shape)
+
+- Branch: feat/joinon-groupby-reductions (AMap.joinOn, per-key swappable inputs)
+- Machine: Windows 11, .NET 10.0, x64 RyuJIT
+- Job: DefaultJob
+- Workload: 200 enemies (right map), 100 projectiles (left map). Every frame
+  every projectile row updates (left-map churn); the join key is stable per
+  key. This is the measured Defli Homing shape, where the mapA idiom rebuilt
+  every per-key subgraph per frame (~5% of busy time as AdaptiveNode
+  ZeroCreate).
+- The left map is the churn source: the mapA journal re-runs the mapping per
+  key per frame (fresh lookup + wrapper nodes); joinOn swaps a value cell in
+  place (no subgraph rebuild).
+
+| Benchmark           | Mean    | Error   | Allocated |
+| ------------------- | ------- | ------- | --------- |
+| JoinOnUpdateAll     | 752.7 µs| 8.87 µs | 0 B       |
+| MapATryFindUpdateAll| 1,185.0 µs | 22.91 µs | 2,120,000 B |
+
+Result: joinOn is ~36% faster and allocates nothing on the update path; the
+mapA+tryFind idiom allocates ~2.1 MB per operation on the same workload. The
+allocation is exactly the rebuild the swap removes.

@@ -195,3 +195,32 @@ Items already tracked in `docs/archive/2026-08-05-PARITY-FDA.md` are marked
 **Extension points** (our additions, not FDA gaps — recorded in
 `docs/2026-08-05-MAPA-DESIGN.md` §1): `ofExternal` + invalidate handles,
 `observeWeak`, `AList.custom`.
+
+---
+
+## 2026-08-10 — addendum (feat/joinon-groupby-reductions)
+
+Items resolved since the decisions above were recorded; the resolution wins.
+
+- **4.10, 4.13** — AMap `*A` family (`reduceByA`, `countByA`, `existsA`,
+  `forallA`, `sumByA`, `averageByA`): **done** — pure compositions over
+  `mapA`/`filterA` + the existing reduction nodes (no new node types).
+- **5.8 `*A`** — AList `*A` family: **done** — value-only mapping
+  (`'T -> aval<'U>`), FDA parity. The `mapiA`-based index-aware form was
+  rejected during implementation: mapiA's mapping-time positions stick on
+  shifts (documented semantic), so an index-aware reduction would not track
+  live positions.
+- **voption counterparts** — ASet and AList `tryMinA`/`tryMaxA`: **done**.
+  Rule: any non-A function with an option/voption shape gets an `*A` form
+  carrying voption in the same position (`aval<'U voption>` here). AMap has
+  no plain `tryMin`/`tryMax`, so no counterparts; `AMap.tryFind` is already
+  the adaptive voption form.
+- **`AMap.difference`** — our addition (the AMap counterpart of
+  `ASet.difference`): **done** — left-only keys on `Choose2MapNode`.
+- **`AMap.joinOn`** — our addition (the map analog of `AVal.map2` with
+  computed join keys; the measured Defli Homing join): **done** — per-key
+  swappable inputs, no subgraph rebuild on updates. See
+  `docs/2026-08-10-JOIN-DESIGN.md`.
+- **`AMap.groupBy`** — untracked FDA parity: **done** — output
+  `amap<'G, amap<'K,'V>>` (live per-group maps), plain key function, empty
+  groups removed at the next drain. See `docs/2026-08-10-JOIN-DESIGN.md`.
