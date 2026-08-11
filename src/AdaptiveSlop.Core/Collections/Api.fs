@@ -785,11 +785,11 @@ module AMap =
     /// </summary>
     /// <example>
     /// <code>
-    /// // towers grouped by type; the per-type map stays live
-    /// let byType = AMap.groupBy (fun _ t -> t.Type) towers
-    /// // adaptively count each type
+    /// // documents grouped by author; the per-author map stays live
+    /// let byAuthor = AMap.groupBy (fun _ doc -> doc.Author) documents
+    /// // adaptively count each author
     /// let counts =
-    ///     byType
+    ///     byAuthor
     ///     |> AMap.mapA (fun _ group -> AMap.count group)
     /// </code>
     /// </example>
@@ -1060,20 +1060,20 @@ module AMap =
     /// </remarks>
     /// <example>
     /// <code>
-    /// // projectiles join their target's live position; a dead target
-    /// // falls back to the last known position
-    /// let homing =
+    /// // orders join their product's current price; a product removed from
+    /// // the catalog falls back to the price stored on the order
+    /// let orderViews =
     ///     AMap.joinOn
-    ///         (fun _ row -> row.TargetEnemy)
-    ///         (fun _ rowV targetV ->
+    ///         (fun _ order -> order.ProductId)
+    ///         (fun _ orderV priceV ->
     ///             AVal.map2
-    ///                 (fun row target ->
-    ///                     { Pos = row.Pos
-    ///                       TargetPos = target |> ValueOption.defaultValue row.LastTargetPos })
-    ///                 rowV
-    ///                 targetV)
-    ///         projectiles.Rows
-    ///         enemies.Positions
+    ///                 (fun order price ->
+    ///                     { Order = order
+    ///                       Price = price |> ValueOption.defaultValue order.StoredPrice })
+    ///                 orderV
+    ///                 priceV)
+    ///         orders
+    ///         products
     /// </code>
     /// </example>
     let inline joinOn

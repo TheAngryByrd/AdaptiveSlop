@@ -1808,12 +1808,12 @@ type ScalarEscapeBenchmarks() =
 // Entry Point
 // =============================================================================
 
-/// The join regime (the Defli Homing shape): projectiles join their target's
-/// live position; every target position changes every frame. JoinOnUpdateAll
-/// is the per-key swappable-input join (no subgraph rebuild on updates);
+/// The join churn regime: the left map's entries are updated every iteration
+/// and joined by a computed key to a right map. JoinOnUpdateAll is the
+/// per-key swappable-input join (no subgraph rebuild on updates);
 /// MapATryFindUpdateAll is the pre-joinOn idiom (mapA + tryFind) that
 /// rebuilds every per-key subgraph on every update (the measured ~5% of
-/// busy time in Defli as AdaptiveNode ZeroCreate).
+/// busy time as AdaptiveNode ZeroCreate in a profiled join projection).
 [<MemoryDiagnoser>]
 type JoinBenchmarks() =
     let mutable enemies = Unchecked.defaultof<AdaptiveSlop.Core.cmap<int, int>>

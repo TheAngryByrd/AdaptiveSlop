@@ -275,8 +275,9 @@ type ElementMapNode<'K, 'V, 'U when 'K: equality>
 // The mapping receives the left value as a SWAPPABLE input: a ChangeableValue
 // the node re-applies on every update of the entry. The mapping's subgraph is
 // built once per key and survives updates — an in-place input swap instead of
-// the rebuild-on-journal of a plain mapA closure (the Defli Homing measure:
-// ~5% of busy time as AdaptiveNode ZeroCreate, from the per-frame rebuild).
+// the rebuild-on-journal of a plain mapA closure (the measured join
+// projection: ~5% of busy time as AdaptiveNode ZeroCreate, from the
+// per-update rebuild of every per-key subgraph).
 // Join-key changes (rare) rebuild the subgraph against the new lookup; the
 // cell survives the rebuild.
 //

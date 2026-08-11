@@ -1050,7 +1050,7 @@ let ``incremental law: AList *A reductions stay correct`` () =
 
     Check.QuickThrowOnFailure prop
 
-// Tail-only reads of 2+ level chains (the Defli stale-count report): the
+// Tail-only reads of 2+ level chains (the stale-count report): the
 // middle transforms are never read, so the tail's version gate must settle
 // the whole chain from its own read. The oracle reads the changeable source
 // only; it never touches the middle transforms.
@@ -2603,59 +2603,59 @@ let ``AMap joinOn defers transaction writes until commit`` () =
 
 [<Fact>]
 let ``AMap joinOn composes into a 3-way join`` () =
-    // The Defli Views shape: projectiles -> (target row) -> (target class),
-    // with the middle map's positions updating every frame.
-    let projectiles = CMap.empty<int, int> // projectile id -> target enemy id
-    let enemies = CMap.empty<int, int> // enemy id -> position
-    let classes = CMap.empty<int, int> // enemy id -> class id
+    // The 3-way join shape: left entries -> (middle row) -> (outer row),
+    // with the middle map's values updating every iteration.
+    let left = CMap.empty<int, int> // left id -> middle key
+    let middle = CMap.empty<int, int> // middle key -> value
+    let outer = CMap.empty<int, int> // middle key -> outer id
 
-    CMap.addOrUpdate 1 10 enemies
-    CMap.addOrUpdate 1 7 classes
-    CMap.addOrUpdate 5 1 projectiles // projectile 5 targets enemy 1
+    CMap.addOrUpdate 1 10 middle
+    CMap.addOrUpdate 1 7 outer
+    CMap.addOrUpdate 5 1 left // left 5 points at middle key 1
 
     let join1 =
         AMap.joinOn
-            (fun _ target -> target) // join key: the target id from the left value
-            (fun _ targetV posV -> AVal.map2 (fun t p -> ValueSome(struct (t, p))) targetV posV)
-            projectiles // left: projectile id -> target id
-            enemies // right: enemy id -> position
+            (fun _ key -> key) // join key: the middle key from the left value
+            (fun _ keyV valueV -> AVal.map2 (fun t p -> ValueSome(struct (t, p))) keyV valueV)
+            left // left: id -> middle key
+            middle // middle: key -> value
 
-    let positionsAndClasses =
+    let joinedRows =
         AMap.joinOn
-            (fun _ struct (target, _) -> target) // join key: the target id carried by the first join
-            (fun _ structV classV ->
+            (fun _ struct (key, _) -> key) // join key: the middle key carried by the first join
+            (fun _ structV outerV ->
                 AVal.map2
-                    (fun struct (target, pos) c ->
+                    (fun struct (key, value) c ->
                         match c with
-                        | ValueSome cid -> ValueSome(struct (pos, cid))
+                        | ValueSome cid -> ValueSome(struct (value, cid))
                         | ValueNone -> ValueNone)
                     structV
-                    classV)
+                    outerV)
             join1
-            classes
+            outer
 
-    let v1 = AMap.toMap positionsAndClasses
+    let v1 = AMap.toMap joinedRows
 
     if v1 <> Map.ofList [ 5, struct (ValueSome 10, 7) ] then
         failwithf "init: %A" v1
 
-    CMap.addOrUpdate 1 11 enemies // per-frame position update flows through both joins
-    let v2 = AMap.toMap positionsAndClasses
+    CMap.addOrUpdate 1 11 middle // per-iteration value update flows through both joins
+    let v2 = AMap.toMap joinedRows
 
     if v2 <> Map.ofList [ 5, struct (ValueSome 11, 7) ] then
-        failwithf "position update: %A" v2
+        failwithf "value update: %A" v2
 
-    CMap.remove 1 enemies // dead target: the second join keeps the row (class still resolves)
-    let v3 = AMap.toMap positionsAndClasses
+    CMap.remove 1 middle // missing middle row: the second join keeps the row (outer still resolves)
+    let v3 = AMap.toMap joinedRows
 
     if v3 <> Map.ofList [ 5, struct (ValueNone, 7) ] then
-        failwithf "target removed: %A" v3
+        failwithf "middle removed: %A" v3
 
-    CMap.remove 1 classes // class gone: the innermost join drops the row
-    let v4 = AMap.toMap positionsAndClasses
+    CMap.remove 1 outer // outer gone: the innermost join drops the row
+    let v4 = AMap.toMap joinedRows
 
     if not v4.IsEmpty then
-        failwithf "class removed: %A" v4
+        failwithf "outer removed: %A" v4
 
 [<Fact>]
 let ``AMap mapA with cross-map lookup matches the model`` () =

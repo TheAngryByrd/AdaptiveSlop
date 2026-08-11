@@ -1,14 +1,14 @@
 # Join + GroupBy Design — per-key joins and live per-group maps
 
 Status: **implemented (2026-08-10)** on `feat/joinon-groupby-reductions`.
-Motivation and measurements: `E:\Defli\docs\2026-08-07-adaptive-slop-join-assessment.md`,
-`E:\Mibo\src\Defli.Raylib\README.md` (Homing = 28.5% of busy; ~5% of busy is
-pure library allocation from the per-frame subgraph rebuild of the
-`mapA` + `tryFind` join idiom).
+Motivation and measurements: a profiled join projection in a game loop
+accounted for 28.5% of busy time; ~5% of busy time was pure library
+allocation from the per-update subgraph rebuild of the `mapA` + `tryFind`
+join idiom (docs/BENCHMARKS.md, 2026-08-10).
 
 ## 1. The problem
 
-Defli's join idiom is always `AMap.mapA`/`chooseA` over one map plus a
+The measured join idiom is always `AMap.mapA`/`chooseA` over one map plus a
 per-element `AMap.tryFind` into another — a hand-rolled equi-join. The
 library offered no alternative: `Choose2MapNode` takes plain values and
 combines on equal map keys only; it cannot express a computed join key (a
@@ -16,10 +16,10 @@ value inside the left row), a 3-way join, or a `voption` output.
 
 The structural cost: `ElementMapNode.DrainJournal` re-runs the mapping
 closure for every journal entry — including `addOrUpdate` of an existing key —
-and rebuilds the per-key aval subgraph from scratch. In the game regime every
-key updates every frame, so the join rebuilt `MapLookupNode + AdaptiveNode`
-per key per frame. The first recompute of every fresh node allocates its
-`deps`/`depVersions` arrays (the measured `ZeroCreate`).
+and rebuilds the per-key aval subgraph from scratch. In the churn regime
+every key updates per frame, so the join rebuilt `MapLookupNode +
+AdaptiveNode` per key per frame. The first recompute of every fresh node
+allocates its `deps`/`depVersions` arrays (the measured `ZeroCreate`).
 
 ## 2. The join node (`AMap.joinOn`)
 
@@ -42,9 +42,9 @@ per key per frame. The first recompute of every fresh node allocates its
   re-read at force time) and through the element scan (gated on the write
   generation, which every delta delivery bumps).
 
-Measured (docs/BENCHMARKS.md, 2026-08-10): on the Defli Homing workload
-(100 projectiles, 200 enemies, per-frame left churn) the idiom allocates
-~2.1 MB per operation; `joinOn` allocates 0 B and is ~36% faster.
+Measured (docs/BENCHMARKS.md, 2026-08-10): on the join churn workload
+(100 left entries, 200 right entries, per-update left churn) the idiom
+allocates ~2.1 MB per operation; `joinOn` allocates 0 B and is ~36% faster.
 
 ### 2.1 Why not change `mapA` instead?
 

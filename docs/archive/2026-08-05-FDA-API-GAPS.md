@@ -218,7 +218,7 @@ Items resolved since the decisions above were recorded; the resolution wins.
 - **`AMap.difference`** — our addition (the AMap counterpart of
   `ASet.difference`): **done** — left-only keys on `Choose2MapNode`.
 - **`AMap.joinOn`** — our addition (the map analog of `AVal.map2` with
-  computed join keys; the measured Defli Homing join): **done** — per-key
+  computed join keys; the measured join projection): **done** — per-key
   swappable inputs, no subgraph rebuild on updates. See
   `docs/2026-08-10-JOIN-DESIGN.md`.
 - **`AMap.groupBy`** — untracked FDA parity: **done** — output

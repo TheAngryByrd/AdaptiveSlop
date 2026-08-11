@@ -5878,7 +5878,7 @@ let ``a thread with its own graph posts into the owner's ring`` () =
     Assert.Equal(7, AVal.getValue value)
 
 // =============================================================================
-// Tail-only reads of 2+ level chains (the Defli stale-count report). A write
+// Tail-only reads of 2+ level chains (the stale-count report). A write
 // journals the first transform level at write time; a transform pushes
 // downstream only at its own read. The transform versions must therefore
 // indicate upstream dirt (the dirty-indicator Version), or a gated tail read

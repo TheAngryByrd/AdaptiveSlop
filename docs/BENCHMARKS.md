@@ -1723,19 +1723,18 @@ entities (identical in both libraries — the graph does not allocate it).
 | FSharpDataAdaptive | 500   | 100        | 3,048.02 μs | 21.423 μs | 18.991 μs |  1.90 |    0.02 | 3.9063 |   47200 B |          NA |
 
 
-## 2026-08-10 — joinOn vs mapA+tryFind (the Defli Homing shape)
+## 2026-08-10 — joinOn vs mapA+tryFind (the per-update join churn shape)
 
 - Branch: feat/joinon-groupby-reductions (AMap.joinOn, per-key swappable inputs)
 - Machine: Windows 11, .NET 10.0, x64 RyuJIT
 - Job: DefaultJob
-- Workload: 200 enemies (right map), 100 projectiles (left map). Every frame
-  every projectile row updates (left-map churn); the join key is stable per
-  key. This is the measured Defli Homing shape, where the mapA idiom rebuilt
-  every per-key subgraph per frame (~5% of busy time as AdaptiveNode
-  ZeroCreate).
+- Workload: 200 right entries, 100 left entries. Every iteration every left
+  entry updates (left-map churn); the join key is stable per key. This is
+  the measured join shape, where the mapA idiom rebuilt every per-key
+  subgraph per update (~5% of busy time as AdaptiveNode ZeroCreate).
 - The left map is the churn source: the mapA journal re-runs the mapping per
-  key per frame (fresh lookup + wrapper nodes); joinOn swaps a value cell in
-  place (no subgraph rebuild).
+  key per iteration (fresh lookup + wrapper nodes); joinOn swaps a value
+  cell in place (no subgraph rebuild).
 
 | Benchmark           | Mean    | Error   | Allocated |
 | ------------------- | ------- | ------- | --------- |
