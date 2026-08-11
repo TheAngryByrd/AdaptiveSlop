@@ -2602,6 +2602,62 @@ let ``AMap joinOn defers transaction writes until commit`` () =
         failwithf "after: %A" after
 
 [<Fact>]
+let ``AMap joinOn composes into a 3-way join`` () =
+    // The Defli Views shape: projectiles -> (target row) -> (target class),
+    // with the middle map's positions updating every frame.
+    let projectiles = CMap.empty<int, int> // projectile id -> target enemy id
+    let enemies = CMap.empty<int, int> // enemy id -> position
+    let classes = CMap.empty<int, int> // enemy id -> class id
+
+    CMap.addOrUpdate 1 10 enemies
+    CMap.addOrUpdate 1 7 classes
+    CMap.addOrUpdate 5 1 projectiles // projectile 5 targets enemy 1
+
+    let join1 =
+        AMap.joinOn
+            (fun _ target -> target) // join key: the target id from the left value
+            (fun _ targetV posV -> AVal.map2 (fun t p -> ValueSome(struct (t, p))) targetV posV)
+            projectiles // left: projectile id -> target id
+            enemies // right: enemy id -> position
+
+    let positionsAndClasses =
+        AMap.joinOn
+            (fun _ struct (target, _) -> target) // join key: the target id carried by the first join
+            (fun _ structV classV ->
+                AVal.map2
+                    (fun struct (target, pos) c ->
+                        match c with
+                        | ValueSome cid -> ValueSome(struct (pos, cid))
+                        | ValueNone -> ValueNone)
+                    structV
+                    classV)
+            join1
+            classes
+
+    let v1 = AMap.toMap positionsAndClasses
+
+    if v1 <> Map.ofList [ 5, struct (ValueSome 10, 7) ] then
+        failwithf "init: %A" v1
+
+    CMap.addOrUpdate 1 11 enemies // per-frame position update flows through both joins
+    let v2 = AMap.toMap positionsAndClasses
+
+    if v2 <> Map.ofList [ 5, struct (ValueSome 11, 7) ] then
+        failwithf "position update: %A" v2
+
+    CMap.remove 1 enemies // dead target: the second join keeps the row (class still resolves)
+    let v3 = AMap.toMap positionsAndClasses
+
+    if v3 <> Map.ofList [ 5, struct (ValueNone, 7) ] then
+        failwithf "target removed: %A" v3
+
+    CMap.remove 1 classes // class gone: the innermost join drops the row
+    let v4 = AMap.toMap positionsAndClasses
+
+    if not v4.IsEmpty then
+        failwithf "class removed: %A" v4
+
+[<Fact>]
 let ``AMap mapA with cross-map lookup matches the model`` () =
     let prop (sc: CrossScenario) =
         let entities = CMap.empty<int, int> // entity -> lookup key
