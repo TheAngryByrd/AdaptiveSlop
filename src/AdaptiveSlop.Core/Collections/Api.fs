@@ -1058,6 +1058,18 @@ module AMap =
     /// case of the mapping; an inner join drops the entry when the right side
     /// is <c>ValueNone</c>.
     /// </remarks>
+    /// <remarks>
+    /// Performance guidance for hot per-key subgraphs (docs/2026-08-10-JOIN-
+    /// DESIGN.md §6): the per-key subgraph is forced per updated key per read.
+    /// A coarser join key reduces the entry count, the direct lever. A static-
+    /// input subgraph with same-typed inputs is cheaper on a fixed-dependency
+    /// node (<c>AVal.mapN</c>/<c>AVal.reduce</c>) than on the general node
+    /// (~40% measured on the recompute); heterogeneous inputs (this mapping's
+    /// cell + lookup) have no fixed-dependency combinator yet. Batching the
+    /// left-map writes of one frame in <c>Transaction.run</c> cuts the
+    /// write-side cost; a clean read (no write since the last read) costs
+    /// nothing.
+    /// </remarks>
     /// <example>
     /// <code>
     /// // orders join their product's current price; a product removed from

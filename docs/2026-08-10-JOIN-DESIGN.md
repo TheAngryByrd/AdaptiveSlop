@@ -94,3 +94,34 @@ form does not apply: a piped value lands in the `right` slot.
   grid-indexed collection is not warranted (small N, churn not asymptotics).
 - `AList.collect`: deferred by decision (gap sheet).
 - `tryFind` memoization: rejected for this PR (see §2.1).
+
+## 6. Performance guidance for hot per-key subgraphs
+
+The remaining per-update cost of a join is the per-key force machinery
+(version checks, recompute, contribution diff) — shared by every derived
+node, not specific to the join. Measured split on the join churn workload:
+~80% of the iteration cost is the read/drain path, ~20% is the write path.
+The levers, in order of effect:
+
+1. **Entry count.** The force runs per updated key per read. A coarser join
+   key (fewer left entries) reduces the forces directly.
+2. **The mapping's subgraph shape.** A hot subgraph with static inputs is
+   cheaper on a node with a fixed dependency set than on the general
+   collect-based node: measured `AVal.mapN` recomputes ~40% faster than
+   `AVal.map2` on the same churn shape (fixed-dep node skips the per-
+   recompute dependency collection and array copies). Constraint: `mapN`
+   and `reduce` require same-typed inputs. A heterogeneous subgraph (the
+   join mapping's `cell + lookup`) has no fixed-dep combinator today; the
+   floor is the general node.
+3. **Write batching.** Batching the left-map writes of one frame in
+   `Transaction.run` cuts the write-side cost (the CMap flushes the batch
+   once); the read/drain cost is unchanged.
+4. **Read discipline.** A clean read (no write since the last read) costs
+   nothing: no scan, no force. Do not re-read the same derivation within a
+   frame.
+
+A library-side follow-up (recorded, not in this PR): reimplement
+`AVal.map2`/`map3`/`map4` on pre-allocated-input nodes (the `MapNNode`
+pattern generalized to heterogeneous inputs) — semantically identical
+(static deps by construction), ~40% cheaper per recompute on the measured
+shape. Core hot-path change: requires its own benchmark run and sign-off.
