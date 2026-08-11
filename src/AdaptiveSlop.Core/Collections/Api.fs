@@ -988,6 +988,51 @@ module AMap =
         )
 
     /// <summary>
+    /// Equi-joins two maps on a computed key (the map analog of
+    /// <c>AVal.map2</c>). The left map is enumerated per key; the join key is
+    /// computed from the left entry; the right map is looked up per entry
+    /// (never enumerated or rebuilt). The mapping receives the left key, the
+    /// left value as an adaptive value, and the right-side value (or
+    /// <c>ValueNone</c> when the join key is absent), and returns the output
+    /// aval; a <c>ValueNone</c> output drops the entry (choose semantics).
+    /// Output entries are keyed by the left key.
+    /// </summary>
+    /// <remarks>
+    /// The per-key subgraph is built once and updated in place: a left update
+    /// re-applies a swappable value cell (no rebuild, no per-frame
+    /// allocation), and a join-key change (rare) re-runs the mapping against
+    /// the new lookup. Right-map changes reach the entries through the lookup
+    /// (read-time gate) on the next read. A left-join is the <c>ValueNone</c>
+    /// case of the mapping; an inner join drops the entry when the right side
+    /// is <c>ValueNone</c>.
+    /// </remarks>
+    /// <example>
+    /// <code>
+    /// // projectiles join their target's live position; a dead target
+    /// // falls back to the last known position
+    /// let homing =
+    ///     AMap.joinOn
+    ///         (fun _ row -> row.TargetEnemy)
+    ///         (fun _ rowV targetV ->
+    ///             AVal.map2
+    ///                 (fun row target ->
+    ///                     { Pos = row.Pos
+    ///                       TargetPos = target |> ValueOption.defaultValue row.LastTargetPos })
+    ///                 rowV
+    ///                 targetV)
+    ///         projectiles.Rows
+    ///         enemies.Positions
+    /// </code>
+    /// </example>
+    let inline joinOn
+        ([<InlineIfLambda>] keyOfLeft: 'K1 -> 'V1 -> 'K2)
+        ([<InlineIfLambda>] mapping: 'K1 -> aval<'V1> -> aval<'V2 voption> -> aval<'U voption>)
+        (left: amap<'K1, 'V1>)
+        (right: amap<'K2, 'V2>)
+        : amap<'K1, 'U> =
+        new JoinMapNode<'K1, 'V1, 'K2, 'V2, 'U>(left, right, keyOfLeft, mapping)
+
+    /// <summary>
     /// Adaptively reduces the map with the given <see cref="AdaptiveReduction"/>
     /// over the values. The state is updated incrementally from deltas: a Set
     /// on an existing key subtracts the old value, then adds the new one.

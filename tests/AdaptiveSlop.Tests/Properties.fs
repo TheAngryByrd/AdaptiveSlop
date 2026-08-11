@@ -1970,6 +1970,252 @@ let ``AMap join choose2V with mapA matches the model`` () =
     Check.One(scenarioConfig, prop)
 
 [<Fact>]
+let ``AMap joinOn matches the model under both-side mutation`` () =
+    let prop (sc: JoinScenario) =
+        let left = CMap.empty<int, int>
+        let right = CMap.empty<int, int>
+
+        for (k, v) in sc.initialA do
+            CMap.addOrUpdate k v left
+
+        for (k, v) in sc.initialB do
+            CMap.addOrUpdate k v right
+
+        let joined =
+            AMap.joinOn
+                (fun _ v -> v % 7) // join key from the value: updates churn the key
+                (fun _ lV rV ->
+                    AVal.map2
+                        (fun l r ->
+                            match r with
+                            | ValueSome rv -> ValueSome(l + rv)
+                            | ValueNone -> ValueNone) // inner join: drop on a missing right side
+                        lV
+                        rV)
+                (CMap.value left)
+                (CMap.value right)
+
+        let modelA = Dictionary<int, int>()
+        let modelB = Dictionary<int, int>()
+
+        for (k, v) in sc.initialA do
+            modelA[k] <- v
+
+        for (k, v) in sc.initialB do
+            modelB[k] <- v
+
+        let apply (op: JoinOp) =
+            match op with
+            | LeftEdit(Upsert(key, value)) ->
+                CMap.addOrUpdate key value left
+                modelA[key] <- value
+            | LeftEdit(MapOp.Remove key) ->
+                CMap.remove key left
+                modelA.Remove key |> ignore
+            | LeftEdit(MapOp.SetValue _) -> ()
+            | RightEdit(Upsert(key, value)) ->
+                CMap.addOrUpdate key value right
+                modelB[key] <- value
+            | RightEdit(MapOp.Remove key) ->
+                CMap.remove key right
+                modelB.Remove key |> ignore
+            | RightEdit(MapOp.SetValue _) -> ()
+
+        for op in sc.ops do
+            apply op
+
+            let actual = AMap.toMap joined
+
+            let expected =
+                Map.ofSeq (
+                    seq {
+                        for KeyValue(k, a) in modelA do
+                            match modelB.TryGetValue(a % 7) with
+                            | true, b -> k, a + b
+                            | false, _ -> ()
+                    }
+                )
+
+            if actual <> expected then
+                failwithf "mismatch after %A: actual=%A expected=%A" op actual expected
+
+    Check.One(scenarioConfig, prop)
+
+[<Fact>]
+let ``AMap joinOn builds each key's subgraph once and swaps inputs in place`` () =
+    let left = CMap.empty<int, int>
+    let right = CMap.empty<int, int>
+    CMap.addOrUpdate 0 100 right
+    let mutable calls = 0
+
+    let joined =
+        AMap.joinOn
+            (fun _ _ -> 0) // stable join key: the swap path is the hot path
+            (fun _ lV rV ->
+                calls <- calls + 1
+
+                AVal.map2
+                    (fun l r ->
+                        match r with
+                        | ValueSome rv -> ValueSome(l + rv)
+                        | ValueNone -> ValueNone)
+                    lV
+                    rV)
+            (CMap.value left)
+            (CMap.value right)
+
+    CMap.addOrUpdate 1 10 left
+    let v1 = AMap.toMap joined
+    let callsAfterInit = calls
+
+    CMap.addOrUpdate 1 11 left // in-place swap: no mapping re-run
+    let v2 = AMap.toMap joined
+    let callsAfterUpdate = calls
+
+    AMap.toMap joined |> ignore // clean re-read: nothing runs
+    let callsAfterClean = calls
+
+    CMap.remove 1 left // removal drops the entry and its subgraph
+    let v3 = AMap.toMap joined
+    CMap.addOrUpdate 2 12 left // new key: the mapping runs again
+    let v4 = AMap.toMap joined
+    let callsAfterReadd = calls
+
+    if v1 <> Map.ofList [ 1, 110 ] then
+        failwithf "init: %A" v1
+
+    if v2 <> Map.ofList [ 1, 111 ] then
+        failwithf "update: %A" v2
+
+    if callsAfterInit <> 1 || callsAfterUpdate <> 1 || callsAfterClean <> 1 then
+        failwithf "mapping re-ran: init=%d update=%d clean=%d" callsAfterInit callsAfterUpdate callsAfterClean
+
+    if not v3.IsEmpty then
+        failwithf "removal: %A" v3
+
+    if v4 <> Map.ofList [ 2, 112 ] then
+        failwithf "re-add: %A" v4
+
+    if callsAfterReadd <> 2 then
+        failwithf "re-add did not rebuild: %d" callsAfterReadd
+
+[<Fact>]
+let ``AMap joinOn regression: add-then-remove and remove-then-add between reads`` () =
+    let left = CMap.empty<int, int>
+    let right = CMap.empty<int, int>
+    CMap.addOrUpdate 0 100 right
+
+    let joined =
+        AMap.joinOn
+            (fun _ _ -> 0)
+            (fun _ lV rV -> AVal.map2 (fun l r -> ValueSome(l + (r |> ValueOption.defaultValue 0))) lV rV)
+            (CMap.value left)
+            (CMap.value right)
+
+    // Add-then-remove between reads: the journal nets to nothing.
+    CMap.addOrUpdate 1 10 left
+    CMap.remove 1 left
+    let afterNet = AMap.toMap joined
+
+    if not afterNet.IsEmpty then
+        failwithf "add-then-remove: %A" afterNet
+
+    // Remove-then-add: the entry must be present with the last value.
+    CMap.addOrUpdate 1 10 left
+    CMap.remove 1 left
+    CMap.addOrUpdate 1 11 left
+    let afterReadd = AMap.toMap joined
+
+    if afterReadd <> Map.ofList [ 1, 111 ] then
+        failwithf "remove-then-add: %A" afterReadd
+
+    // Update-then-remove: nothing remains.
+    CMap.addOrUpdate 1 12 left
+    CMap.remove 1 left
+    let afterUpdateRemove = AMap.toMap joined
+
+    if not afterUpdateRemove.IsEmpty then
+        failwithf "update-then-remove: %A" afterUpdateRemove
+
+[<Fact>]
+let ``AMap joinOn re-joins when the join key changes`` () =
+    let left = CMap.empty<int, int>
+    let right = CMap.empty<int, int>
+    CMap.addOrUpdate 1 100 right // join key 1 only; join key 0 is missing until the catch-up
+
+    let joined =
+        AMap.joinOn
+            (fun _ v -> v % 7) // value 1 -> key 1; value 8 -> key 1; value 14 -> key 0
+            (fun _ lV rV ->
+                AVal.map2
+                    (fun l r ->
+                        match r with
+                        | ValueSome rv -> ValueSome(l + rv)
+                        | ValueNone -> ValueNone)
+                    lV
+                    rV)
+            (CMap.value left)
+            (CMap.value right)
+
+    CMap.addOrUpdate 1 1 left // join key 1: 1 + 100
+    let v1 = AMap.toMap joined
+    CMap.addOrUpdate 1 8 left // join key still 1: swap path, 8 + 100
+    let v2 = AMap.toMap joined
+    CMap.addOrUpdate 1 14 left // join key 0: right missing -> dropped
+    let v3 = AMap.toMap joined
+    CMap.addOrUpdate 0 21 right // right catch-up: the entry re-joins via the scan
+    let v4 = AMap.toMap joined
+    CMap.addOrUpdate 1 1 left // back to join key 1: re-point, 1 + 100
+    let v5 = AMap.toMap joined
+
+    if v1 <> Map.ofList [ 1, 101 ] then
+        failwithf "init: %A" v1
+
+    if v2 <> Map.ofList [ 1, 108 ] then
+        failwithf "same-key update: %A" v2
+
+    if not v3.IsEmpty then
+        failwithf "key change to missing: %A" v3
+
+    if v4 <> Map.ofList [ 1, 35 ] then
+        failwithf "right catch-up: %A" v4
+
+    if v5 <> Map.ofList [ 1, 101 ] then
+        failwithf "key change back: %A" v5
+
+[<Fact>]
+let ``AMap joinOn defers transaction writes until commit`` () =
+    let left = CMap.empty<int, int>
+    let right = CMap.empty<int, int>
+    CMap.addOrUpdate 0 100 right
+    CMap.addOrUpdate 1 10 left
+
+    let joined =
+        AMap.joinOn
+            (fun _ _ -> 0)
+            (fun _ lV rV -> AVal.map2 (fun l r -> ValueSome(l + (r |> ValueOption.defaultValue 0))) lV rV)
+            (CMap.value left)
+            (CMap.value right)
+
+    let before = AMap.toMap joined
+
+    let inside =
+        Transaction.run (fun () ->
+            CMap.addOrUpdate 1 20 left
+            AMap.toMap joined) // reads inside see pre-transaction values
+
+    let after = AMap.toMap joined
+
+    if before <> Map.ofList [ 1, 110 ] then
+        failwithf "before: %A" before
+
+    if inside <> Map.ofList [ 1, 110 ] then
+        failwithf "inside: %A" inside
+
+    if after <> Map.ofList [ 1, 120 ] then
+        failwithf "after: %A" after
+
+[<Fact>]
 let ``AMap mapA with cross-map lookup matches the model`` () =
     let prop (sc: CrossScenario) =
         let entities = CMap.empty<int, int> // entity -> lookup key

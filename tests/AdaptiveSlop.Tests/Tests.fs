@@ -1868,6 +1868,43 @@ let ``N-element delta delivery allocates zero bytes`` () =
     Assert.Equal(55, (ASet.toSet filtered).Count)
 
 [<Fact>]
+let ``joinOn swap path: updates and one drain read allocate nothing`` () =
+    let left = CMap.empty<int, int>
+    let right = CMap.empty<int, int>
+
+    for i in 0..99 do
+        CMap.addOrUpdate i 100 right
+
+    let joined =
+        AMap.joinOn
+            (fun _ _ -> 0)
+            (fun _ lV rV -> AVal.map2 (fun l r -> ValueSome(l + (r |> ValueOption.defaultValue 0))) lV rV)
+            (CMap.value left)
+            (CMap.value right)
+
+    for i in 0..49 do
+        CMap.addOrUpdate i i left
+
+    // Extra warm cycles: tiered JIT promotion must settle BEFORE the window.
+    for _ in 1..3 do
+        for i in 0..49 do
+            CMap.addOrUpdate i (i + 1000) left
+
+        AMap.getValue joined |> ignore
+
+    GC.Collect()
+    GC.WaitForPendingFinalizers()
+    GC.Collect()
+    let before = GC.GetAllocatedBytesForCurrentThread()
+
+    for i in 0..49 do
+        CMap.addOrUpdate i (i + 1000) left
+
+    AMap.getValue joined |> ignore
+    let after = GC.GetAllocatedBytesForCurrentThread()
+    Assert.True(after - before < 128L, sprintf "swap drain allocated %d bytes" (after - before))
+
+[<Fact>]
 let ``derived chain processes nothing when never read`` () =
     let source = CSet.ofSeq [ 1 ]
     let mutable processed = 0
