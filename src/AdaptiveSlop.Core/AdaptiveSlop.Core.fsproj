@@ -11,9 +11,11 @@
 
 
   <ItemGroup>
+    <Compile Include="JsonConverters.fs" />
     <Compile Include="Library.fs" />
     <Compile Include="Collections/Shared.fs" />
     <Compile Include="Collections/Changeable.fs" />
+    <Compile Include="Collections/JsonConverters.fs" />
     <Compile Include="Collections/SetNodes.fs" />
     <Compile Include="Collections/MapNodes.fs" />
     <Compile Include="Collections/ListNodes.fs" />
